@@ -23,10 +23,6 @@ fn pubc_json(pubc: &[Map<String, Value>]) -> String {
     ))
 }
 
-pub fn parse_selector2(sel: &str) -> (String, String) {
-    crate::parse_selector(sel)
-}
-
 pub fn resolve_selector(sel: &str) -> Resolve {
     let (kind, val) = crate::parse_selector(sel);
     match kind.as_str() {

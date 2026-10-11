@@ -140,7 +140,74 @@ fn verr_text(tool: &str, errs: &[VErr]) -> String {
     s
 }
 
+/// Shared integer-overflow gate (F4): ONE policy for every int parser —
+/// REJECT anything that does not fit in `i64` with one consistent message.
+/// Each call site (`coerce_int`, `burst::py_int`, `screen::py_int_elem` via
+/// `parse_region`) checks this first so the same out-of-range input is
+/// rejected identically instead of Err vs clamp vs None.
+pub(crate) fn int_overflow_err(v: &Value) -> String {
+    format!("integer out of range: {v} does not fit in i64")
+}
+
+/// True when `v` parses as an integer but overflows `i64` (u64 > MAX,
+/// integral float outside the i64 range, or a digit string whose checked
+/// i64 accumulation overflows). Garbage (non-numeric, fractional floats,
+/// bad literals) returns false so each caller keeps its own message there.
+pub(crate) fn is_int_overflow(v: &Value) -> bool {
+    match v {
+        Value::Number(n) => {
+            if n.as_i64().is_some() {
+                false
+            } else if let Some(u) = n.as_u64() {
+                u > i64::MAX as u64
+            } else if let Some(f) = n.as_f64() {
+                if !f.is_finite() || f.fract() != 0.0 {
+                    false
+                } else {
+                    const MAX_F: f64 = 9223372036854775808.0; // 2^63
+                    const MIN_F: f64 = -9223372036854775808.0; // -2^63
+                    f < MIN_F || f >= MAX_F
+                }
+            } else {
+                false
+            }
+        }
+        Value::String(s) => {
+            let t = s.trim().replace('_', "");
+            let t = t.as_str();
+            let body = t.strip_prefix('+').unwrap_or(t);
+            let neg = t.starts_with('-');
+            let digits = if neg { &body[1..] } else { body };
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return false;
+            }
+            // Handle the sign edge explicitly: the magnitude of i64::MIN
+            // (9223372036854775808) overflows a positive i64 accumulation,
+            // so accumulate the magnitude as unsigned and compare once.
+            let mut mag: u64 = 0;
+            for b in digits.bytes() {
+                mag = match mag
+                    .checked_mul(10)
+                    .and_then(|m| m.checked_add((b - b'0') as u64))
+                {
+                    Some(m) => m,
+                    None => return true,
+                };
+            }
+            if neg {
+                mag > 9223372036854775808u64
+            } else {
+                mag > i64::MAX as u64
+            }
+        }
+        _ => false,
+    }
+}
+
 fn coerce_int(v: &Value) -> Result<i64, (String, String)> {
+    if is_int_overflow(v) {
+        return Err((int_overflow_err(v), "int_parsing".to_string()));
+    }
     match v {
         Value::Number(n) => {
             if let Some(i) = n.as_i64() {
@@ -155,7 +222,11 @@ fn coerce_int(v: &Value) -> Result<i64, (String, String)> {
                     ))
                 }
             } else if let Some(f) = n.as_f64() {
-                if f.is_finite() && f.fract() == 0.0 && f >= -9.0e18 && f <= 9.0e18 {
+                if f.is_finite()
+                    && f.fract() == 0.0
+                    && f >= -9223372036854775808.0
+                    && f < 9223372036854775808.0
+                {
                     Ok(f.trunc() as i64)
                 } else {
                     Err((
@@ -179,14 +250,14 @@ fn coerce_int(v: &Value) -> Result<i64, (String, String)> {
             let neg = t.starts_with('-');
             let digits = if neg { &body[1..] } else { body };
             if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
-                let mut val: i64 = 0;
+                let mut mag: u64 = 0;
                 let mut ok = true;
                 for b in digits.bytes() {
-                    val = match val
+                    mag = match mag
                         .checked_mul(10)
-                        .and_then(|v| v.checked_add((b - b'0') as i64))
+                        .and_then(|m| m.checked_add((b - b'0') as u64))
                     {
-                        Some(v) => v,
+                        Some(m) => m,
                         None => {
                             ok = false;
                             break;
@@ -194,7 +265,16 @@ fn coerce_int(v: &Value) -> Result<i64, (String, String)> {
                     };
                 }
                 if ok {
-                    return Ok(if neg { -val } else { val });
+                    if neg {
+                        if mag == 9223372036854775808u64 {
+                            return Ok(i64::MIN);
+                        }
+                        if mag <= i64::MAX as u64 {
+                            return Ok(-(mag as i64));
+                        }
+                    } else if mag <= i64::MAX as u64 {
+                        return Ok(mag as i64);
+                    }
                 }
             }
             Err((
@@ -1030,4 +1110,46 @@ fn main() {
         }
     }
     serve::run();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn overflow_string_rejected_with_shared_error() {
+        let v = json!("9223372036854775808"); // i64::MAX + 1
+        assert!(is_int_overflow(&v));
+        let (msg, _) = coerce_int(&v).expect_err("MAX+1 must be rejected");
+        assert_eq!(msg, int_overflow_err(&v));
+    }
+
+    #[test]
+    fn overflow_u64_rejected_with_shared_error() {
+        let v = Value::from(u64::MAX);
+        assert!(is_int_overflow(&v));
+        let (msg, _) = coerce_int(&v).expect_err("u64::MAX must be rejected");
+        assert_eq!(msg, int_overflow_err(&v));
+    }
+
+    #[test]
+    fn overflow_float_rejected_with_shared_error() {
+        let v = json!(1e19);
+        assert!(is_int_overflow(&v));
+        let (msg, _) = coerce_int(&v).expect_err("1e19 must be rejected");
+        assert_eq!(msg, int_overflow_err(&v));
+    }
+
+    #[test]
+    fn in_range_values_still_accepted() {
+        assert_eq!(coerce_int(&json!("9223372036854775807")).unwrap(), i64::MAX);
+        assert_eq!(
+            coerce_int(&json!("-9223372036854775808")).unwrap(),
+            i64::MIN
+        );
+        assert_eq!(coerce_int(&json!(42)).unwrap(), 42);
+        assert!(!is_int_overflow(&json!(42)));
+        assert!(!is_int_overflow(&json!("-9223372036854775808")));
+    }
 }
