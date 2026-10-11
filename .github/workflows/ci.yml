@@ -1,9 +1,6 @@
 # nathwn12 house CI — stack: rust (copy to .github/workflows/ci.yml)
 name: ci
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
 jobs:
   build:
