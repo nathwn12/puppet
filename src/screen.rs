@@ -295,6 +295,18 @@ pub fn screenshot_window(a: &ShotArgs) -> String {
     ok_blocks(&blocks)
 }
 
+/// 0-based monitor choice over the `EnumDisplayMonitors` list. Shared by the
+/// GDI rect leg and the DXGI output leg so both index the same monitor.
+pub fn monitor_rect(mons: &[[i32; 4]], display: i64) -> Result<[i32; 4], String> {
+    if display < 0 || display >= mons.len() as i64 {
+        return Err(format!(
+            "error: bad_display: display {display} out of range (0..{})",
+            mons.len() as i64 - 1
+        ));
+    }
+    Ok(mons[display as usize])
+}
+
 pub fn screenshot_desktop(a: &ShotArgs) -> String {
     let (vx, vy, vr, vb) = virtual_rect();
     let mons = display_monitors();
@@ -310,15 +322,10 @@ pub fn screenshot_desktop(a: &ShotArgs) -> String {
                 "virtual".to_string(),
             )
         } else {
-            let d = a.display;
-            let idx = 1 + d;
-            if d < 0 || idx >= mons.len() as i64 {
-                return shot_err_list(vec![format!(
-                    "error: bad_display: display {d} out of range (0..{})",
-                    n_mon - 1
-                )]);
-            }
-            let m = mons[idx as usize];
+            let m = match monitor_rect(&mons, a.display) {
+                Ok(m) => m,
+                Err(e) => return shot_err_list(vec![e]),
+            };
             (
                 m[0] as i64,
                 m[1] as i64,
@@ -516,4 +523,30 @@ pub fn resolve_window_pub(
     Option<Vec<Map<String, Value>>>,
 ) {
     resolve_window(title, hwnd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn two_mons() -> Vec<[i32; 4]> {
+        vec![[0, 0, 1920, 1080], [1920, 0, 3840, 1080]]
+    }
+
+    #[test]
+    fn display_zero_selects_first_monitor() {
+        assert_eq!(monitor_rect(&two_mons(), 0).unwrap(), [0, 0, 1920, 1080]);
+    }
+
+    #[test]
+    fn display_one_selects_second_monitor() {
+        assert_eq!(monitor_rect(&two_mons(), 1).unwrap(), [1920, 0, 3840, 1080]);
+    }
+
+    #[test]
+    fn display_out_of_range_rejected() {
+        assert!(monitor_rect(&two_mons(), 2).is_err());
+        assert!(monitor_rect(&two_mons(), -1).is_err());
+        assert!(monitor_rect(&vec![[0, 0, 1920, 1080]], 0).is_ok());
+    }
 }

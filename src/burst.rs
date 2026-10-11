@@ -42,6 +42,8 @@ const K_UNICODE: u32 = 0x0004;
 
 const BG_NOTE: &str = "background PostMessage delivery is best-effort: it is NOT honoured by every app and is NOT equivalent to real (SendInput) input.";
 const BG_SUFFIX: &str = "; omit background for real SendInput delivery";
+const MAX_CLICK_COUNT: i64 = 100;
+const MAX_STABLE_EDGE: i64 = 16384;
 
 fn bg_non_postable(typ: &str) -> Option<&'static str> {
     match typ {
@@ -504,6 +506,13 @@ fn bg_execute(hwnd: i64, a: &Map<String, Value>) -> (bool, Option<String>, i64) 
             Ok(c) => c.max(1),
             Err(_) => return (false, Some("click count must be an int".to_string()), 0),
         };
+        if count > MAX_CLICK_COUNT {
+            return (
+                false,
+                Some(format!("click count absurd (>{MAX_CLICK_COUNT}): {count}")),
+                0,
+            );
+        }
         let (cx, cy) = match bg_client(hwnd, &a["x"], &a["y"]) {
             Ok(p) => p,
             Err(e) => return (false, Some(e), 0),
@@ -894,6 +903,17 @@ fn wait_for(a: &Map<String, Value>, t0: &Instant) -> Map<String, Value> {
                 false,
                 false,
                 Some("region must have right>left and bottom>top".to_string()),
+            );
+        }
+        let (rw, rh) = (rr - rl, rb - rt);
+        if rw > MAX_STABLE_EDGE || rh > MAX_STABLE_EDGE {
+            return wf_done(
+                t0,
+                false,
+                false,
+                Some(format!(
+                    "region must be at most {MAX_STABLE_EDGE}x{MAX_STABLE_EDGE} (got {rw}x{rh})"
+                )),
             );
         }
         let mut prev: Option<Vec<u8>> = None;
@@ -1485,6 +1505,9 @@ pub fn do_burst(
                     Some(v) => py_int(v)?,
                 }
                 .max(1);
+                if count > MAX_CLICK_COUNT {
+                    return Err(format!("click count absurd (>{MAX_CLICK_COUNT}): {count}"));
+                }
                 for _ in 0..count {
                     st.pending.push(mi_btn(dn, 0));
                     st.pending.push(mi_btn(up, 0));
@@ -1989,4 +2012,106 @@ pub fn do_burst(
         }
     }
     wrapped_text(&crate::py_dumps(&Value::Object(payload)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn burst_first(actions: &[Value]) -> Map<String, Value> {
+        let out = do_burst(actions, None, false, 0, true);
+        let outer: Value = serde_json::from_str(&out).expect("outer frame");
+        let inner = outer
+            .get("structuredContent")
+            .and_then(|s| s.get("result"))
+            .and_then(|r| r.as_str())
+            .expect("structured result");
+        let payload: Value = serde_json::from_str(inner).expect("payload");
+        let results = payload
+            .get("results")
+            .and_then(|r| r.as_array())
+            .expect("results");
+        results
+            .first()
+            .and_then(|r| r.as_object())
+            .expect("first result")
+            .clone()
+    }
+
+    #[test]
+    fn click_count_bound_rejected_in_dry_run() {
+        let actions = vec![serde_json::json!({"type": "click", "count": 101})];
+        let first = burst_first(&actions);
+        assert_eq!(first.get("ok"), Some(&Value::from(false)));
+        let err = first.get("error").and_then(|e| e.as_str()).unwrap_or("");
+        assert!(
+            err.contains("absurd"),
+            "count error should name the bound, got: {err}"
+        );
+    }
+
+    #[test]
+    fn click_count_sane_passes_dry_run() {
+        let actions = vec![serde_json::json!({"type": "click", "count": 2})];
+        let first = burst_first(&actions);
+        assert_eq!(first.get("ok"), Some(&Value::from(true)));
+    }
+
+    #[test]
+    fn bg_click_count_bound_rejected_before_post() {
+        let mut a = Map::new();
+        a.insert("type".to_string(), Value::from("click"));
+        a.insert("x".to_string(), Value::from(1));
+        a.insert("y".to_string(), Value::from(1));
+        a.insert("count".to_string(), Value::from(1_000_000_000_000i64));
+        let (ok, err, _) = bg_execute(0, &a);
+        assert!(!ok);
+        assert!(
+            err.unwrap_or_default().contains("absurd"),
+            "bg count error should name the bound"
+        );
+    }
+
+    #[test]
+    fn stable_huge_region_refused_before_grab() {
+        let mut a = Map::new();
+        a.insert("kind".to_string(), Value::from("stable"));
+        a.insert(
+            "region".to_string(),
+            Value::from(vec![
+                Value::from(0),
+                Value::from(0),
+                Value::from(100000),
+                Value::from(100000),
+            ]),
+        );
+        a.insert("timeout_ms".to_string(), Value::from(1000));
+        let t0 = Instant::now();
+        let r = wait_for(&a, &t0);
+        assert_eq!(r.get("ok"), Some(&Value::from(false)));
+        let err = r.get("error").and_then(|e| e.as_str()).unwrap_or("");
+        assert!(
+            err.contains("region must"),
+            "huge region should hit the region guard, got: {err}"
+        );
+    }
+
+    #[test]
+    fn stable_empty_region_still_rejected() {
+        let mut a = Map::new();
+        a.insert("kind".to_string(), Value::from("stable"));
+        a.insert(
+            "region".to_string(),
+            Value::from(vec![
+                Value::from(10),
+                Value::from(10),
+                Value::from(5),
+                Value::from(5),
+            ]),
+        );
+        a.insert("timeout_ms".to_string(), Value::from(0));
+        let t0 = Instant::now();
+        let r = wait_for(&a, &t0);
+        assert_eq!(r.get("ok"), Some(&Value::from(false)));
+    }
 }
