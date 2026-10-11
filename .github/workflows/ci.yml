@@ -1,24 +1,15 @@
+# nathwn12 house CI — stack: rust (copy to .github/workflows/ci.yml)
 name: ci
-
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
-
 jobs:
   build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
-      - name: Check formatting
-        run: cargo fmt --check
-        continue-on-error: true
-      - name: Clippy
-        run: cargo clippy --all-targets
-        continue-on-error: true
-      - name: Build (release)
-        run: cargo build --release
-      - name: Test
-        run: cargo test
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --locked
+      - run: cargo test --locked
