@@ -1,6 +1,6 @@
 //! screenshot tool handlers (window + desktop paths).
 
-use crate::cap::{bitblt_grab, finalize, resolve_selector, resolve_window, Img};
+use crate::cap::{bitblt_grab, finalize, resolve_selector, Img};
 use crate::dxgi::dxgi_grab;
 use crate::shot::{capture_window, elements_block};
 use crate::{
@@ -42,7 +42,7 @@ fn py_int_elem(v: &Value) -> Option<i64> {
                     None
                 }
             } else if let Some(f) = n.as_f64() {
-                if f.is_finite() && f >= -9.0e18 && f <= 9.0e18 {
+                if f.is_finite() && f >= -9223372036854775808.0 && f < 9223372036854775808.0 {
                     Some(f.trunc() as i64)
                 } else {
                     None
@@ -61,11 +61,25 @@ fn py_int_elem(v: &Value) -> Option<i64> {
             if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
                 return None;
             }
-            let mut val: i64 = 0;
+            let mut mag: u64 = 0;
             for b in digits.bytes() {
-                val = val.checked_mul(10)?.checked_add((b - b'0') as i64)?;
+                mag = mag.checked_mul(10)?.checked_add((b - b'0') as u64)?;
             }
-            Some(if neg { -val } else { val })
+            if neg {
+                if mag == 9223372036854775808u64 {
+                    return Some(i64::MIN);
+                }
+                if mag <= i64::MAX as u64 {
+                    return Some(-(mag as i64));
+                }
+                None
+            } else {
+                if mag <= i64::MAX as u64 {
+                    Some(mag as i64)
+                } else {
+                    None
+                }
+            }
         }
         _ => None,
     }
@@ -80,6 +94,12 @@ fn parse_region(region: &Option<Vec<Value>>) -> Result<Option<[i64; 4]>, String>
             }
             let mut r = [0i64; 4];
             for (i, x) in v.iter().enumerate() {
+                // F4: overflow rejects with the one shared message so the
+                // same out-of-range input errors identically in every tool;
+                // other garbage keeps the legacy bad_region shape.
+                if crate::is_int_overflow(x) {
+                    return Err(crate::int_overflow_err(x));
+                }
                 match py_int_elem(x) {
                     Some(n) => r[i] = n,
                     None => return Err("error: bad_region: region must be [left,top,right,bottom] in virtual-desktop px".to_string()),
@@ -499,30 +519,12 @@ pub fn screenshot_desktop(a: &ShotArgs) -> String {
     ok_blocks(&blocks)
 }
 
-pub fn bad_display_type(n_mon: i64) -> String {
-    shot_err_list(vec![format!(
-        "error: bad_display: display must be -1 or 0..{}",
-        n_mon - 1
-    )])
-}
-
 pub fn dispatch_screenshot(a: &ShotArgs) -> String {
     if a.window.is_some() {
         screenshot_window(a)
     } else {
         screenshot_desktop(a)
     }
-}
-
-pub fn resolve_window_pub(
-    title: Option<&str>,
-    hwnd: Option<i64>,
-) -> (
-    Option<windows_sys::Win32::Foundation::HWND>,
-    Option<String>,
-    Option<Vec<Map<String, Value>>>,
-) {
-    resolve_window(title, hwnd)
 }
 
 #[cfg(test)]
@@ -548,5 +550,47 @@ mod tests {
         assert!(monitor_rect(&two_mons(), 2).is_err());
         assert!(monitor_rect(&two_mons(), -1).is_err());
         assert!(monitor_rect(&vec![[0, 0, 1920, 1080]], 0).is_ok());
+    }
+
+    #[test]
+    fn overflow_region_elem_rejected_with_shared_error() {
+        let v = serde_json::json!("9223372036854775808"); // i64::MAX + 1
+        assert!(crate::is_int_overflow(&v));
+        let region = Some(vec![
+            Value::from(0),
+            Value::from(0),
+            v.clone(),
+            Value::from(100),
+        ]);
+        let err = parse_region(&region).expect_err("MAX+1 region must be rejected");
+        assert_eq!(err, crate::int_overflow_err(&v));
+    }
+
+    #[test]
+    fn overflow_region_u64_rejected_with_shared_error() {
+        let v = Value::from(u64::MAX);
+        assert!(crate::is_int_overflow(&v));
+        let region = Some(vec![
+            Value::from(0),
+            Value::from(0),
+            v.clone(),
+            Value::from(10),
+        ]);
+        let err = parse_region(&region).expect_err("u64::MAX region must be rejected");
+        assert_eq!(err, crate::int_overflow_err(&v));
+    }
+
+    #[test]
+    fn overflow_region_float_rejected_with_shared_error() {
+        let v = serde_json::json!(1e19);
+        assert!(crate::is_int_overflow(&v));
+        let region = Some(vec![
+            Value::from(0),
+            Value::from(0),
+            v.clone(),
+            Value::from(10),
+        ]);
+        let err = parse_region(&region).expect_err("1e19 region must be rejected");
+        assert_eq!(err, crate::int_overflow_err(&v));
     }
 }

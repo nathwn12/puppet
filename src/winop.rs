@@ -63,6 +63,17 @@ pub struct WinArgs {
     pub height: Option<i64>,
 }
 
+/// Shared range gate for every i64 coordinate routed to `SetWindowPos`
+/// (which takes `i32`). Rejects anything outside `i32` instead of letting
+/// `as i32` wrap (e.g. 2^40 wraps to 0 and teleports the window).
+pub(crate) fn checked_i32(v: i64, name: &str) -> Result<i32, String> {
+    if v < i32::MIN as i64 || v > i32::MAX as i64 {
+        Err(format!("{name} out of range for SetWindowPos (got {v})"))
+    } else {
+        Ok(v as i32)
+    }
+}
+
 pub fn do_window(a: &WinArgs) -> String {
     let (hwnd_r, err, cands) = resolve_window(a.title.as_deref(), a.hwnd);
     if hwnd_r.is_none() {
@@ -89,11 +100,29 @@ pub fn do_window(a: &WinArgs) -> String {
             if act == "move" {
                 match (a.x, a.y) {
                     (Some(xi), Some(yi)) => {
+                        let xi32 = match checked_i32(xi, "x") {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let mut o = Map::new();
+                                o.insert("ok".to_string(), Value::from(false));
+                                o.insert("error".to_string(), Value::from(e));
+                                return Ok(crate::py_dumps(&Value::Object(o)));
+                            }
+                        };
+                        let yi32 = match checked_i32(yi, "y") {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let mut o = Map::new();
+                                o.insert("ok".to_string(), Value::from(false));
+                                o.insert("error".to_string(), Value::from(e));
+                                return Ok(crate::py_dumps(&Value::Object(o)));
+                            }
+                        };
                         if SetWindowPos(
                             h,
                             std::ptr::null_mut(),
-                            xi as i32,
-                            yi as i32,
+                            xi32,
+                            yi32,
                             0,
                             0,
                             SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE,
@@ -131,13 +160,31 @@ pub fn do_window(a: &WinArgs) -> String {
                             );
                             return Ok(crate::py_dumps(&Value::Object(o)));
                         }
+                        let wi32 = match checked_i32(wi, "width") {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let mut o = Map::new();
+                                o.insert("ok".to_string(), Value::from(false));
+                                o.insert("error".to_string(), Value::from(e));
+                                return Ok(crate::py_dumps(&Value::Object(o)));
+                            }
+                        };
+                        let hi32 = match checked_i32(hi2, "height") {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let mut o = Map::new();
+                                o.insert("ok".to_string(), Value::from(false));
+                                o.insert("error".to_string(), Value::from(e));
+                                return Ok(crate::py_dumps(&Value::Object(o)));
+                            }
+                        };
                         if SetWindowPos(
                             h,
                             std::ptr::null_mut(),
                             0,
                             0,
-                            wi as i32,
-                            hi2 as i32,
+                            wi32,
+                            hi32,
                             SWP_NOZORDER | SWP_NOMOVE | SWP_NOACTIVATE,
                         ) == 0
                         {
@@ -256,5 +303,28 @@ pub fn do_cursor() -> String {
         o.insert("y".to_string(), Value::from(pt.y as i64));
         o.insert("screens".to_string(), Value::from(screens));
         wrapped_text(&crate::py_dumps(&Value::Object(o)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn out_of_i32_range_rejected_not_wrapped() {
+        // 2^40 wraps to 0 under `as i32`; the helper must reject instead.
+        assert_eq!(1099511627776i64 as i32, 0);
+        assert!(checked_i32(1099511627776, "x").is_err());
+        assert!(checked_i32(-1099511627776, "y").is_err());
+        assert!(checked_i32(i32::MAX as i64 + 1, "width").is_err());
+        assert!(checked_i32(i32::MIN as i64 - 1, "height").is_err());
+    }
+
+    #[test]
+    fn in_range_values_pass_through() {
+        assert_eq!(checked_i32(0, "x").unwrap(), 0);
+        assert_eq!(checked_i32(-10, "y").unwrap(), -10);
+        assert_eq!(checked_i32(i32::MAX as i64, "width").unwrap(), i32::MAX);
+        assert_eq!(checked_i32(i32::MIN as i64, "x").unwrap(), i32::MIN);
     }
 }

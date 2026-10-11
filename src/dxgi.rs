@@ -275,11 +275,17 @@ pub fn dxgi_grab(output: u32, w: i32, h: i32) -> Result<Img, String> {
                         return Err("dxgi unavailable (cooldown)".to_string());
                     };
                     if let Some(c) = &ses.cached {
-                        return Ok(Img {
-                            w: c.w,
-                            h: c.h,
-                            px: c.px.clone(),
-                        });
+                        if check_size(c, w, h).is_ok() {
+                            return Ok(Img {
+                                w: c.w,
+                                h: c.h,
+                                px: c.px.clone(),
+                            });
+                        }
+                        // Stale cache after a resolution change: drop it so the
+                        // caller falls through to GDI instead of surfacing a
+                        // size-mismatched frame as `capture_failed`.
+                        ses.cached = None;
                     }
                     if attempt == 0 {
                         std::thread::sleep(Duration::from_millis(20));
@@ -292,4 +298,30 @@ pub fn dxgi_grab(output: u32, w: i32, h: i32) -> Result<Img, String> {
         }
         Err("dxgi grab returned None (no new frame after retry)".to_string())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn img(w: i32, h: i32) -> Img {
+        Img {
+            w,
+            h,
+            px: vec![0u8; (w as usize) * (h as usize) * 3],
+        }
+    }
+
+    #[test]
+    fn matching_size_passes() {
+        assert!(check_size(&img(1920, 1080), 1920, 1080).is_ok());
+    }
+
+    #[test]
+    fn stale_cache_size_mismatch_rejected() {
+        // Resolution change with a warm cache: the cached 1920x1080 frame
+        // must NOT validate for a 2560x1440 output; the caller drops it
+        // and falls through to GDI.
+        assert!(check_size(&img(1920, 1080), 2560, 1440).is_err());
+    }
 }

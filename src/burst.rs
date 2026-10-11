@@ -113,21 +113,26 @@ fn py_truthy(v: &Value) -> bool {
 }
 
 /// CPython int(x) with CPython-shaped error texts (puppet.py int(...) sites).
+/// Overflow policy (F4): REJECT via the shared `crate::is_int_overflow`
+/// gate with the shared `crate::int_overflow_err` message — never clamp.
 fn py_int(v: &Value) -> Result<i64, String> {
+    if crate::is_int_overflow(v) {
+        return Err(crate::int_overflow_err(v));
+    }
     match v {
         Value::Bool(b) => Ok(if *b { 1 } else { 0 }),
         Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Ok(i)
             } else if let Some(u) = n.as_u64() {
-                Ok(u.min(i64::MAX as u64) as i64)
+                Ok(u as i64)
             } else if let Some(f) = n.as_f64() {
                 if f.is_nan() {
                     Err("cannot convert float NaN to integer".to_string())
                 } else if f.is_infinite() {
                     Err("cannot convert float infinity to integer".to_string())
                 } else {
-                    Ok(f.trunc().clamp(i64::MIN as f64, i64::MAX as f64) as i64)
+                    Ok(f.trunc() as i64)
                 }
             } else {
                 Err("int() argument must be a real number".to_string())
@@ -152,7 +157,9 @@ fn py_int(v: &Value) -> Result<i64, String> {
                 if neg {
                     val = -val;
                 }
-                Ok(val.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
+                // Overflow already rejected by the shared gate above; the
+                // try_from is a no-clamp backstop with the same message.
+                Ok(i64::try_from(val).map_err(|_| crate::int_overflow_err(v))?)
             } else {
                 Err(format!(
                     "invalid literal for int() with base 10: {}",
@@ -2113,5 +2120,38 @@ mod tests {
         let t0 = Instant::now();
         let r = wait_for(&a, &t0);
         assert_eq!(r.get("ok"), Some(&Value::from(false)));
+    }
+
+    #[test]
+    fn overflow_string_rejected_with_shared_error() {
+        let v = serde_json::json!("9223372036854775808"); // i64::MAX + 1
+        assert!(crate::is_int_overflow(&v));
+        let err = py_int(&v).expect_err("MAX+1 must be rejected, never clamped");
+        assert_eq!(err, crate::int_overflow_err(&v));
+    }
+
+    #[test]
+    fn overflow_u64_rejected_with_shared_error() {
+        let v = Value::from(u64::MAX);
+        assert!(crate::is_int_overflow(&v));
+        let err = py_int(&v).expect_err("u64::MAX must be rejected, never clamped");
+        assert_eq!(err, crate::int_overflow_err(&v));
+    }
+
+    #[test]
+    fn overflow_float_rejected_with_shared_error() {
+        let v = serde_json::json!(1e19);
+        assert!(crate::is_int_overflow(&v));
+        let err = py_int(&v).expect_err("1e19 must be rejected, never clamped");
+        assert_eq!(err, crate::int_overflow_err(&v));
+    }
+
+    #[test]
+    fn in_range_values_still_accepted() {
+        assert_eq!(py_int(&serde_json::json!(42)).unwrap(), 42);
+        assert_eq!(
+            py_int(&serde_json::json!("-9223372036854775808")).unwrap(),
+            i64::MIN
+        );
     }
 }
