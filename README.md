@@ -1,26 +1,6 @@
-<!-- Header. Use the icon image by default. Where the repo's `ART.md` verdict
-     allows a text banner, the framed banner replaces the icon image - never both.
-
-     THE BANNER RECIPE (reproducible, do not improvise):
-       uvx pyfiglet -f ansi_regular <NAME-UPPERCASE>
-     then strip trailing whitespace, drop blank edge lines, let W = the longest
-     art line, and frame in UNICODE BOX-DRAWING (never `+`/`-`/`|`):
-       top    `┌` + `─`*(W+2) + `┐`
-       each   `│ ` + art line padded right to W + ` │`
-       bottom `└` + `─`*(W+2) + `┘`
-     EVERY framed line MUST have an identical character count - assert it with
-     `len()`, never eyeball it. `ansi_regular` is chosen over `ansi_shadow`
-     because it carries the same weight without being the most-used banner font
-     on GitHub. Never place emoji inside a grid (variable width breaks columns). -->
-```text
-┌───────────────────────────────────────────────────┐
-│ ██████  ██    ██ ██████  ██████  ███████ ████████ │
-│ ██   ██ ██    ██ ██   ██ ██   ██ ██         ██    │
-│ ██████  ██    ██ ██████  ██████  █████      ██    │
-│ ██      ██    ██ ██      ██      ██         ██    │
-│ ██       ██████  ██      ██      ███████    ██    │
-└───────────────────────────────────────────────────┘
-```
+<p align="center">
+  <img src="assets/icon.svg" alt="puppet" width="120" height="120">
+</p>
 <h1 align="center">puppet</h1>
 <p align="center"><strong>Control the Windows desktop from any MCP client - screenshot, window, input, cursor - Rust.</strong></p>
 <p align="center">
