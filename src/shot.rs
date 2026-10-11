@@ -1,0 +1,390 @@
+//! Window capture chain (Mode A + Mode C; B deferred) + element model.
+
+use crate::cap::{
+    bitblt_grab, detector_json, detector_tag, detector_verdict, printwindow_grab, Img,
+};
+use crate::{
+    cloaked, dwm_rect, enum_child_windows, exe_of_pid, pid_of, win_class, win_text, ELEMENT_CAP,
+    MODE_B_NOTE, STALE, UIA_DEPTH_LIMIT, WDA_EXCLUDEFROMCAPTURE,
+};
+use serde_json::{Map, Value};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::time::Instant;
+use windows_sys::Win32::Foundation::{GetLastError, HWND, RECT};
+use windows_sys::Win32::UI::WindowsAndMessaging::*;
+
+pub struct CapOk {
+    pub img: Img,
+    pub backend: String,
+    pub ms: f64,
+    pub print_flags: Option<i64>,
+    pub rect_source: String,
+    pub rect_delta: [i32; 4],
+    pub detector: Map<String, Value>,
+    pub stale: bool,
+    pub dwm: [i32; 4],
+    pub hwnd: i64,
+    pub pid: u32,
+    pub exe: String,
+    pub title: String,
+    pub cloaked: i64,
+    pub note: Option<String>,
+}
+
+fn frame_sig(img: &Img, title: &str, dwm: &[i32; 4]) -> (String, (i32, i32, i32, i32), u64) {
+    let mut h = DefaultHasher::new();
+    img.px.hash(&mut h);
+    (
+        title.to_string(),
+        (dwm[0], dwm[1], dwm[2], dwm[3]),
+        h.finish(),
+    )
+}
+
+pub fn capture_window(hwnd: HWND, allow_crop_fallback: bool) -> Result<CapOk, String> {
+    let t0 = Instant::now();
+    let h = hwnd as i64;
+    unsafe {
+        if IsWindow(hwnd) == 0 {
+            return Err(format!(
+                "error: bad_window: hwnd recycled/closed (hwnd={h})"
+            ));
+        }
+    }
+    let title = unsafe { win_text(hwnd) };
+    if unsafe { IsIconic(hwnd) } != 0 {
+        return Err("error: bad_window: minimized (refusing to restore)".to_string());
+    }
+    let cloak = cloaked(hwnd);
+    if cloak != 0 {
+        return Err(format!("error: bad_window: cloaked (cloak={cloak})"));
+    }
+    let (dwm_v, dwm_fb) = dwm_rect(hwnd);
+    let rect_source = if dwm_fb { "gwr_fallback" } else { "dwm" }.to_string();
+    let (gl, gt, gr, gb) = unsafe {
+        let mut rc = RECT::default();
+        if GetWindowRect(hwnd, &mut rc) != 0 {
+            (rc.left, rc.top, rc.right, rc.bottom)
+        } else {
+            let e = crate::win32_text(GetLastError());
+            return Err(format!(
+                "error: bad_window: cannot read rect of hwnd={h}: {e}"
+            ));
+        }
+    };
+    let dwm = [dwm_v[0], dwm_v[1], dwm_v[2], dwm_v[3]];
+    let rect_delta = [dwm[0] - gl, dwm[1] - gt, dwm[2] - gr, dwm[3] - gb];
+    let (ww, wh) = (dwm[2] - dwm[0], dwm[3] - dwm[1]);
+    if ww <= 0 || wh <= 0 {
+        return Err("error: bad_window: zero-size".to_string());
+    }
+    unsafe {
+        let mut aff: u32 = 0;
+        if GetWindowDisplayAffinity(hwnd, &mut aff) != 0 && aff == WDA_EXCLUDEFROMCAPTURE {
+            return Err("error: capture_failed: excluded_from_capture".to_string());
+        }
+    }
+    let mut img: Option<Img> = None;
+    let mut print_flags: Option<u32> = None;
+    let mut last_err = String::from("PrintWindow refused");
+    for flags in [2u32, 0u32] {
+        match printwindow_grab(hwnd, ww, wh, flags) {
+            Ok(im) => {
+                img = Some(im);
+                print_flags = Some(flags);
+                break;
+            }
+            Err(e) => {
+                last_err = e;
+            }
+        }
+    }
+    if let Some(im) = img {
+        if im.w != ww || im.h != wh {
+            return Err(format!(
+                "error: capture_failed: PrintWindow returned {}x{} for a {ww}x{wh} window",
+                im.w, im.h
+            ));
+        }
+        let verdict = detector_verdict(&im);
+        if verdict.rejected {
+            return Err(format!(
+                "error: capture_failed: {}: {} frame rejected",
+                detector_tag(&verdict),
+                verdict.reason.clone().unwrap()
+            ));
+        }
+        let mut stale = false;
+        let mut sig = frame_sig(&im, &title, &dwm);
+        let mut img = im;
+        let prev = STALE.lock().unwrap().get(&h).cloned();
+        if let Some(p) = prev {
+            if p == sig {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let pf = print_flags.unwrap();
+                match printwindow_grab(hwnd, ww, wh, pf) {
+                    Ok(im2) => {
+                        let v2 = detector_verdict(&im2);
+                        if v2.rejected {
+                            return Err(format!(
+                                "error: capture_failed: {}: {} frame rejected",
+                                detector_tag(&v2),
+                                v2.reason.clone().unwrap()
+                            ));
+                        }
+                        img = im2;
+                        sig = frame_sig(&img, &title, &dwm);
+                        stale = sig == p;
+                    }
+                    Err(e) => {
+                        return Err(format!("error: capture_failed: stale retry failed: {e}"));
+                    }
+                }
+            }
+        }
+        {
+            let mut st = STALE.lock().unwrap();
+            if st.len() > 64 {
+                st.clear();
+            }
+            st.insert(h, sig);
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let pid = pid_of(hwnd);
+        let _fg = unsafe { GetForegroundWindow() == hwnd };
+        return Ok(CapOk {
+            img,
+            backend: "printwindow".to_string(),
+            ms,
+            print_flags: print_flags.map(|f| f as i64),
+            rect_source,
+            rect_delta,
+            detector: detector_json(&verdict),
+            stale,
+            dwm,
+            hwnd: h,
+            pid,
+            exe: exe_of_pid(pid),
+            title,
+            cloaked: cloak,
+            note: Some(MODE_B_NOTE.to_string()),
+        });
+    }
+    let fg = unsafe { GetForegroundWindow() == hwnd };
+    if allow_crop_fallback && fg {
+        match bitblt_grab(dwm[0], dwm[1], ww, wh) {
+            Ok(crop) => {
+                let verdict = detector_verdict(&crop);
+                if verdict.rejected {
+                    return Err(format!(
+                        "error: capture_failed: {}: {} frame rejected",
+                        detector_tag(&verdict),
+                        verdict.reason.clone().unwrap()
+                    ));
+                }
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                let pid = pid_of(hwnd);
+                return Ok(CapOk {
+                    img: crop,
+                    backend: "desktop-crop:gdi".to_string(),
+                    ms,
+                    print_flags: None,
+                    rect_source,
+                    rect_delta,
+                    detector: detector_json(&verdict),
+                    stale: false,
+                    dwm,
+                    hwnd: h,
+                    pid,
+                    exe: exe_of_pid(pid),
+                    title,
+                    cloaked: cloak,
+                    note: Some(format!(
+                        "PrintWindow refused ({last_err}); foreground-only desktop crop to dwm_rect. {MODE_B_NOTE}"
+                    )),
+                });
+            }
+            Err(e) => {
+                return Err(format!("error: capture_failed: crop fallback failed: {e}"));
+            }
+        }
+    }
+    let why = format!("PrintWindow refused ({last_err})");
+    Err(format!(
+        "error: capture_failed: window capture refused PrintWindow ({why}); refusing an occlusion-prone crop (pass allow_crop_fallback=true on the foreground window). {MODE_B_NOTE}"
+    ))
+}
+
+// ---------------------------------------------------------------- element model (Win32 fallback)
+
+fn role_of_class(cls: &str) -> &str {
+    match cls {
+        "Button" => "Button",
+        "Edit" => "Edit",
+        "Static" => "Text",
+        "ComboBox" => "ComboBox",
+        "ListBox" => "List",
+        "SysListView32" => "List",
+        "SysTreeView32" => "Tree",
+        "SysTabControl32" => "Tab",
+        "msctls_statusbar32" => "StatusBar",
+        "msctls_progress32" => "ProgressBar",
+        "msctls_trackbar32" => "Slider",
+        "ScrollBar" => "ScrollBar",
+        c if c.is_empty() => "Unknown",
+        c => c,
+    }
+}
+
+fn win32_element_list(hwnd: HWND) -> Result<(Vec<Map<String, Value>>, bool), String> {
+    let kids = enum_child_windows(hwnd)?;
+    let mut entries: Vec<Map<String, Value>> = Vec::new();
+    let mut truncated = false;
+    for (i, h) in kids.iter().enumerate() {
+        if entries.len() >= ELEMENT_CAP {
+            truncated = true;
+            break;
+        }
+        let name = unsafe { win_text(*h) };
+        let cls = unsafe { win_class(*h) };
+        let cid = unsafe { GetDlgCtrlID(*h) };
+        let aid = if cid > 0 {
+            cid.to_string()
+        } else {
+            String::new()
+        };
+        let rect = unsafe {
+            let mut rc = RECT::default();
+            if GetWindowRect(*h, &mut rc) != 0 {
+                vec![
+                    rc.left as i64,
+                    rc.top as i64,
+                    (rc.right - rc.left) as i64,
+                    (rc.bottom - rc.top) as i64,
+                ]
+            } else {
+                vec![0, 0, 0, 0]
+            }
+        };
+        let inv = cls == "Button";
+        if !name.is_empty() || !aid.is_empty() || inv {
+            let mut e = Map::new();
+            e.insert("win".to_string(), Value::from(hwnd as i64));
+            e.insert("role".to_string(), Value::from(role_of_class(&cls)));
+            e.insert("name".to_string(), Value::from(name));
+            e.insert("auto_id".to_string(), Value::from(aid));
+            e.insert("rect".to_string(), Value::from(rect));
+            e.insert("invokable".to_string(), Value::from(inv));
+            e.insert("path".to_string(), Value::from(i.to_string()));
+            e.insert("hwnd".to_string(), Value::from(*h as i64));
+            entries.push(e);
+        }
+    }
+    Ok((entries, truncated))
+}
+
+pub struct ElementModel {
+    pub entries: Vec<Map<String, Value>>,
+    pub truncated: bool,
+    pub backend: String,
+    pub detail: Map<String, Value>,
+}
+
+pub fn element_model(hwnd: HWND) -> ElementModel {
+    // puppet.py:1253-1331: UIA first (wins iff >=1 entry), else the Win32
+    // EnumChildWindows fallback. detail carries uia_available (COM loadable),
+    // uia_error (why UIA failed, else null), fallback (which fallback ran,
+    // else null), empty + empty_reason, depth_capped + depth_limit.
+    let uia_avail = crate::uia::uia_available();
+    let mut uia_error: Option<String> = None;
+    match crate::uia::uia_element_list(hwnd) {
+        Ok((entries, trunc, dcapped)) => {
+            if !entries.is_empty() {
+                let mut detail = Map::new();
+                detail.insert("uia_available".to_string(), Value::from(true));
+                detail.insert("uia_error".to_string(), Value::Null);
+                detail.insert("fallback".to_string(), Value::Null);
+                detail.insert("empty".to_string(), Value::from(false));
+                detail.insert("depth_capped".to_string(), Value::from(dcapped));
+                detail.insert("depth_limit".to_string(), Value::from(UIA_DEPTH_LIMIT));
+                return ElementModel {
+                    entries,
+                    truncated: trunc,
+                    backend: "uia".to_string(),
+                    detail,
+                };
+            }
+            let _ = dcapped;
+        }
+        Err(e) => {
+            uia_error = Some(e);
+        }
+    }
+    let mut detail = Map::new();
+    detail.insert("uia_available".to_string(), Value::from(uia_avail));
+    detail.insert(
+        "uia_error".to_string(),
+        uia_error.clone().map(Value::from).unwrap_or(Value::Null),
+    );
+    detail.insert("fallback".to_string(), Value::from("win32"));
+    detail.insert("depth_capped".to_string(), Value::from(false));
+    detail.insert("depth_limit".to_string(), Value::from(UIA_DEPTH_LIMIT));
+    match win32_element_list(hwnd) {
+        Err(e) => {
+            detail.insert("empty".to_string(), Value::from(true));
+            detail.insert(
+                "empty_reason".to_string(),
+                Value::from(format!("win32 fallback failed: {e}")),
+            );
+            ElementModel {
+                entries: vec![],
+                truncated: false,
+                backend: "win32".to_string(),
+                detail,
+            }
+        }
+        Ok((entries, trunc)) => {
+            if entries.is_empty() {
+                let reason = format!(
+                    "UIA yielded no entries{} and the win32 fallback found no children",
+                    uia_error.map(|s| format!(" ({s})")).unwrap_or_default()
+                );
+                detail.insert("empty".to_string(), Value::from(true));
+                detail.insert("empty_reason".to_string(), Value::from(reason));
+            } else {
+                detail.insert("empty".to_string(), Value::from(false));
+            }
+            ElementModel {
+                entries,
+                truncated: trunc,
+                backend: "win32".to_string(),
+                detail,
+            }
+        }
+    }
+}
+
+pub fn elements_block(hwnd: HWND) -> String {
+    let m = element_model(hwnd);
+    let mut o = Map::new();
+    o.insert("backend".to_string(), Value::from(m.backend));
+    o.insert("truncated".to_string(), Value::from(m.truncated));
+    o.insert("rect_space".to_string(), Value::from("screen"));
+    o.insert("elements".to_string(), Value::from(m.entries));
+    o.insert(
+        "uia_available".to_string(),
+        m.detail["uia_available"].clone(),
+    );
+    o.insert("uia_error".to_string(), m.detail["uia_error"].clone());
+    o.insert("fallback".to_string(), m.detail["fallback"].clone());
+    o.insert("empty".to_string(), m.detail["empty"].clone());
+    if m.detail.get("empty") == Some(&Value::from(true)) {
+        if let Some(r) = m.detail.get("empty_reason") {
+            o.insert("empty_reason".to_string(), r.clone());
+        }
+    }
+    o.insert("depth_capped".to_string(), m.detail["depth_capped"].clone());
+    o.insert("depth_limit".to_string(), m.detail["depth_limit"].clone());
+    crate::py_dumps_compact(&Value::Object(o))
+}
