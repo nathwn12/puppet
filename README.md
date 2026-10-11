@@ -8,7 +8,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="license: MIT"></a>
   <img src="https://img.shields.io/badge/language-Rust-orange.svg" alt="language: Rust">
   <img src="https://img.shields.io/badge/platform-Windows-blue.svg" alt="platform: Windows">
-  <a href="https://github.com/nathwn12/puppet-mcp/actions/workflows/ci.yml"><img src="https://github.com/nathwn12/puppet-mcp/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+  <a href="https://github.com/nathwn12/puppet/actions/workflows/ci.yml"><img src="https://github.com/nathwn12/puppet/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
 </p>
 
 ## What it is
@@ -48,7 +48,7 @@ runtime. Single static binary, fast desktop capture, same 5-tool contract.
 ## Install
 
 A prebuilt Windows binary (`puppet.exe`) is attached to the
-[GitHub Releases](https://github.com/nathwn12/puppet-mcp/releases) page.
+[GitHub Releases](https://github.com/nathwn12/puppet/releases) page.
 Download it, then point your MCP client at it. Building from source (below)
 is the alternative.
 
