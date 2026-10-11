@@ -9,25 +9,25 @@ use crate::{
     opt_int, opt_str, req_bool, req_int, req_str, verr_text, LATEST_VERSION, SUPPORTED_VERSIONS,
 };
 use serde_json::{Map, Value};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, Write};
 
-fn write_result(out: &mut impl Write, id: &Value, result: &str) {
+fn write_result(out: &mut impl Write, id: &Value, result: &str) -> std::io::Result<()> {
     let ids = serde_json::to_string(id).unwrap();
-    let _ = writeln!(
+    writeln!(
         out,
         "{{\"jsonrpc\":\"2.0\",\"id\":{ids},\"result\":{result}}}"
-    );
-    let _ = out.flush();
+    )?;
+    out.flush()
 }
 
-fn write_error(out: &mut impl Write, id: &Value, code: i64, msg: &str) {
+fn write_error(out: &mut impl Write, id: &Value, code: i64, msg: &str) -> std::io::Result<()> {
     let ids = serde_json::to_string(id).unwrap();
     let ms = serde_json::to_string(msg).unwrap();
-    let _ = writeln!(
+    writeln!(
         out,
         "{{\"jsonrpc\":\"2.0\",\"id\":{ids},\"error\":{{\"code\":{code},\"message\":{ms}}}}}"
-    );
-    let _ = out.flush();
+    )?;
+    out.flush()
 }
 
 fn init_result(params: &Value) -> String {
@@ -344,27 +344,37 @@ fn tools_call(params: &Value) -> String {
     }
 }
 
-fn handle(v: &Value, out: &mut impl Write) {
+fn handle(v: &Value, out: &mut impl Write) -> std::io::Result<()> {
     let method = v.get("method").and_then(|m| m.as_str());
     let id = v.get("id").cloned();
     match (method, id) {
-        (None, _) => {}
-        (Some(_), None) => {}
+        (None, _) => Ok(()),
+        (Some(_), None) => Ok(()),
         (Some(m), Some(id)) => match m {
             "initialize" => {
                 let p = v.get("params").cloned().unwrap_or(Value::Null);
-                write_result(out, &id, &init_result(&p));
+                write_result(out, &id, &init_result(&p))
             }
             "tools/list" => write_result(out, &id, &tools_list_result()),
             "tools/call" => {
                 let p = v.get("params").cloned().unwrap_or(Value::Null);
-                write_result(out, &id, &tools_call(&p));
+                match p.get("arguments") {
+                    None | Some(Value::Null) | Some(Value::Object(_)) => {
+                        write_result(out, &id, &tools_call(&p))
+                    }
+                    Some(_) => write_error(
+                        out,
+                        &id,
+                        -32602,
+                        "Invalid params: arguments must be an object",
+                    ),
+                }
             }
             "ping" => write_result(out, &id, "{}"),
             "prompts/list" => write_result(out, &id, "{\"prompts\":[]}"),
             "resources/list" => write_result(out, &id, "{\"resources\":[]}"),
             "resources/templates/list" => write_result(out, &id, "{\"resourceTemplates\":[]}"),
-            _ if m.starts_with("notifications/") => {}
+            _ if m.starts_with("notifications/") => Ok(()),
             _ => write_error(out, &id, -32601, &format!("Method not found: {m}")),
         },
     }
@@ -373,7 +383,16 @@ fn handle(v: &Value, out: &mut impl Write) {
 pub fn run() {
     let stdin = std::io::stdin();
     let mut out = std::io::stdout();
-    let reader = BufReader::new(stdin.lock());
+    let code = pump(stdin.lock(), &mut out);
+    if code != 0 {
+        std::process::exit(code);
+    }
+}
+
+/// Stdio pump, split from `run` for testability. Returns the process exit
+/// code: 0 on clean stdin EOF, 1 when a response could not be written
+/// (dead client: stop consuming stdin instead of spinning forever).
+fn pump(reader: impl BufRead, out: &mut impl Write) -> i32 {
     for line in reader.lines() {
         let line = match line {
             Ok(l) => l,
@@ -384,19 +403,116 @@ pub fn run() {
             continue;
         }
         if !t.starts_with('{') && !t.starts_with('[') {
+            if write_error(out, &Value::Null, -32700, "Parse error").is_err() {
+                return 1;
+            }
             continue;
         }
         let v: Value = match serde_json::from_str(t) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(_) => {
+                if write_error(out, &Value::Null, -32700, "Parse error").is_err() {
+                    return 1;
+                }
+                continue;
+            }
         };
         if v.is_array() {
+            if write_error(
+                out,
+                &Value::Null,
+                -32600,
+                "Batch requests are not supported",
+            )
+            .is_err()
+            {
+                return 1;
+            }
             continue;
         }
-        handle(&v, &mut out);
+        if handle(&v, out).is_err() {
+            return 1;
+        }
     }
+    0
 }
 
 pub fn monitor_count() -> i64 {
     display_monitors().len() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn run_pump(input: &[u8]) -> (i32, String) {
+        let mut out: Vec<u8> = Vec::new();
+        let code = pump(input, &mut out);
+        (code, String::from_utf8(out).expect("utf8"))
+    }
+
+    #[test]
+    fn parse_error_gets_reply() {
+        let (code, s) = run_pump(b"not-json\n");
+        assert_eq!(code, 0);
+        assert!(
+            s.contains("-32700"),
+            "unparseable frame must get a Parse error reply, got: {s}"
+        );
+    }
+
+    #[test]
+    fn batch_array_rejected() {
+        let (code, s) = run_pump(b"[1, 2]\n");
+        assert_eq!(code, 0);
+        assert!(
+            s.contains("-32600"),
+            "batch array must be explicitly rejected, got: {s}"
+        );
+    }
+
+    #[test]
+    fn non_object_arguments_rejected() {
+        let frame = br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"cursor","arguments":42}}"#;
+        let mut framed = frame.to_vec();
+        framed.push(b'\n');
+        let (code, s) = run_pump(&framed);
+        assert_eq!(code, 0);
+        assert!(
+            s.contains("-32602"),
+            "non-object arguments must get Invalid params, got: {s}"
+        );
+    }
+
+    #[test]
+    fn clean_eof_exits_zero() {
+        let frame = br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        let mut framed = frame.to_vec();
+        framed.push(b'\n');
+        let (code, s) = run_pump(&framed);
+        assert_eq!(code, 0);
+        assert!(s.contains("\"result\":{}"), "ping must answer, got: {s}");
+    }
+
+    struct FailWriter;
+
+    impl Write for FailWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+    }
+
+    #[test]
+    fn dead_client_stops_pump_nonzero() {
+        let frame = br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        let mut framed = frame.to_vec();
+        framed.push(b'\n');
+        let mut out = FailWriter;
+        let code = pump(&framed[..], &mut out);
+        assert_eq!(code, 1, "broken stdout must stop the pump with code 1");
+    }
 }

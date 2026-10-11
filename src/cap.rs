@@ -876,6 +876,9 @@ pub fn finalize(
             if m <= 0 {
                 return Err("error: bad_region: max_px must be a positive int or null".to_string());
             }
+            if m > 8192 {
+                return Err(format!("error: bad_region: max_px absurd (>8192): {m}"));
+            }
             Some(m)
         }
     };
@@ -920,4 +923,39 @@ pub fn finalize(
         encode_png(&img).map_err(|e| format!("error: capture_failed: {e}"))?
     };
     Ok((data, iw, ih, scale, f, q))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny() -> Img {
+        Img {
+            w: 4,
+            h: 4,
+            px: vec![128u8; 4 * 4 * 3],
+        }
+    }
+
+    #[test]
+    fn finalize_rejects_absurd_max_px() {
+        let r = finalize(tiny(), Some(1_000_000_000_000), "jpeg", Some(80), false);
+        assert!(r.is_err(), "absurd max_px must be rejected, got Ok");
+    }
+
+    #[test]
+    fn finalize_rejects_nonpositive_max_px() {
+        assert!(finalize(tiny(), Some(0), "jpeg", Some(80), false).is_err());
+        assert!(finalize(tiny(), Some(-5), "jpeg", Some(80), false).is_err());
+    }
+
+    #[test]
+    fn finalize_accepts_sane_max_px() {
+        let (data, iw, ih, _, f, q) =
+            finalize(tiny(), Some(1280), "jpeg", Some(80), false).expect("sane max_px");
+        assert_eq!((iw, ih), (4, 4));
+        assert_eq!(f, "jpeg");
+        assert_eq!(q, 80);
+        assert!(!data.is_empty());
+    }
 }
