@@ -1,12 +1,35 @@
-# puppet 4.1.0 — native Rust Windows desktop-control MCP server
+<p align="center"><img src="assets/icon.svg" width="96" alt="puppet"></p>
 
-What it is: a native-Rust Windows desktop-control MCP server speaking stdio
+<h1 align="center">puppet</h1>
+
+<p align="center">Native Rust Windows desktop-control MCP server — stdio in, pixels out.</p>
+
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="license: MIT"></a>
+  <img src="https://img.shields.io/badge/language-Rust-orange.svg" alt="language: Rust">
+  <img src="https://img.shields.io/badge/platform-Windows-blue.svg" alt="platform: Windows">
+  <a href="https://github.com/nathwn12/puppet-mcp/actions/workflows/ci.yml"><img src="https://github.com/nathwn12/puppet-mcp/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+</p>
+
+## What it is
+
+A native-Rust Windows desktop-control MCP server speaking stdio
 (JSON-RPC 2.0 over stdin/stdout). It exposes exactly 5 tools — `screenshot`,
 `list_windows`, `window`, `do`, `cursor` — and reports MCP
 `serverInfo { name: puppet, version: 4.1.0 }`.
 
-Why: a Rust port of the Python incumbent — no Python runtime and no venv at
+Transport: stdio MCP, newline-delimited JSON-RPC 2.0. `stdout` carries
+protocol frames only; logs go to `stderr`.
+
+## Why
+
+A Rust port of the Python incumbent — no Python runtime and no venv at
 runtime. Single static binary, fast desktop capture, same 5-tool contract.
+
+- Native Rust, no Python or venv at runtime.
+- Single static binary (`puppet.exe`).
+- Fast desktop capture via the DXGI desktop-capture path.
+- Same 5-tool contract as the Python incumbent.
 
 ## Tools
 
@@ -22,13 +45,44 @@ runtime. Single static binary, fast desktop capture, same 5-tool contract.
 
 - Windows (Win32 APIs: GDI/DXGI, UIA, SendInput). No Python required at runtime.
 
-## Build
+## Install
 
-```text
-cargo build --release
+A prebuilt Windows binary (`puppet.exe`) is attached to the
+[GitHub Releases](https://github.com/nathwn12/puppet-mcp/releases) page.
+Download it, then point your MCP client at it. Building from source (below)
+is the alternative.
+
+```jsonc
+{
+  "mcp": {
+    "puppet": {
+      "type": "local",
+      "command": ["<path-to>\\puppet.exe"]
+    }
+  }
+}
 ```
 
-## Run
+Replace `<path-to>` with the folder holding `puppet.exe`.
+
+## Usage
+
+Wire the binary into your MCP client config and start the client. The server
+speaks stdio (JSON-RPC 2.0 over stdin/stdout), so there is nothing else to
+launch by hand — the client spawns it.
+
+```jsonc
+{
+  "mcp": {
+    "puppet": {
+      "type": "local",
+      "command": ["<path-to>\\puppet.exe"]
+    }
+  }
+}
+```
+
+Manual run (same binary the client would spawn):
 
 ```text
 target\release\puppet.exe
@@ -37,7 +91,20 @@ target\release\puppet.exe
 - Transport: stdio MCP, newline-delimited JSON-RPC 2.0.
 - `stdout` carries protocol frames only; logs go to `stderr`.
 
-## Measured
+## Build from source
+
+Requires a Rust toolchain (stable) on Windows.
+
+```text
+cargo build --release
+```
+
+The binary lands at `target\release\puppet.exe`, then configure your client
+as in Install above.
+
+## Measured performance
+
+Numbers below were measured on the author's machine, not in CI.
 
 - Desktop capture: 15.82 ms default / 19.78 ms normalized, versus the Python
   incumbent at 35.78 / 35.99 ms.
