@@ -28,23 +28,54 @@ A Rust port of the Python incumbent, so there is no interpreter to install and c
 | do | Send input / window operations (mouse, keyboard, window ops). |
 | cursor | Report the current cursor position and monitor rects as JSON. |
 
+## Requirements
+
+- Windows 10/11, 64-bit. `puppet` is Windows-only by nature: it drives the
+  Win32 desktop (DXGI/GDI capture, SendInput, UIA), so there is no macOS or
+  Linux build and WSL cannot substitute for it.
+- No external runtime: no Python, no venv, no browser, no Node. One static
+  binary (`puppet.exe`); the Rust toolchain is needed only to build from
+  source.
+
+## Supported platforms
+
+Windows x86-64 only. Other platforms are not supported — GUI automation here
+means the Windows desktop API surface, which does not exist elsewhere.
+
 ## Install
 
-1. Download `puppet.exe` from the [GitHub Releases](https://github.com/nathwn12/puppet/releases) page.
-2. Point your MCP client at it:
+1. Download `puppet-<version>-windows-x86_64.zip` from the [GitHub Releases](https://github.com/nathwn12/puppet/releases) page and unzip it anywhere (it contains `puppet.exe`, `LICENSE`, `README.md`).
+2. Point your MCP client at it (pick your client):
+
+OpenCode V2 (`opencode.json`):
 
 ```jsonc
 {
   "mcp": {
-    "puppet": {
-      "type": "local",
-      "command": ["<path-to>\\puppet.exe"]
+    "servers": {
+      "puppet": {
+        "type": "local",
+        "command": ["C:\\tools\\puppet\\puppet.exe"]
+      }
     }
   }
 }
 ```
 
-3. Replace `<path-to>` with the folder holding `puppet.exe`, then restart the client. Building from source (below) is the alternative.
+Claude Desktop (`claude_desktop_config.json`):
+
+```jsonc
+{
+  "mcpServers": {
+    "puppet": {
+      "command": "C:\\tools\\puppet\\puppet.exe",
+      "args": []
+    }
+  }
+}
+```
+
+3. Replace the path with the folder holding `puppet.exe`, then restart the client. Building from source (below) is the alternative.
 
 ## Usage
 

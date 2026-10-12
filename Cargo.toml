@@ -2,6 +2,12 @@
 name = "puppet"
 version = "4.1.0"
 edition = "2021"
+license = "MIT"
+description = "Native-Rust Windows desktop-control MCP server over stdio: screenshot, windows, input, cursor."
+repository = "https://github.com/nathwn12/puppet"
+keywords = ["mcp", "windows", "automation", "desktop", "screenshot"]
+categories = ["command-line-utilities"]
+rust-version = "1.80"
 
 [dependencies]
 windows-sys = { version = "0.61", features = [
