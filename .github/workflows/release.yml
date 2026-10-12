@@ -1,0 +1,25 @@
+# nathwn12 house release — stack: rust (copy to .github/workflows/release.yml)
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --locked --release
+      - shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $zip = "puppet-$tag-windows-x86_64.zip"
+          Compress-Archive -Path target\release\puppet.exe, LICENSE, README.md -DestinationPath $zip
+          (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower() + "  $zip" | Out-File "$zip.sha256" -Encoding ascii
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            puppet-*.zip
+            puppet-*.zip.sha256
