@@ -1,12 +1,17 @@
 //! JSON-RPC stdio loop + per-tool validation (pydantic-shaped) + dispatch.
 
 use crate::burst::do_burst;
-use crate::schemas::{TOOL_CURSOR, TOOL_DO, TOOL_LIST_WINDOWS, TOOL_SCREENSHOT, TOOL_WINDOW};
+use crate::cap::resolve_selector;
+use crate::schemas::{
+    TOOL_CURSOR, TOOL_DO, TOOL_ELEMENTS, TOOL_LIST_WINDOWS, TOOL_SCREENSHOT, TOOL_WINDOW,
+};
 use crate::screen::{dispatch_screenshot, ShotArgs};
+use crate::shot::{compact_entry, element_model, elements_object};
 use crate::winop::{do_cursor, do_list_windows, do_window, WinArgs};
 use crate::{
     check_no_extra, coerce_int, coerce_str, display_monitors, err_result_text, missing_arg,
-    opt_int, opt_str, req_bool, req_int, req_str, verr_text, LATEST_VERSION, SUPPORTED_VERSIONS,
+    opt_int, opt_str, py_dumps, req_bool, req_int, req_str, verr_text, wrapped_text,
+    LATEST_VERSION, SUPPORTED_VERSIONS,
 };
 use serde_json::{Map, Value};
 use std::io::{BufRead, Write};
@@ -41,13 +46,13 @@ fn init_result(params: &Value) -> String {
         LATEST_VERSION
     };
     format!(
-        "{{\"protocolVersion\":{},\"capabilities\":{{\"logging\":{{}},\"prompts\":{{\"listChanged\":true}},\"resources\":{{\"subscribe\":false,\"listChanged\":true}},\"tools\":{{\"listChanged\":true}}}},\"serverInfo\":{{\"name\":\"puppet\",\"version\":\"4.1.0\"}}}}",
+        "{{\"protocolVersion\":{},\"capabilities\":{{\"logging\":{{}},\"prompts\":{{\"listChanged\":true}},\"resources\":{{\"subscribe\":false,\"listChanged\":true}},\"tools\":{{\"listChanged\":true}}}},\"serverInfo\":{{\"name\":\"puppet\",\"version\":\"4.3.0\"}}}}",
         serde_json::to_string(echo).unwrap()
     )
 }
 
 fn tools_list_result() -> String {
-    format!("{{\"tools\":[{TOOL_SCREENSHOT},{TOOL_LIST_WINDOWS},{TOOL_WINDOW},{TOOL_DO},{TOOL_CURSOR}]}}")
+    format!("{{\"tools\":[{TOOL_SCREENSHOT},{TOOL_LIST_WINDOWS},{TOOL_WINDOW},{TOOL_DO},{TOOL_CURSOR},{TOOL_ELEMENTS}]}}")
 }
 
 fn call_window(args: &Map<String, Value>) -> String {
@@ -104,6 +109,61 @@ fn call_window(args: &Map<String, Value>) -> String {
         width: width.unwrap(),
         height: height.unwrap(),
     })
+}
+
+/// Zero-pixel structured enumeration: resolve the window selector, then reuse
+/// the screenshot element walk (`shot::element_model`, the same object as
+/// `shot::elements_block`) and return it as structured JSON.
+fn call_elements(args: &Map<String, Value>) -> String {
+    let mut errs = Vec::new();
+    check_no_extra(args, &mut errs, &["title", "hwnd", "detail"]);
+    let title = opt_str(args, &mut errs, "title");
+    let hwnd = opt_int(args, &mut errs, "hwnd");
+    let detail = req_bool(args, &mut errs, "detail");
+    if !errs.is_empty() {
+        return err_result_text(&verr_text("elements", &errs));
+    }
+    let (t, h, d) = (title.unwrap(), hwnd.unwrap(), detail.unwrap());
+    // Same branches as `cap::resolve_window`, spelled through
+    // `resolve_selector` directly: explicit hwnd wins, else title text.
+    let (hwnd_r, err, cands) = match (h, t) {
+        (Some(v), _) => resolve_selector(&format!("hwnd:{v}")),
+        (None, Some(v)) if !v.is_empty() => resolve_selector(&v),
+        _ => (
+            None,
+            Some("bad_window: need title or hwnd".to_string()),
+            None,
+        ),
+    };
+    if hwnd_r.is_none() {
+        let mut payload = Map::new();
+        payload.insert("ok".to_string(), Value::from(false));
+        payload.insert("error".to_string(), Value::from(err.unwrap()));
+        if let Some(c) = cands {
+            payload.insert(
+                "candidates".to_string(),
+                Value::from(c.into_iter().map(Value::Object).collect::<Vec<_>>()),
+            );
+        }
+        return wrapped_text(&py_dumps(&Value::Object(payload)));
+    }
+    let model = element_model(hwnd_r.unwrap());
+    let entries: Vec<Value> = if d {
+        model.entries.into_iter().map(Value::Object).collect()
+    } else {
+        model
+            .entries
+            .iter()
+            .map(compact_entry)
+            .map(Value::Object)
+            .collect()
+    };
+    // Same top-level object as `shot::elements_block`, as structured JSON
+    // (both assemble through `shot::elements_object`; only the entries
+    // slice differs: full walk entries under detail=true, compact
+    // projections by default).
+    let o = elements_object(&model.backend, model.truncated, entries, &model.detail);
+    wrapped_text(&py_dumps(&Value::Object(o)))
 }
 
 fn call_screenshot(args: &Map<String, Value>) -> String {
@@ -340,6 +400,7 @@ fn tools_call(params: &Value) -> String {
             Some(e) => e,
             None => do_cursor(),
         },
+        "elements" => call_elements(&args),
         _ => err_result_text(&format!("Unknown tool: '{name}'")),
     }
 }
@@ -514,5 +575,173 @@ mod tests {
         let mut out = FailWriter;
         let code = pump(&framed[..], &mut out);
         assert_eq!(code, 1, "broken stdout must stop the pump with code 1");
+    }
+
+    fn elements_args(pairs: &[(&str, Value)]) -> Map<String, Value> {
+        let mut m = Map::new();
+        for (k, v) in pairs {
+            m.insert((*k).to_string(), v.clone());
+        }
+        m
+    }
+
+    #[test]
+    fn elements_rejects_unknown_arg_like_neighbours() {
+        let args = elements_args(&[("title", Value::from("x")), ("bogus", Value::from(1))]);
+        let s = call_elements(&args);
+        assert!(
+            s.contains("validation error for call[elements]"),
+            "unknown arg must fail validation, got: {s}"
+        );
+        assert!(
+            s.contains("unexpected_keyword_argument"),
+            "unknown arg needs the shared extra-key type, got: {s}"
+        );
+    }
+
+    #[test]
+    fn elements_rejects_overflow_hwnd_with_shared_error() {
+        let v = serde_json::json!("9223372036854775808"); // i64::MAX + 1
+        let s = call_elements(&elements_args(&[("hwnd", v.clone())]));
+        assert!(
+            s.contains("validation error for call[elements]"),
+            "overflow hwnd must fail validation, got: {s}"
+        );
+        assert!(
+            s.contains("does not fit in i64") && s.contains("int_parsing"),
+            "overflow hwnd needs the shared range message, got: {s}"
+        );
+    }
+
+    #[test]
+    fn elements_tool_schema_has_expected_input_schema() {
+        let t: Value = serde_json::from_str(crate::schemas::TOOL_ELEMENTS)
+            .expect("TOOL_ELEMENTS must be JSON");
+        assert_eq!(t.get("name").and_then(|v| v.as_str()), Some("elements"));
+        let props = t
+            .get("inputSchema")
+            .and_then(|s| s.get("properties"))
+            .and_then(|p| p.as_object())
+            .expect("elements inputSchema.properties");
+        for k in ["title", "hwnd", "detail"] {
+            assert!(props.contains_key(k), "elements schema needs {k}");
+        }
+        assert_eq!(
+            t.get("inputSchema")
+                .and_then(|s| s.get("additionalProperties")),
+            Some(&Value::from(false))
+        );
+        assert_eq!(props["detail"].get("default"), Some(&Value::from(false)));
+    }
+
+    fn elements_payload(args: &Map<String, Value>) -> Value {
+        let out = call_elements(args);
+        let outer: Value = serde_json::from_str(&out).expect("outer frame");
+        let inner = outer
+            .get("structuredContent")
+            .and_then(|s| s.get("result"))
+            .and_then(|r| r.as_str())
+            .expect("structured result");
+        serde_json::from_str(inner).expect("elements payload")
+    }
+
+    #[test]
+    fn elements_live_offscreen_fixture_lists_edit_and_ok() {
+        // Live resolve path against a real HWND the test owns (offscreen,
+        // never activated): proves `elements` beyond unit/schema assertions.
+        let f = crate::fixture::Fixture::new();
+        let hwnd = f.hwnd() as i64;
+        let fg_before =
+            unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+        // Poll own fixture only until the UIA backend stabilizes (first walk
+        // can race ShowWindow and fall back to win32).
+        let payload = {
+            let t0 = std::time::Instant::now();
+            loop {
+                let p = elements_payload(&elements_args(&[("hwnd", Value::from(hwnd))]));
+                let be = p.get("backend").and_then(|v| v.as_str()).unwrap_or("");
+                let n = p
+                    .get("elements")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                if (be == "uia" && n >= 3) || t0.elapsed() > std::time::Duration::from_secs(5) {
+                    break p;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        };
+        assert_eq!(payload.get("uia_available"), Some(&Value::from(true)));
+        let els = payload
+            .get("elements")
+            .and_then(|v| v.as_array())
+            .expect("elements");
+        assert!(
+            !els.is_empty(),
+            "offscreen fixture must list a non-empty element list"
+        );
+        let has_edit = els
+            .iter()
+            .any(|e| e.get("role").and_then(|v| v.as_str()) == Some("Edit"));
+        let has_ok = els.iter().any(|e| {
+            e.get("name").and_then(|v| v.as_str()) == Some("OK")
+                && e.get("role").and_then(|v| v.as_str()) == Some("Button")
+        });
+        assert!(
+            has_edit,
+            "element list must contain the EDIT control, got: {payload}"
+        );
+        assert!(
+            has_ok,
+            "element list must contain the OK button, got: {payload}"
+        );
+        for e in els {
+            let o = e.as_object().expect("entry object");
+            assert!(
+                o.contains_key("ref"),
+                "compact entry must carry ref, got: {o:?}"
+            );
+            assert!(
+                !o["ref"].as_str().unwrap_or("").is_empty(),
+                "ref must be populated"
+            );
+            for k in crate::shot::COMPACT_ELEMENT_KEYS {
+                assert!(
+                    o.contains_key(k),
+                    "compact entry must carry {k}, got: {o:?}"
+                );
+            }
+            assert!(!o.contains_key("win"), "compact default must omit win");
+        }
+        assert_eq!(payload.get("backend").and_then(|v| v.as_str()), Some("uia"));
+        // Foreground untouched by a zero-pixel read.
+        assert_eq!(
+            unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() },
+            fg_before
+        );
+        // Evidence for the report (captured with -- --nocapture).
+        println!("ELEMENTS_COMPACT_FIXTURE_JSON={payload}");
+    }
+
+    #[test]
+    fn elements_live_detail_keeps_win() {
+        let f = crate::fixture::Fixture::new();
+        let hwnd = f.hwnd() as i64;
+        let payload = elements_payload(&elements_args(&[
+            ("hwnd", Value::from(hwnd)),
+            ("detail", Value::from(true)),
+        ]));
+        let els = payload
+            .get("elements")
+            .and_then(|v| v.as_array())
+            .expect("elements");
+        assert!(!els.is_empty());
+        let first = els[0].as_object().expect("entry");
+        assert_eq!(
+            first.get("win").and_then(|v| v.as_i64()),
+            Some(hwnd),
+            "detail must keep raw win"
+        );
+        println!("ELEMENTS_DETAIL_FIXTURE_JSON={payload}");
     }
 }

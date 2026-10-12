@@ -1,6 +1,6 @@
-//! puppet-rs: native Rust MCP server, wire-parity with puppet.py (FastMCP 4.1.0).
+//! puppet-rs: native Rust MCP server, wire-parity with puppet.py (FastMCP 4.3.0).
 //!
-//! Tools: screenshot, list_windows, window, do, cursor.
+//! Tools: screenshot, list_windows, window, do, cursor, elements.
 //! HEADLESS: windows_subsystem windows (never a console); stdout carries
 //! protocol frames ONLY; diagnostics go to stderr.
 
@@ -1097,6 +1097,8 @@ fn parse_selector(sel: &str) -> (String, String) {
 pub mod burst;
 pub mod cap;
 pub mod dxgi;
+#[cfg(test)]
+pub mod fixture;
 pub mod screen;
 pub mod serve;
 pub mod shot;
