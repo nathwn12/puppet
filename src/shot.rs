@@ -278,6 +278,10 @@ fn win32_element_list(hwnd: HWND) -> Result<(Vec<Map<String, Value>>, bool), Str
             e.insert("invokable".to_string(), Value::from(inv));
             e.insert("path".to_string(), Value::from(i.to_string()));
             e.insert("hwnd".to_string(), Value::from(*h as i64));
+            e.insert(
+                "ref".to_string(),
+                Value::from(format!("{}.{i}", hwnd as i64)),
+            );
             entries.push(e);
         }
     }
@@ -365,26 +369,204 @@ pub fn element_model(hwnd: HWND) -> ElementModel {
     }
 }
 
-pub fn elements_block(hwnd: HWND) -> String {
-    let m = element_model(hwnd);
+/// Compact default per-entry shape for the standalone `elements` tool:
+/// everything except the raw `win` (and `hwnd` on the Win32 fallback)
+/// identifiers, which `detail=true` retains.
+pub const COMPACT_ELEMENT_KEYS: [&str; 7] = [
+    "ref",
+    "role",
+    "name",
+    "auto_id",
+    "rect",
+    "invokable",
+    "path",
+];
+
+/// Project one full walk entry to the compact default shape.
+pub fn compact_entry(e: &Map<String, Value>) -> Map<String, Value> {
+    let mut m = Map::new();
+    for k in COMPACT_ELEMENT_KEYS {
+        if let Some(v) = e.get(k) {
+            m.insert(k.to_string(), v.clone());
+        }
+    }
+    m
+}
+
+/// Assemble the top-level elements object. `elements_block` (screenshot
+/// path) and the standalone `elements` tool both build through here, so
+/// the two stay the same top-level object by construction; only the
+/// entries slice differs (full walk entries vs compact projections).
+pub fn elements_object(
+    backend: &str,
+    truncated: bool,
+    entries: Vec<Value>,
+    detail: &Map<String, Value>,
+) -> Map<String, Value> {
     let mut o = Map::new();
-    o.insert("backend".to_string(), Value::from(m.backend));
-    o.insert("truncated".to_string(), Value::from(m.truncated));
+    o.insert("backend".to_string(), Value::from(backend));
+    o.insert("truncated".to_string(), Value::from(truncated));
     o.insert("rect_space".to_string(), Value::from("screen"));
-    o.insert("elements".to_string(), Value::from(m.entries));
+    o.insert("elements".to_string(), Value::from(entries));
     o.insert(
         "uia_available".to_string(),
-        m.detail["uia_available"].clone(),
+        detail.get("uia_available").cloned().unwrap_or(Value::Null),
     );
-    o.insert("uia_error".to_string(), m.detail["uia_error"].clone());
-    o.insert("fallback".to_string(), m.detail["fallback"].clone());
-    o.insert("empty".to_string(), m.detail["empty"].clone());
-    if m.detail.get("empty") == Some(&Value::from(true)) {
-        if let Some(r) = m.detail.get("empty_reason") {
+    o.insert(
+        "uia_error".to_string(),
+        detail.get("uia_error").cloned().unwrap_or(Value::Null),
+    );
+    o.insert(
+        "fallback".to_string(),
+        detail.get("fallback").cloned().unwrap_or(Value::Null),
+    );
+    o.insert(
+        "empty".to_string(),
+        detail.get("empty").cloned().unwrap_or(Value::from(false)),
+    );
+    if detail.get("empty") == Some(&Value::from(true)) {
+        if let Some(r) = detail.get("empty_reason") {
             o.insert("empty_reason".to_string(), r.clone());
         }
     }
-    o.insert("depth_capped".to_string(), m.detail["depth_capped"].clone());
-    o.insert("depth_limit".to_string(), m.detail["depth_limit"].clone());
+    o.insert(
+        "depth_capped".to_string(),
+        detail
+            .get("depth_capped")
+            .cloned()
+            .unwrap_or(Value::from(false)),
+    );
+    o.insert(
+        "depth_limit".to_string(),
+        detail.get("depth_limit").cloned().unwrap_or(Value::from(8)),
+    );
+    o
+}
+
+pub fn elements_block(hwnd: HWND) -> String {
+    let m = element_model(hwnd);
+    let entries: Vec<Value> = m.entries.into_iter().map(Value::Object).collect();
+    let o = elements_object(&m.backend, m.truncated, entries, &m.detail);
     crate::py_dumps_compact(&Value::Object(o))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A full Win32-fallback-style entry, keyed exactly as
+    /// `win32_element_list` builds one (`win` + `hwnd` identifiers plus
+    /// the shared `ref`/role/name/auto_id/rect/invokable/path fields).
+    fn full_win32_entry() -> Map<String, Value> {
+        let mut e = Map::new();
+        e.insert("win".to_string(), Value::from(199210));
+        e.insert("role".to_string(), Value::from("Button"));
+        e.insert("name".to_string(), Value::from("OK"));
+        e.insert("auto_id".to_string(), Value::from("2"));
+        e.insert(
+            "rect".to_string(),
+            Value::from(vec![
+                Value::from(10),
+                Value::from(20),
+                Value::from(80),
+                Value::from(24),
+            ]),
+        );
+        e.insert("invokable".to_string(), Value::from(true));
+        e.insert("path".to_string(), Value::from("3"));
+        e.insert("hwnd".to_string(), Value::from(199340));
+        e.insert("ref".to_string(), Value::from("199210.3"));
+        e
+    }
+
+    fn test_detail(empty: bool) -> Map<String, Value> {
+        let mut d = Map::new();
+        d.insert("uia_available".to_string(), Value::from(false));
+        d.insert(
+            "uia_error".to_string(),
+            Value::from("UIA unavailable in test"),
+        );
+        d.insert("fallback".to_string(), Value::from("win32"));
+        d.insert("empty".to_string(), Value::from(empty));
+        if empty {
+            d.insert(
+                "empty_reason".to_string(),
+                Value::from("UIA yielded no entries and the win32 fallback found no children"),
+            );
+        }
+        d.insert("depth_capped".to_string(), Value::from(false));
+        d.insert("depth_limit".to_string(), Value::from(8));
+        d
+    }
+
+    #[test]
+    fn compact_entry_carries_documented_keys_only() {
+        let full = full_win32_entry();
+        let c = compact_entry(&full);
+        let keys: Vec<&str> = c.keys().map(|k| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "ref",
+                "role",
+                "name",
+                "auto_id",
+                "rect",
+                "invokable",
+                "path"
+            ],
+            "compact default must carry exactly the documented keys, got: {keys:?}"
+        );
+        assert!(!c.contains_key("win"), "compact must omit win");
+        assert!(!c.contains_key("hwnd"), "compact must omit hwnd");
+    }
+
+    #[test]
+    fn detail_entry_retains_win_and_hwnd() {
+        // The detail path returns the walk entry unprojected, so the raw
+        // `win`/`hwnd` identifiers stay available for correlation.
+        let full = full_win32_entry();
+        assert_eq!(full.get("win").and_then(|v| v.as_i64()), Some(199210));
+        assert_eq!(full.get("hwnd").and_then(|v| v.as_i64()), Some(199340));
+        assert_eq!(
+            full.get("ref").and_then(|v| v.as_str()),
+            Some("199210.3"),
+            "detail keeps ref as a per-enumeration correlation token"
+        );
+    }
+
+    #[test]
+    fn top_level_key_set_matches_screenshot_block_shape() {
+        // Both the screenshot elements block (`elements_block`) and the
+        // standalone `elements` tool assemble through `elements_object`,
+        // so this key set is the contract for both.
+        let entries = vec![Value::Object(compact_entry(&full_win32_entry()))];
+        let o = elements_object("win32", false, entries, &test_detail(false));
+        let keys: Vec<&str> = o.keys().map(|k| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "backend",
+                "truncated",
+                "rect_space",
+                "elements",
+                "uia_available",
+                "uia_error",
+                "fallback",
+                "empty",
+                "depth_capped",
+                "depth_limit",
+            ],
+            "top-level keys must match the documented elements object, got: {keys:?}"
+        );
+        assert!(
+            !o.contains_key("empty_reason"),
+            "empty_reason appears only when empty:true"
+        );
+        let o_empty = elements_object("win32", false, vec![], &test_detail(true));
+        assert!(
+            o_empty.contains_key("empty_reason"),
+            "empty:true must carry empty_reason"
+        );
+    }
 }

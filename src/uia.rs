@@ -25,18 +25,20 @@ use crate::{ELEMENT_CAP, UIA_DEPTH_LIMIT};
 use serde_json::{Map, Value};
 use std::ffi::c_void;
 use windows_sys::core::{GUID, HRESULT};
-use windows_sys::Win32::Foundation::{SysFreeString, HWND, RECT};
+use windows_sys::Win32::Foundation::{SysAllocStringLen, SysFreeString, HWND, RECT};
 use windows_sys::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
 };
 use windows_sys::Win32::UI::Accessibility::{
     CUIAutomation, UIA_InvokePatternId, UIA_SelectionItemPatternId, UIA_TogglePatternId,
+    UIA_ValuePatternId,
 };
 
 const IID_IUIAUTOMATION: GUID = GUID::from_u128(0x30cbe57d_d9d0_452a_ab13_7ac5ac4825ee);
 const IID_INVOKE_PATTERN: GUID = GUID::from_u128(0xfb377fbe_8ea6_46d5_9c73_6499642d3059);
 const IID_SELECTIONITEM_PATTERN: GUID = GUID::from_u128(0xa8efa66a_0fda_421a_9194_38021f3578ea);
 const IID_TOGGLE_PATTERN: GUID = GUID::from_u128(0x94cf8058_9b8d_4ab9_8bfd_4cd0a33c8c70);
+const IID_VALUE_PATTERN: GUID = GUID::from_u128(0xa94cd8b1_0844_4cd6_9d2d_640537ab39e9);
 
 // Vtable slots (see header note for provenance).
 const IDX_QI: usize = 0;
@@ -52,6 +54,8 @@ const IDX_NAME: usize = 23;
 const IDX_AUTOMATION_ID: usize = 29;
 const IDX_BOUNDING_RECT: usize = 43;
 const IDX_PATTERN_FIRE: usize = 3;
+const IDX_VALUE_SET: usize = 3;
+const IDX_VALUE_IS_READONLY: usize = 5;
 
 /// Owning COM interface pointer: AddRef on clone, Release on drop.
 /// Mirrors `windows::core::Interface` ownership exactly (every successful
@@ -253,6 +257,45 @@ fn fire_pattern(pat: &Iface) -> HRESULT {
     }
 }
 
+/// Two-argument vtable call mirroring `fire_pattern`: ValuePattern.SetValue
+/// lives at the same slot 3 but takes a BSTR (IUIAutomationValuePattern_Vtbl:
+/// base IUnknown + SetValue(3), CurrentValue(4), CurrentIsReadOnly(5) per the
+/// windows 0.58 generated vtbl). Allocates with SysAllocStringLen so empty
+/// clears via a null BSTR; frees with SysFreeString like BSTR.
+fn value_set(pat: &Iface, text: &str) -> HRESULT {
+    unsafe {
+        type SetV = unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT;
+        let f: SetV = pat.slot(IDX_VALUE_SET);
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        let bstr: *const u16 = if wide.is_empty() {
+            std::ptr::null()
+        } else {
+            SysAllocStringLen(wide.as_ptr(), wide.len() as u32)
+        };
+        if !wide.is_empty() && bstr.is_null() {
+            return -2147024882; // E_OUTOFMEMORY
+        }
+        let hr = f(pat.0, bstr);
+        if !bstr.is_null() {
+            SysFreeString(bstr);
+        }
+        hr
+    }
+}
+
+fn value_is_readonly(pat: &Iface) -> Option<bool> {
+    unsafe {
+        type Gir = unsafe extern "system" fn(*mut c_void, *mut i32) -> HRESULT;
+        let f: Gir = pat.slot(IDX_VALUE_IS_READONLY);
+        let mut v: i32 = 0;
+        if f(pat.0, &mut v) != 0 {
+            None
+        } else {
+            Some(v != 0)
+        }
+    }
+}
+
 fn control_type_name(ct: i32) -> Option<&'static str> {
     Some(match ct {
         50040 => "AppBarControl",
@@ -391,6 +434,10 @@ impl Walk {
                 );
                 e.insert("invokable".to_string(), Value::from(inv));
                 e.insert("path".to_string(), Value::from(p.clone()));
+                e.insert(
+                    "ref".to_string(),
+                    Value::from(format!("{}.{}", self.win, p)),
+                );
                 self.entries.push(e);
             }
             if depth < UIA_DEPTH_LIMIT {
@@ -433,6 +480,35 @@ pub fn uia_element_list(hwnd: HWND) -> Result<(Vec<Map<String, Value>>, bool, bo
     Ok((w.entries, w.truncated, w.depth_capped))
 }
 
+/// Shared path-walk resolver: follow `path` (`"0.1.2"`) from `el` through
+/// the raw-view walker, transferring the chosen child's ref at each level.
+/// Err carries the already-formatted resolve message (`UIA resolve failed:`
+/// or the `went stale` form) so both activation and set_value stay closed.
+fn resolve_path_el(walker: &Iface, mut el: Iface, path: &str) -> Result<Iface, String> {
+    if !path.is_empty() {
+        for seg in path.split('.') {
+            let kids = raw_children(walker, &el);
+            let idx: i64 = match seg.trim().parse() {
+                Ok(n) => n,
+                Err(e) => return Err(format!("UIA resolve failed: {e}")),
+            };
+            if idx < 0 || idx >= kids.len() as i64 {
+                return Err(format!(
+                    "UIA path {} went stale (child {seg} missing)",
+                    crate::py_repr_str(path)
+                ));
+            }
+            // Transfer the chosen child's ref (clone = AddRef); the parent
+            // and the unchosen siblings release here, mirroring the windows
+            // build's clone-and-reassign.
+            let next = kids[idx as usize].clone();
+            drop(el);
+            el = next;
+        }
+    }
+    Ok(el)
+}
+
 /// Fire Invoke/SelectionItem/Toggle on the UIA element at path
 /// (puppet.py:1391-1439). No mouse, no focus change.
 /// `unconfirmed: activation needs owner permission` - implemented but never
@@ -448,7 +524,7 @@ pub fn uia_activate(hwnd: i64, path: &str) -> (bool, String, Option<String>) {
             )
         }
     };
-    let mut el = match element_from_handle(&auto, hwnd as HWND) {
+    let el = match element_from_handle(&auto, hwnd as HWND) {
         Ok(e) => e,
         Err(hr) => {
             return (
@@ -468,37 +544,10 @@ pub fn uia_activate(hwnd: i64, path: &str) -> (bool, String, Option<String>) {
             )
         }
     };
-    if !path.is_empty() {
-        for seg in path.split('.') {
-            let kids = raw_children(&walker, &el);
-            let idx: i64 = match seg.trim().parse() {
-                Ok(n) => n,
-                Err(e) => {
-                    return (
-                        false,
-                        String::new(),
-                        Some(format!("UIA resolve failed: {e}")),
-                    )
-                }
-            };
-            if idx < 0 || idx >= kids.len() as i64 {
-                return (
-                    false,
-                    String::new(),
-                    Some(format!(
-                        "UIA path {} went stale (child {seg} missing)",
-                        crate::py_repr_str(path)
-                    )),
-                );
-            }
-            // Transfer the chosen child's ref (clone = AddRef); the parent
-            // and the unchosen siblings release here, mirroring the windows
-            // build's clone-and-reassign.
-            let next = kids[idx as usize].clone();
-            drop(el);
-            el = next;
-        }
-    }
+    let el = match resolve_path_el(&walker, el, path) {
+        Ok(e) => e,
+        Err(msg) => return (false, String::new(), Some(msg)),
+    };
     // One arm per pattern (puppet.py:1391-1439): a failed GetCurrentPattern
     // silently tries the next pattern; QueryInterface and fire failures
     // return. The intermediate IUnknown releases on scope exit in all arms.
@@ -597,4 +646,93 @@ pub fn uia_activate(hwnd: i64, path: &str) -> (bool, String, Option<String>) {
                 .to_string(),
         ),
     )
+}
+
+/// Write `text` into the UIA element at `path` via ValuePattern.SetValue.
+/// No click, no coordinates, no focus change. Fail-closed and typed:
+/// resolve failures (`UIA resolve failed:` / `went stale`), no ValuePattern,
+/// read-only, and pattern-call failure. Via is `uia-set-value` for every
+/// pattern-level outcome, empty for resolve failures (the caller maps empty
+/// to `none`, mirroring `uia_activate`).
+pub fn uia_set_value(hwnd: i64, path: &str, text: &str) -> (bool, String, Option<String>) {
+    let auto = match automation() {
+        Ok(a) => a,
+        Err(e) => {
+            return (
+                false,
+                String::new(),
+                Some(format!("UIA resolve failed: {e}")),
+            )
+        }
+    };
+    let el = match element_from_handle(&auto, hwnd as HWND) {
+        Ok(e) => e,
+        Err(hr) => {
+            return (
+                false,
+                String::new(),
+                Some(format!("UIA resolve failed: {}", crate::hr_text(hr))),
+            )
+        }
+    };
+    let walker = match raw_view_walker(&auto) {
+        Ok(w) => w,
+        Err(hr) => {
+            return (
+                false,
+                String::new(),
+                Some(format!("UIA resolve failed: {}", crate::hr_text(hr))),
+            )
+        }
+    };
+    let el = match resolve_path_el(&walker, el, path) {
+        Ok(e) => e,
+        Err(msg) => return (false, String::new(), Some(msg)),
+    };
+    let unk = match el_get_pattern(&el, UIA_ValuePatternId) {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                false,
+                "uia-set-value".to_string(),
+                Some(
+                    "element has no ValuePattern (control is not editable via ValuePattern)"
+                        .to_string(),
+                ),
+            )
+        }
+    };
+    let pat = match unsafe { unk.query(&IID_VALUE_PATTERN) } {
+        Ok(p) => p,
+        Err(hr) => {
+            return (
+                false,
+                "uia-set-value".to_string(),
+                Some(format!(
+                    "uia-set-value pattern call failed: {}",
+                    crate::hr_text(hr)
+                )),
+            )
+        }
+    };
+    if value_is_readonly(&pat) == Some(true) {
+        return (
+            false,
+            "uia-set-value".to_string(),
+            Some("element is read-only (ValuePattern.IsReadOnly)".to_string()),
+        );
+    }
+    let hr = value_set(&pat, text);
+    if hr == 0 {
+        (true, "uia-set-value".to_string(), None)
+    } else {
+        (
+            false,
+            "uia-set-value".to_string(),
+            Some(format!(
+                "uia-set-value pattern call failed: {}",
+                crate::hr_text(hr)
+            )),
+        )
+    }
 }

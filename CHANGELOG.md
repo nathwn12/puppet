@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.3.0] - 2026-10-12
+
+### Added
+
+- `do` action `set_value`: writes text via UIA `ValuePattern.SetValue`
+  on the resolved control (`name:`/`auto_id:`/`path:` selector), with no
+  click, no coordinates, and no focus change. It fails closed with typed
+  errors (element not found, no ValuePattern, read-only, re-resolve
+  failure), reports the target and the value length, and never echoes
+  the text value back.
+
+## [4.2.1] - 2026-10-12
+
+### Fixed
+
+- Removed the `ref:` invoke selector: a `ref` token pins only window +
+  path and cannot promise element identity, so invoking by `ref:` could
+  silently retarget activation to a replacement control when the UI
+  changed between enumeration and invoke. Invoke accepts `name:`,
+  `auto_id:`, and `path:`; `ref` stays on element entries as a
+  per-enumeration correlation identifier, not a durable handle.
+- Corrected the `elements` tool description: the compact default entry
+  omits `win` (and `hwnd` on the Win32 fallback), which `detail=true`
+  retains; fixed the `hwmd` typo to `hwnd`.
+
+## [4.2.0] - 2026-10-12
+
+### Added
+
+- Standalone `elements` tool: zero-pixel structured UI enumeration for a
+  window (title/hwmd selector plus `detail`), returning the same
+  top-level object the screenshot `elements` block carries as
+  structured JSON (per entry, the compact default shape omits `win`,
+  and `hwnd` on the Win32 fallback, which `detail=true` retains).
+- Per-enumeration `ref` token (`"<hwnd>.<path>"`) on every element from
+  both the UIA and Win32 backends, for correlating entries between
+  listings; it is not an invoke selector and not an identity guarantee.
+
 ## [4.1.0] - 2026-10-11
 
 ### Added

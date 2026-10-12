@@ -1049,6 +1049,7 @@ fn element_public(e: &Map<String, Value>) -> Map<String, Value> {
     m.insert("name".to_string(), Value::from(entry_str(e, "name")));
     m.insert("role".to_string(), Value::from(entry_str(e, "role")));
     m.insert("auto_id".to_string(), Value::from(entry_str(e, "auto_id")));
+    m.insert("ref".to_string(), Value::from(entry_str(e, "ref")));
     m.insert(
         "rect".to_string(),
         e.get("rect")
@@ -1866,6 +1867,159 @@ pub fn do_burst(
                 d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
                 return Ok(Some(d));
             }
+            if typ == "set_value" {
+                let (_, ferr) = st.flush();
+                if let Some(fe) = ferr {
+                    fail_since_flush(&mut st.results, &mut st.marked, &fe);
+                } else {
+                    st.marked.clear();
+                }
+                let mut d = base_entry(i, &typ_v, false, 0.0);
+                if bg_mode && (bg_error.is_some() || bg_hwnd.is_none()) {
+                    d.insert(
+                        "error".to_string(),
+                        Value::from(
+                            bg_error
+                                .clone()
+                                .unwrap_or("bad_window: no background target".to_string()),
+                        ),
+                    );
+                    d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
+                    return Ok(Some(d));
+                }
+                let tgt = match (bg_mode, bg_hwnd) {
+                    (true, Some(h)) => h,
+                    _ => fg_now(),
+                };
+                d.insert("target_hwnd".to_string(), Value::from(tgt));
+                if tgt == 0 {
+                    d.insert(
+                        "error".to_string(),
+                        Value::from(
+                            "bad_window: set_value needs a background target or a foreground window",
+                        ),
+                    );
+                    d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
+                    return Ok(Some(d));
+                }
+                let model = element_model(tgt as HWND);
+                if dry_run {
+                    d.insert("dry_run".to_string(), Value::from(true));
+                }
+                d.insert("backend".to_string(), Value::from(model.backend.clone()));
+                // Argument validation: element must be present (same
+                // name:|auto_id:|path: forms as invoke; ref: stays rejected
+                // by match_element's unknown-kind path). Empty here gets the
+                // set_value-typed message instead of invoke's.
+                let elem_ok = match ad.get("element") {
+                    Some(v) if py_truthy(v) && !py_str(v).trim().is_empty() => true,
+                    _ => false,
+                };
+                if !elem_ok {
+                    d.insert(
+                        "error".to_string(),
+                        Value::from("set_value needs \"element\" (e.g. \"name:OK\")"),
+                    );
+                    d.insert("resolution".to_string(), Value::from("not-found"));
+                    if dry_run {
+                        d.insert("via".to_string(), Value::from("none"));
+                    }
+                    d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
+                    return Ok(Some(d));
+                }
+                let (entry, merr, mcands) =
+                    match_element(&model.entries, ad.get("element"), ad.get("index"));
+                if let Some(me) = merr {
+                    d.insert("error".to_string(), Value::from(me));
+                    d.insert(
+                        "resolution".to_string(),
+                        Value::from(if mcands.is_some() {
+                            "ambiguous"
+                        } else {
+                            "not-found"
+                        }),
+                    );
+                    if let Some(c) = mcands {
+                        d.insert(
+                            "candidates".to_string(),
+                            Value::from(c.into_iter().map(Value::Object).collect::<Vec<_>>()),
+                        );
+                    }
+                    if dry_run {
+                        d.insert("via".to_string(), Value::from("none"));
+                    }
+                    d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
+                    return Ok(Some(d));
+                }
+                let entry = entry.unwrap();
+                // Text is required; present values coerce via py_str like the
+                // `type` action (numbers become their string form). Missing or
+                // null is an argument failure, never a silent clear.
+                let text: Option<String> = match ad.get("text") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(py_str(v)),
+                };
+                let text = match text {
+                    Some(t) => t,
+                    None => {
+                        d.insert("element".to_string(), Value::from(element_pub_full(&entry)));
+                        d.insert("resolution".to_string(), Value::from("found"));
+                        d.insert("via".to_string(), Value::from("none"));
+                        d.insert(
+                            "error".to_string(),
+                            Value::from(
+                                "set_value needs \"text\" (e.g. {\"type\":\"set_value\",\"element\":\"name:OK\",\"text\":\"hello\"})",
+                            ),
+                        );
+                        d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
+                        return Ok(Some(d));
+                    }
+                };
+                let value_len = text.chars().count() as i64;
+                if dry_run {
+                    d.insert("ok".to_string(), Value::from(true));
+                    d.insert("resolution".to_string(), Value::from("found"));
+                    d.insert("element".to_string(), Value::from(element_pub_full(&entry)));
+                    d.insert("via".to_string(), Value::from("none"));
+                    d.insert("value_len".to_string(), Value::from(value_len));
+                    d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
+                    return Ok(Some(d));
+                }
+                d.insert("element".to_string(), Value::from(element_pub_full(&entry)));
+                d.insert("resolution".to_string(), Value::from("found"));
+                if model.backend != "uia" {
+                    d.insert("via".to_string(), Value::from("none"));
+                    d.insert(
+                        "error".to_string(),
+                        Value::from(
+                            "element has no ValuePattern under the Win32 backend (set_value needs the UIA backend)",
+                        ),
+                    );
+                    d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
+                    return Ok(Some(d));
+                }
+                let (ok_v, via, verr) =
+                    crate::uia::uia_set_value(tgt, &entry_str(&entry, "path"), &text);
+                d.insert(
+                    "via".to_string(),
+                    Value::from(if via.is_empty() {
+                        "none".to_string()
+                    } else {
+                        via
+                    }),
+                );
+                d.insert("ok".to_string(), Value::from(ok_v));
+                if ok_v {
+                    d.insert("value_len".to_string(), Value::from(value_len));
+                }
+                if let Some(e) = verr {
+                    if !ok_v {
+                        d.insert("error".to_string(), Value::from(e));
+                    }
+                }
+                d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
+                return Ok(Some(d));
+            }
             if typ == "wait" {
                 let (_, ferr) = st.flush();
                 if let Some(fe) = ferr {
@@ -2153,5 +2307,319 @@ mod tests {
             py_int(&serde_json::json!("-9223372036854775808")).unwrap(),
             i64::MIN
         );
+    }
+
+    fn ref_entry(win: i64, path: &str, name: &str) -> Map<String, Value> {
+        let mut m = Map::new();
+        m.insert("win".to_string(), Value::from(win));
+        m.insert("role".to_string(), Value::from("Button"));
+        m.insert("name".to_string(), Value::from(name));
+        m.insert("auto_id".to_string(), Value::from(""));
+        m.insert(
+            "rect".to_string(),
+            Value::from(vec![
+                Value::from(0),
+                Value::from(0),
+                Value::from(10),
+                Value::from(10),
+            ]),
+        );
+        m.insert("invokable".to_string(), Value::from(true));
+        m.insert("path".to_string(), Value::from(path));
+        m.insert("ref".to_string(), Value::from(format!("{win}.{path}")));
+        m
+    }
+
+    #[test]
+    fn ref_selector_rejected_names_accepted_forms() {
+        // The `ref:` invoke selector was removed (4.2.1): a ref token pins
+        // only window + path and cannot promise element identity, so any
+        // `ref:<x>` element string is rejected with the existing unknown-kind
+        // error naming the accepted forms. `ref` remains a reporting field
+        // on element entries (see element_public), never a selector.
+        let entries = vec![
+            ref_entry(199210, "0", "Cancel"),
+            ref_entry(199210, "0.3.1", "OK"),
+        ];
+        for bad in ["ref:199210.0.3.1", "ref:199210.0.9", "ref:abc", "ref:"] {
+            let (hit, err, _) = match_element(&entries, Some(&Value::from(bad)), None);
+            assert!(hit.is_none(), "{bad} must not resolve");
+            let e = err.expect("ref selector must be rejected, never silent");
+            assert!(
+                e.contains("unknown element selector kind"),
+                "ref selector needs the unknown-kind shape, got: {e}"
+            );
+            assert!(
+                e.contains("(want name:|auto_id:|path:)"),
+                "rejection must name the accepted forms, got: {e}"
+            );
+            assert!(
+                !e.contains("ref:"),
+                "rejection must not advertise a ref: selector, got: {e}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------- set_value (4.3.0)
+
+    fn burst_bg(actions: &[Value], bg: &str, dry_run: bool) -> (String, Map<String, Value>) {
+        let out = do_burst(actions, Some(bg.to_string()), false, 0, dry_run);
+        let outer: Value = serde_json::from_str(&out).expect("outer frame");
+        let inner = outer
+            .get("structuredContent")
+            .and_then(|s| s.get("result"))
+            .and_then(|r| r.as_str())
+            .expect("structured result");
+        let payload: Value = serde_json::from_str(inner).expect("payload");
+        let first = payload
+            .get("results")
+            .and_then(|r| r.as_array())
+            .expect("results")[0]
+            .as_object()
+            .expect("first")
+            .clone();
+        (out, first)
+    }
+
+    fn fixture_bg() -> (crate::fixture::Fixture, String) {
+        let f = crate::fixture::Fixture::new();
+        let bg = format!("hwnd:{}", f.hwnd_i64());
+        (f, bg)
+    }
+
+    #[test]
+    fn set_value_missing_element_rejected() {
+        let (fx, bg) = fixture_bg();
+        let _ = fx.hwnd();
+        let actions = vec![serde_json::json!({"type": "set_value", "text": "hi"})];
+        let (_, first) = burst_bg(&actions, &bg, true);
+        assert_eq!(first.get("ok"), Some(&Value::from(false)));
+        let e = first.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            e.contains("set_value needs \"element\""),
+            "missing element must name set_value, got: {e}"
+        );
+        assert_eq!(first.get("resolution"), Some(&Value::from("not-found")));
+    }
+
+    #[test]
+    fn set_value_missing_text_rejected() {
+        let (fx, bg) = fixture_bg();
+        let _ = fx.hwnd();
+        // Resolve an existing control first (OK button by name), but omit text.
+        let actions = vec![serde_json::json!({"type": "set_value", "element": "name:OK"})];
+        let (_, first) = burst_bg(&actions, &bg, true);
+        assert_eq!(first.get("ok"), Some(&Value::from(false)));
+        let e = first.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            e.contains("set_value needs \"text\""),
+            "missing text must be typed, got: {e}"
+        );
+    }
+
+    #[test]
+    fn set_value_ref_rejected_like_invoke() {
+        // set_value resolves through the same match_element, so ref: stays
+        // rejected with the unknown-kind shape naming the accepted forms.
+        let (fx, bg) = fixture_bg();
+        let _ = fx.hwnd();
+        let actions =
+            vec![serde_json::json!({"type": "set_value", "element": "ref:123.0", "text": "hi"})];
+        let (_, first) = burst_bg(&actions, &bg, true);
+        assert_eq!(first.get("ok"), Some(&Value::from(false)));
+        let e = first.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            e.contains("unknown element selector kind"),
+            "ref: must be unknown-kind, got: {e}"
+        );
+        assert!(
+            e.contains("(want name:|auto_id:|path:)"),
+            "must name accepted forms, got: {e}"
+        );
+    }
+
+    #[test]
+    fn set_value_not_found_typed() {
+        let (fx, bg) = fixture_bg();
+        let _ = fx.hwnd();
+        let actions = vec![
+            serde_json::json!({"type": "set_value", "element": "name:NoSuchControlXYZ123", "text": "hi"}),
+        ];
+        let (_, first) = burst_bg(&actions, &bg, true);
+        assert_eq!(first.get("ok"), Some(&Value::from(false)));
+        let e = first.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            e.contains("no element matching"),
+            "not-found must be typed, got: {e}"
+        );
+        assert_eq!(first.get("resolution"), Some(&Value::from("not-found")));
+    }
+
+    #[test]
+    fn set_value_button_has_no_valuepattern() {
+        // Live (not dry_run): the OK button exposes Invoke, not ValuePattern.
+        let (fx, bg) = fixture_bg();
+        let _ = fx.hwnd();
+        // Stabilize the UIA backend first (poll own fixture only): the first
+        // enumeration right after ShowWindow can race the provider and fall
+        // back to win32, which would give via:none instead of uia-set-value.
+        wait_uia_stable(fx.hwnd());
+        let actions =
+            vec![serde_json::json!({"type": "set_value", "element": "name:OK", "text": "hi"})];
+        let (_, first) = burst_bg(&actions, &bg, false);
+        assert_eq!(first.get("ok"), Some(&Value::from(false)));
+        let e = first.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            e.contains("has no ValuePattern"),
+            "button must fail with no-ValuePattern, got: {e}"
+        );
+        assert_eq!(first.get("via"), Some(&Value::from("uia-set-value")));
+    }
+
+    fn wait_uia_stable(hwnd: HWND) {
+        // Poll only the fixture HWND until the UIA backend serves Edit
+        // controls (or 5s elapses and the caller asserts on the real state).
+        let t0 = Instant::now();
+        loop {
+            let m = element_model(hwnd);
+            let has_edit = m
+                .entries
+                .iter()
+                .any(|e| e.get("role").and_then(|v| v.as_str()) == Some("Edit"));
+            if m.backend == "uia" && has_edit {
+                return;
+            }
+            if t0.elapsed() > std::time::Duration::from_secs(5) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    fn edit_paths() -> (crate::fixture::Fixture, String, String, String) {
+        // Returns (fixture, bg, writable_path, readonly_path) by enumerating
+        // the live model and splitting the two Edit roles by screen-y.
+        let f = crate::fixture::Fixture::new();
+        let bg = format!("hwnd:{}", f.hwnd_i64());
+        wait_uia_stable(f.hwnd());
+        let model = element_model(f.hwnd());
+        let mut edits: Vec<(i64, String)> = Vec::new();
+        for e in &model.entries {
+            if e.get("role").and_then(|v| v.as_str()).unwrap_or("") == "Edit" {
+                let top = e
+                    .get("rect")
+                    .and_then(|r| r.as_array())
+                    .and_then(|a| a.get(1))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let path = e
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                edits.push((top, path));
+            }
+        }
+        edits.sort();
+        assert!(
+            edits.len() >= 2,
+            "fixture must expose 2 Edit controls via UIA, got {}",
+            edits.len()
+        );
+        let w = edits[0].1.clone();
+        let r = edits[1].1.clone();
+        (f, bg, w, r)
+    }
+
+    #[test]
+    fn set_value_readonly_typed() {
+        let (fx, bg, _w, ro) = edit_paths();
+        let _ = fx.hwnd();
+        let actions = vec![
+            serde_json::json!({"type": "set_value", "element": format!("path:{ro}"), "text": "hi"}),
+        ];
+        let (_, first) = burst_bg(&actions, &bg, false);
+        assert_eq!(first.get("ok"), Some(&Value::from(false)));
+        let e = first.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            e.contains("read-only"),
+            "readonly EDIT must fail typed, got: {e}"
+        );
+    }
+
+    #[test]
+    fn set_value_success_writes_and_never_echoes() {
+        let (fx, bg, wpath, _ro) = edit_paths();
+        let secret = "fixture-secret-4821";
+        let actions = vec![
+            serde_json::json!({"type": "set_value", "element": format!("path:{wpath}"), "text": secret}),
+        ];
+        let (out, first) = burst_bg(&actions, &bg, false);
+        assert_eq!(
+            first.get("ok"),
+            Some(&Value::from(true)),
+            "set_value must succeed, got: {first:?}"
+        );
+        assert_eq!(first.get("via"), Some(&Value::from("uia-set-value")));
+        assert_eq!(
+            first.get("value_len"),
+            Some(&Value::from(secret.chars().count() as i64))
+        );
+        assert!(
+            !out.contains(secret),
+            "result must never echo the text value"
+        );
+        // Read-back proves the value landed in the EDIT control.
+        assert_eq!(fx.edit_text(), secret);
+        println!("SET_VALUE_READBACK={}", fx.edit_text());
+        // No activation: the fixture must never become the foreground window
+        // (robust to the owner switching windows mid-test, unlike an
+        // equality check on the foreground HWND itself).
+        let fg_after = fg_now();
+        assert_ne!(
+            fg_after,
+            fx.hwnd_i64(),
+            "set_value must never activate the fixture window"
+        );
+    }
+
+    #[test]
+    fn set_value_reresolve_failure_typed() {
+        // Direct UIA call with a bogus path exercises the shared resolver's
+        // stale branch without touching the owner's desktop.
+        let f = crate::fixture::Fixture::new();
+        let (ok, via, err) = crate::uia::uia_set_value(f.hwnd_i64(), "9999", "x");
+        assert!(!ok);
+        let e = err.expect("stale path must be typed, never silent");
+        assert!(
+            e.contains("went stale") || e.contains("resolve failed"),
+            "re-resolution failure must be typed, got: {e}"
+        );
+        assert!(
+            via.is_empty() || via == "none",
+            "resolve failure carries empty via, got: {via}"
+        );
+    }
+
+    #[test]
+    fn set_value_burst_continues_after_failure() {
+        // Per-action ok:false never aborts the rest of the burst.
+        let (fx, bg, wpath, _ro) = edit_paths();
+        let _ = fx.hwnd();
+        let actions = vec![
+            serde_json::json!({"type": "set_value", "element": "name:NoSuchXYZ", "text": "x"}),
+            serde_json::json!({"type": "set_value", "element": format!("path:{wpath}"), "text": "after-failure"}),
+        ];
+        let out = do_burst(&actions, Some(bg.to_string()), false, 0, false);
+        let outer: Value = serde_json::from_str(&out).expect("outer");
+        let inner = outer["structuredContent"]["result"]
+            .as_str()
+            .expect("inner");
+        let payload: Value = serde_json::from_str(inner).expect("payload");
+        let res = payload["results"].as_array().expect("results");
+        assert_eq!(res.len(), 2);
+        assert_eq!(res[0].get("ok"), Some(&Value::from(false)));
+        assert_eq!(res[1].get("ok"), Some(&Value::from(true)));
+        assert_eq!(fx.edit_text(), "after-failure");
     }
 }
