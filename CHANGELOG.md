@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `do` parameter `desktop: "hidden"` (opt-in, default null): launches the
+  program named by `background` (`exe:notepad.exe` or a path) on a private
+  desktop, resolves its window with `EnumDesktopWindows` (never the owner's
+  `EnumWindows`), drives it through the existing `background` PostMessage
+  path, captures it with `PrintWindow(PW_RENDERFULLCONTENT)`, closes that
+  process (and any process owning a window on that private desktop), and
+  destroys the desktop. Teardown moves the thread off the desktop before
+  `CloseDesktop` and proves it gone with a NULL `OpenDesktopW`. The owner's
+  desktop, cursor, foreground window, and focus are never touched; omitting
+  the parameter leaves plain `do` byte-identical.
+
 ## [4.3.0] - 2026-10-12
 
 ### Added

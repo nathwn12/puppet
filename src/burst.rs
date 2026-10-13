@@ -12,6 +12,7 @@ use crate::{
     enum_child_windows, py_repr_str, py_repr_value, py_round_half_even, py_round_n, virtual_rect,
     wrapped_text,
 };
+use base64::Engine as _;
 use serde_json::{Map, Value};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{GetLastError, GlobalFree, HGLOBAL, HWND, LPARAM, POINT};
@@ -954,6 +955,17 @@ fn wait_for(a: &Map<String, Value>, t0: &Instant) -> Map<String, Value> {
 
 // ---------------------------------------------------------------- focus helpers (puppet.py:1895-1934)
 
+fn cursor_now() -> (i64, i64) {
+    unsafe {
+        let mut pt = POINT { x: 0, y: 0 };
+        if GetCursorPos(&mut pt) != 0 {
+            (pt.x as i64, pt.y as i64)
+        } else {
+            (-1, -1)
+        }
+    }
+}
+
 fn fg_now() -> i64 {
     unsafe {
         let h = GetForegroundWindow();
@@ -1355,9 +1367,11 @@ pub fn do_burst(
     focus_guard: bool,
     settle_ms: i64,
     dry_run: bool,
+    desktop: Option<String>,
 ) -> String {
     let t_all = Instant::now();
     let focus_before = fg_now();
+    let cursor_before = cursor_now();
 
     // Boot phase (puppet.py:2693-2746). Top-level wire types are validated in
     // serve.rs; only the range clamps are live here.
@@ -1378,8 +1392,54 @@ pub fn do_burst(
         boot_errors.push(m);
         settle_n = 0;
     }
-    let bg_mode = background.is_some();
-    let (bg_hwnd, bg_error): (Option<i64>, Option<String>) = if !bg_mode {
+    let hidden_mode = desktop
+        .as_deref()
+        .map(|d| d.trim().eq_ignore_ascii_case("hidden"))
+        .unwrap_or(false);
+    let mut hidden_owner: Option<crate::hidden::Hidden> = None;
+    let mut hidden_created = false;
+    let mut hidden_set_desktop = false;
+    let mut hidden_pid: Option<u32> = None;
+    let mut hidden_name = String::new();
+    let mut hidden_hwnd: Option<i64> = None;
+    let mut hidden_class = String::new();
+    let mut hidden_title = String::new();
+    let mut hidden_win_pid: u32 = 0;
+
+    let bg_mode = background.is_some() || hidden_mode;
+    let (bg_hwnd, bg_error): (Option<i64>, Option<String>) = if hidden_mode {
+        // Opt-in mode: `background` names the program to launch on a private
+        // desktop; its window is resolved with EnumDesktopWindows (never the
+        // owner's EnumWindows) and then driven through the same PostMessage
+        // branch below.
+        let prog = match background.as_deref() {
+            None => Err(
+                "bad_window: desktop=\"hidden\" needs background to name the program to launch (e.g. exe:notepad.exe)"
+                    .to_string(),
+            ),
+            Some(s) => crate::hidden::program_from_background(s),
+        };
+        match prog {
+            Err(e) => (None, Some(e)),
+            Ok(p) => {
+                let h = crate::hidden::spawn(&p);
+                hidden_created = h.ready.created;
+                hidden_set_desktop = h.ready.set_desktop;
+                hidden_pid = h.ready.pid;
+                hidden_hwnd = h.ready.hwnd;
+                hidden_class = h.ready.hwnd_class.clone();
+                hidden_title = h.ready.hwnd_title.clone();
+                hidden_win_pid = h.ready.hwnd_pid;
+                hidden_name = h.ready.desktop_name.clone();
+                let err = h.ready.error.clone();
+                hidden_owner = Some(h);
+                match err {
+                    Some(e) => (None, Some(e)),
+                    None => (hidden_hwnd, None),
+                }
+            }
+        }
+    } else if !bg_mode {
         (None, None)
     } else {
         let s = background.unwrap();
@@ -2138,6 +2198,134 @@ pub fn do_burst(
         focus_restored = restore_foreground(focus_before);
         focus_after = fg_now();
     }
+    // Hidden-desktop finalization: capture + readback run on the hidden-desktop
+    // thread, then the desktop is torn down and the proof recorded.
+    let mut hidden_meta: Option<Map<String, Value>> = None;
+    if let Some(owner) = hidden_owner.take() {
+        let mut hd = Map::new();
+        hd.insert("requested".to_string(), Value::from("hidden"));
+        hd.insert("desktop_name".to_string(), Value::from(hidden_name.clone()));
+        hd.insert("desktop_created".to_string(), Value::from(hidden_created));
+        hd.insert(
+            "set_thread_desktop".to_string(),
+            Value::from(hidden_set_desktop),
+        );
+        hd.insert(
+            "launched_pid".to_string(),
+            hidden_pid
+                .map(|p| Value::from(p as i64))
+                .unwrap_or(Value::Null),
+        );
+        hd.insert(
+            "window_hwnd".to_string(),
+            hidden_hwnd.map(Value::from).unwrap_or(Value::Null),
+        );
+        hd.insert(
+            "window_class".to_string(),
+            Value::from(hidden_class.clone()),
+        );
+        hd.insert(
+            "window_title".to_string(),
+            Value::from(hidden_title.clone()),
+        );
+        hd.insert("window_pid".to_string(), Value::from(hidden_win_pid as i64));
+        hd.insert(
+            "window_on_hidden_desktop".to_string(),
+            Value::from(hidden_hwnd.is_some()),
+        );
+        let owner_absent = match hidden_hwnd {
+            Some(h) => !crate::enum_windows().iter().any(|w| *w as i64 == h),
+            None => false,
+        };
+        hd.insert(
+            "absent_from_owner_enum_windows".to_string(),
+            Value::from(owner_absent),
+        );
+        let done = owner.teardown();
+        let cursor_after = cursor_now();
+        let fg_end = fg_now();
+        hd.insert("window_alive".to_string(), Value::from(done.alive));
+        hd.insert(
+            "text_readback".to_string(),
+            done.text.clone().map(Value::from).unwrap_or(Value::Null),
+        );
+        match done.capture.as_ref() {
+            Some(c) => {
+                let mut cap = Map::new();
+                cap.insert("ok".to_string(), Value::from(c.ok));
+                cap.insert("print_flags".to_string(), Value::from(c.flags as i64));
+                cap.insert("w".to_string(), Value::from(c.w as i64));
+                cap.insert("h".to_string(), Value::from(c.h as i64));
+                cap.insert("min".to_string(), Value::from(c.min as i64));
+                cap.insert("max".to_string(), Value::from(c.max as i64));
+                cap.insert("uniform".to_string(), Value::from(c.min == c.max));
+                if let Some(png) = c.png.as_ref() {
+                    cap.insert("bytes".to_string(), Value::from(png.len() as i64));
+                    cap.insert(
+                        "png_b64".to_string(),
+                        Value::from(base64::engine::general_purpose::STANDARD.encode(png)),
+                    );
+                }
+                if let Some(e) = c.error.as_ref() {
+                    cap.insert("error".to_string(), Value::from(e.clone()));
+                }
+                hd.insert("capture".to_string(), Value::Object(cap));
+            }
+            None => {
+                hd.insert("capture".to_string(), Value::Null);
+            }
+        }
+        let mut td = Map::new();
+        td.insert("close_posted".to_string(), Value::from(done.close_posted));
+        td.insert(
+            "process_exited".to_string(),
+            Value::from(done.process_exited),
+        );
+        td.insert("terminated".to_string(), Value::from(done.terminated));
+        td.insert("desktop_empty".to_string(), Value::from(done.desktop_empty));
+        td.insert(
+            "set_thread_desktop_restored".to_string(),
+            Value::from(done.restored_desktop),
+        );
+        td.insert(
+            "close_desktop".to_string(),
+            Value::from(done.closed_desktop),
+        );
+        td.insert(
+            "open_after_close_null".to_string(),
+            Value::from(done.open_after_close_null),
+        );
+        td.insert("proven".to_string(), Value::from(done.teardown_proven));
+        if let Some(e) = done.error {
+            td.insert("error".to_string(), Value::from(e));
+        }
+        hd.insert("teardown".to_string(), Value::Object(td));
+        hd.insert(
+            "owner_cursor_delta".to_string(),
+            Value::from(if cursor_after == cursor_before { 0 } else { 1 }),
+        );
+        hd.insert(
+            "cursor_before".to_string(),
+            Value::from(vec![
+                Value::from(cursor_before.0),
+                Value::from(cursor_before.1),
+            ]),
+        );
+        hd.insert(
+            "cursor_after".to_string(),
+            Value::from(vec![
+                Value::from(cursor_after.0),
+                Value::from(cursor_after.1),
+            ]),
+        );
+        hd.insert(
+            "owner_foreground_delta".to_string(),
+            Value::from(if fg_end == focus_before { 0 } else { 1 }),
+        );
+        hd.insert("foreground_before".to_string(), Value::from(focus_before));
+        hd.insert("foreground_after".to_string(), Value::from(fg_end));
+        hidden_meta = Some(hd);
+    }
     let mut payload = Map::new();
     payload.insert(
         "results".to_string(),
@@ -2172,6 +2360,9 @@ pub fn do_burst(
             payload.insert("background_error".to_string(), Value::from(be));
         }
     }
+    if let Some(hd) = hidden_meta {
+        payload.insert("hidden_desktop".to_string(), Value::Object(hd));
+    }
     wrapped_text(&crate::py_dumps(&Value::Object(payload)))
 }
 
@@ -2180,7 +2371,7 @@ mod tests {
     use super::*;
 
     fn burst_first(actions: &[Value]) -> Map<String, Value> {
-        let out = do_burst(actions, None, false, 0, true);
+        let out = do_burst(actions, None, false, 0, true, None);
         let outer: Value = serde_json::from_str(&out).expect("outer frame");
         let inner = outer
             .get("structuredContent")
@@ -2363,7 +2554,7 @@ mod tests {
     // ---------------------------------------------------------------- set_value (4.3.0)
 
     fn burst_bg(actions: &[Value], bg: &str, dry_run: bool) -> (String, Map<String, Value>) {
-        let out = do_burst(actions, Some(bg.to_string()), false, 0, dry_run);
+        let out = do_burst(actions, Some(bg.to_string()), false, 0, dry_run, None);
         let outer: Value = serde_json::from_str(&out).expect("outer frame");
         let inner = outer
             .get("structuredContent")
@@ -2610,7 +2801,7 @@ mod tests {
             serde_json::json!({"type": "set_value", "element": "name:NoSuchXYZ", "text": "x"}),
             serde_json::json!({"type": "set_value", "element": format!("path:{wpath}"), "text": "after-failure"}),
         ];
-        let out = do_burst(&actions, Some(bg.to_string()), false, 0, false);
+        let out = do_burst(&actions, Some(bg.to_string()), false, 0, false, None);
         let outer: Value = serde_json::from_str(&out).expect("outer");
         let inner = outer["structuredContent"]["result"]
             .as_str()
