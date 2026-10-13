@@ -697,7 +697,7 @@ unsafe extern "system" fn enum_cb(hwnd: HWND, lp: LPARAM) -> BOOL {
     1
 }
 
-fn enum_windows() -> Vec<HWND> {
+pub(crate) fn enum_windows() -> Vec<HWND> {
     let mut v: Vec<isize> = Vec::new();
     unsafe {
         EnumWindows(Some(enum_cb), &mut v as *mut Vec<isize> as LPARAM);
@@ -1099,6 +1099,7 @@ pub mod cap;
 pub mod dxgi;
 #[cfg(test)]
 pub mod fixture;
+pub mod hidden;
 pub mod screen;
 pub mod serve;
 pub mod shot;

@@ -25,7 +25,7 @@ A Rust port of the Python incumbent, so there is no interpreter to install and c
 | screenshot | Capture the desktop (default or normalized) and return it as an image frame. |
 | list_windows | List visible top-level windows as JSON. |
 | window | Inspect or act on a single window by handle or title match. |
-| do | Send input / window operations (mouse, keyboard, window ops), including `set_value` text writes via UIA ValuePattern (no click, no focus change; value never echoed). |
+| do | Send input / window operations (mouse, keyboard, window ops), including `set_value` text writes via UIA ValuePattern (no click, no focus change; value never echoed), and the opt-in `desktop:"hidden"` mode that launches a target on a private desktop, drives it through the PostMessage path, captures it with PrintWindow, then tears the desktop down — the owner's cursor, foreground window, and focus are never touched. |
 | cursor | Report the current cursor position and monitor rects as JSON. |
 | elements | List structured UI elements for a window as JSON (zero-pixel). |
 
