@@ -7,7 +7,6 @@
   <a href="LICENSE"><img src="https://img.shields.io/github/license/nathwn12/puppet" alt="License" /></a>
   <img src="https://img.shields.io/github/languages/top/nathwn12/puppet" alt="Language" />
   <img src="https://img.shields.io/badge/platform-windows--64bit-2b3137?logo=windows&logoColor=white" alt="Platform" />
-  <a href="https://github.com/nathwn12/puppet/actions/workflows/ci.yml"><img src="https://github.com/nathwn12/puppet/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
 </p>
 
 ## What it is
