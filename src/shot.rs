@@ -42,7 +42,9 @@ fn frame_sig(img: &Img, title: &str, dwm: &[i32; 4]) -> (String, (i32, i32, i32,
     )
 }
 
-pub fn capture_window(hwnd: HWND, allow_crop_fallback: bool) -> Result<CapOk, String> {
+/// # Safety
+/// `hwnd` must be a live window handle; it is passed to the Win32 window APIs as a raw pointer.
+pub unsafe fn capture_window(hwnd: HWND, allow_crop_fallback: bool) -> Result<CapOk, String> {
     let t0 = Instant::now();
     let h = hwnd as i64;
     unsafe {
