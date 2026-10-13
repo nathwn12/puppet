@@ -167,7 +167,7 @@ pub fn screenshot_window(a: &ShotArgs) -> String {
         Ok(r) => r,
         Err(e) => return shot_err_list(vec![e]),
     };
-    let cap = match capture_window(hwnd, a.allow_crop_fallback) {
+    let cap = match unsafe { capture_window(hwnd, a.allow_crop_fallback) } {
         Ok(c) => c,
         Err(e) => return shot_err_list(vec![e]),
     };

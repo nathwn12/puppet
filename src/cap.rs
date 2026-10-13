@@ -361,7 +361,9 @@ fn grab_bits(
     }
 }
 
-pub fn printwindow_grab(hwnd: HWND, w: i32, h: i32, flags: u32) -> Result<Img, String> {
+/// # Safety
+/// `hwnd` must be a live window handle; it is passed to `PrintWindow` as a raw pointer.
+pub unsafe fn printwindow_grab(hwnd: HWND, w: i32, h: i32, flags: u32) -> Result<Img, String> {
     use windows_sys::Win32::Storage::Xps::PrintWindow;
     if w <= 0 || h <= 0 {
         return Err("zero-size bitmap request".to_string());
