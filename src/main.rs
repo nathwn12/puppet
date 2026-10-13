@@ -1106,7 +1106,28 @@ pub mod shot;
 pub mod uia;
 pub mod winop;
 
+// ---------------------------------------------------------------- provenance
+
+/// Commit this binary was compiled from (`build.rs`), `unknown` when git was
+/// unavailable at build time.
+const GIT_SHA: &str = env!("PUPPET_GIT_SHA");
+/// `-dirty` when the tree was modified at build time, else empty.
+const GIT_DIRTY: &str = env!("PUPPET_GIT_DIRTY");
+
 fn main() {
+    // Provenance answers without touching the desktop: this prints and returns
+    // before any Win32 call or the stdio pump. MCP clients pass no args, so
+    // the server path below is unchanged.
+    if std::env::args_os()
+        .skip(1)
+        .any(|a| a == "--version" || a == "-V")
+    {
+        println!(
+            "puppet {} ({GIT_SHA}{GIT_DIRTY})",
+            env!("CARGO_PKG_VERSION")
+        );
+        return;
+    }
     unsafe {
         if SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) == 0 {
             SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE);
