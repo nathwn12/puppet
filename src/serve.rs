@@ -248,6 +248,7 @@ fn call_do(args: &Map<String, Value>) -> String {
             "focus_guard",
             "settle_ms",
             "dry_run",
+            "desktop",
         ],
     );
     let actions: Option<Vec<Value>> = match args.get("actions") {
@@ -286,6 +287,21 @@ fn call_do(args: &Map<String, Value>) -> String {
     let focus_guard = do_bool(args, &mut errs, "focus_guard");
     let settle_ms = req_int(args, &mut errs, "settle_ms", 0);
     let dry_run = do_bool(args, &mut errs, "dry_run");
+    // desktop is `str | None`, opt-in only: the sole accepted value is
+    // "hidden" (case-insensitive). Plain `do` omits it and keeps its exact
+    // behaviour.
+    let desktop: Option<Option<String>> = opt_str(args, &mut errs, "desktop");
+    if let Some(Some(d)) = desktop.as_ref() {
+        if !d.trim().eq_ignore_ascii_case("hidden") {
+            errs.push(crate::VErr {
+                loc: "desktop".to_string(),
+                msg: "Input should be 'hidden'".to_string(),
+                typ: "literal_error".to_string(),
+                iv: crate::render_iv(&Value::String(d.clone())),
+                it: "str".to_string(),
+            });
+        }
+    }
     if !errs.is_empty() {
         return err_result_text(&verr_text("do", &errs));
     }
@@ -295,6 +311,7 @@ fn call_do(args: &Map<String, Value>) -> String {
         focus_guard.unwrap(),
         settle_ms.unwrap(),
         dry_run.unwrap(),
+        desktop.unwrap(),
     )
 }
 
