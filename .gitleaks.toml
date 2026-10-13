@@ -1,0 +1,17 @@
+# gitleaks configuration for the puppet repo.
+#
+# The default ruleset is kept fully enabled; the only known hit is a
+# test-only dummy string, not a credential:
+#   src/burst.rs:2744  (`fixture-secret-4821` inside #[test]
+#                       set_value_success_writes_and_never_echoes @87e69fd)
+# The test asserts set_value never echoes the value back, so the token is
+# intentionally a fake fixture. Allowlist ONLY that exact value, and ONLY in
+# src/burst.rs, so any other path or value still trips.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Test-only fixture dummy 'fixture-secret-4821' at src/burst.rs (#[test] set_value_success_writes_and_never_echoes @87e69fd); not a credential."
+condition = "AND"
+paths = ['''(^|[\\/])src[\\/]burst\.rs$''']
+regexes = ['''^fixture-secret-4821$''']
