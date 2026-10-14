@@ -5,9 +5,18 @@
 //! currency and dirty-tree builds re-measurable against `git rev-parse HEAD`.
 //!
 //! The rerun set below is explicit rather than left to cargo's "any file in the
-//! package changed" default, because a `git commit` rewrites `.git/index` and
-//! `.git` refs WITHOUT touching any working-tree mtime - the default would then
-//! reuse the pre-commit stamp and a fresh binary would report a stale sha.
+//! package changed" default, because a `git commit` moves HEAD WITHOUT touching
+//! any working-tree mtime - the default would then reuse the pre-commit stamp
+//! and a fresh binary would report a stale sha.
+//!
+//! The watched paths are the ones git actually rewrites on a HEAD move. For a
+//! commit on a branch that is the loose ref (`.git/refs/heads/<branch>`) and the
+//! reflog (`.git/logs/HEAD`); `.git/index` and `.git/HEAD` are NOT written (both
+//! measured against `git commit --allow-empty`, 2026-10-14). A checkout or a
+//! detached-HEAD commit rewrites `.git/HEAD`, and a repository with reflogs
+//! disabled still moves `.git/refs/heads`, so the two sets together cover every
+//! HEAD move; a path that is absent (git worktree, source tarball) is treated by
+//! cargo as dirty, which rebuilds the stamp rather than reusing a stale one.
 
 use std::process::Command;
 
@@ -35,11 +44,14 @@ fn main() {
         if dirty { "-dirty" } else { "" }
     );
 
-    // Re-stamp on a commit (index rewrite), a branch switch (HEAD), an unstaged
-    // source edit (src/, tests/), or a manifest edit. Nothing else can change
-    // the stamp, so `target/` and `bin/` are deliberately not walked.
+    // Re-stamp on a commit (loose ref + reflog), a checkout or detached-HEAD
+    // move (`.git/HEAD`), a staged edit (index), an unstaged source edit (src/,
+    // tests/), or a manifest edit. Nothing else can change the stamp, so
+    // `target/` and `bin/` are deliberately not walked.
     println!("cargo:rerun-if-changed=.git/index");
     println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/refs/heads");
+    println!("cargo:rerun-if-changed=.git/logs/HEAD");
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src");
