@@ -1,0 +1,23 @@
+{
+  "name": "puppet-mcp",
+  "version": "4.3.0",
+  "description": "Windows desktop-control MCP server (npx launcher): provisions the pinned server binary from the GitHub Release on first run, then serves MCP over stdio",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nathwn12/puppet"
+  },
+  "homepage": "https://github.com/nathwn12/puppet",
+  "engines": {
+    "node": ">=22.14.0"
+  },
+  "bin": {
+    "puppet-mcp": "./bin/puppet-mcp.js"
+  },
+  "files": [
+    "bin/",
+    "engine-manifest.json",
+    "LICENSE",
+    "README.md"
+  ]
+}
