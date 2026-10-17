@@ -666,10 +666,12 @@ mod tests {
     fn elements_live_offscreen_fixture_lists_edit_and_ok() {
         // Live resolve path against a real HWND the test owns (offscreen,
         // never activated): proves `elements` beyond unit/schema assertions.
+        // Foreground contract is environment-independent: record BEFORE any
+        // fixture work; a zero-pixel read must not CHANGE it (skips with
+        // FG_SKIP when the environment has no foreground session).
+        let fg_before = crate::fixture::foreground_now();
         let f = crate::fixture::Fixture::new();
         let hwnd = f.hwnd() as i64;
-        let fg_before =
-            unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
         // Poll own fixture only until the UIA backend stabilizes (first walk
         // can race ShowWindow and fall back to win32).
         let payload = {
@@ -731,11 +733,10 @@ mod tests {
             assert!(!o.contains_key("win"), "compact default must omit win");
         }
         assert_eq!(payload.get("backend").and_then(|v| v.as_str()), Some("uia"));
-        // Foreground untouched by a zero-pixel read.
-        assert_eq!(
-            unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() },
-            fg_before
-        );
+        // Foreground untouched by a zero-pixel read: fail only if a fixture
+        // window is LEFT activated (skips with FG_SKIP when the environment
+        // provides no foreground session, e.g. headless CI).
+        crate::fixture::check_foreground_left_clean(hwnd, fg_before, "elements");
         // Evidence for the report (captured with -- --nocapture).
         println!("ELEMENTS_COMPACT_FIXTURE_JSON={payload}");
     }
