@@ -39,7 +39,7 @@ Wire the server into your MCP client config:
 Pin an exact version instead of `@latest`:
 
 ```powershell
-npx -y puppet-mcp@4.3.0 --doctor
+npx -y puppet-mcp@4.4.0 --doctor
 ```
 
 Build from source when you want the working tree instead of the Release binary:
@@ -89,7 +89,7 @@ You get back per-action results with `index`, `type`, `ok`, and `ms`. Remove `dr
 - Six tools to see and drive the desktop: `screenshot`, `list_windows`, `window`, `do`, `cursor`, and `elements` (src/schemas.rs).
 - Coordinates you can trust: every screenshot carries the map that turns image pixels back into screen pixels.
 - A small local footprint: one native binary over stdio; the launcher provisions it on first run and re-verifies the cache each time.
-- Input that never asks first: `do` drives the real desktop, so preview a risky burst with `dry_run`; input aimed at an elevated window is refused with a typed error (on `main`, ships in 4.4.0).
+- Input that never asks first: `do` drives the real desktop, so preview a risky burst with `dry_run`; input aimed at an elevated window is refused with a typed error instead of failing silently.
 
 ## Requirements
 
