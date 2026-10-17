@@ -2,116 +2,106 @@
 
 **Give your coding agent eyes and hands for your Windows desktop.**
 
-## Easy install
-
-```text
-git clone https://github.com/nathwn12/puppet
-cargo build --release --locked
-```
-
-There are no releases yet, so building from source is the only route.
-The client setup below takes about a minute.
-
-## Let your AI install it
-
-```text
-Clone https://github.com/nathwn12/puppet, build it with
-cargo build --release --locked, and add the built puppet.exe
-to my MCP client config. Then prove it works by running
-puppet --version and making one read-only list_windows call.
-```
-
 ## Install
 
-1. Install the stable Rust toolchain from https://rustup.rs.
-2. Clone the repo and build it:
-
-```text
-git clone https://github.com/nathwn12/puppet
-cargo build --release --locked
+```powershell
+npx -y puppet-mcp@latest --doctor
 ```
 
-3. The build produces a single `target\release\puppet.exe`.
-   Add it to your MCP client:
+You need Node 22.14 or newer on Windows 10/11 x64 first. The first run provisions the pinned server binary from the tagged GitHub Release, sha256-verified, then `--doctor` prints the manifest with the resolved cache path and exits 0.
+
+### Or let your AI install it
+
+```text
+Install the npm package puppet-mcp from nathwn12/puppet into my MCP client config, served with npx puppet-mcp@latest over stdio.
+Then verify with npx puppet-mcp@latest --doctor and npm view puppet-mcp version and show me both outputs.
+```
+
+### Wire it yourself
+
+Wire the server into your MCP client config:
 
 ```json
 {
   "mcpServers": {
     "puppet": {
-      "command": "C:\\tools\\puppet\\puppet.exe",
-      "args": []
+      "command": "npx",
+      "args": [
+        "puppet-mcp@latest"
+      ]
     }
   }
 }
 ```
 
-Replace the command path with the folder holding your built `puppet.exe`,
-then restart the client. The client spawns the server over stdio,
-so you never launch the binary by hand.
+### Offline or pinned
 
-## Safety: what it touches
+Pin an exact version instead of `@latest`:
 
-puppet drives your real Windows desktop. The seeing tools change nothing:
-`screenshot` captures without raising or focusing anything, `list_windows`
-and `cursor` only read state, and `elements` lists a window's controls with
-no screenshot, no focus change, and no input. The doing tools act for real:
-`do` moves the mouse, types, and sends keys, and `window` can focus, move,
-resize, minimize, maximize, restore, or close a window. Nothing asks you
-first, so preview a risky burst with `"dry_run": true`, which assembles
-the input without sending it.
+```powershell
+npx -y puppet-mcp@4.3.0 --doctor
+```
+
+Build from source when you want the working tree instead of the Release binary:
+
+```text
+git clone https://github.com/nathwn12/puppet
+cargo build --release --locked
+```
+
+Redirect the cache with `PUPPET_ENGINE_CACHE`, or inspect the pin with no network access:
+
+```powershell
+npx -y puppet-mcp@latest --print-manifest
+```
+
+The names above come from `puppet-mcp --help`. There is no fully offline fresh install: the first run still downloads the pinned binary, so treat these as pins and overrides, not as a no-network setup.
 
 ## Use it
 
-1. See what is open. Read-only, changes nothing. Call `list_windows` with:
+List what is open with the `list_windows` tool. Read-only, changes nothing:
 
 ```json
 {}
 ```
 
-You get back each visible window with `hwnd`, `pid`, `exe`, `title`,
-and its screen rect.
-
-2. See the screen. Call `screenshot` with:
+You get back each visible top-level window with `hwnd`, `pid`, `exe`, `title`, `class`, screen `rect`, `dpi`, and whether the process runs `elevated`. See the screen with the `screenshot` tool:
 
 ```json
-{"max_px": 1280}
+{
+  "max_px": 1280
+}
 ```
 
-You get back an image frame plus a coordinate map that turns image pixels
-back into screen coordinates.
-
-3. Send input, previewed first. Call `do` with:
+You get back an image frame plus a coordinate map that turns image pixels back into screen pixels. Send input with the `do` tool, previewed first:
 
 ```json
-{"actions": [{"type": "type", "text": "hello"}], "dry_run": true}
+{
+  "actions": [{ "type": "type", "text": "hello" }],
+  "dry_run": true
+}
 ```
 
-You get back per-action results with `index`, `type`, `ok`, and `ms`.
-Remove `dry_run` to send the input for real.
+You get back per-action results with `index`, `type`, `ok`, and `ms`. Remove `dry_run` to send the input for real.
 
 ## What you get
 
-- See the desktop from any MCP client: screenshots, window lists,
-  cursor position, and UI element trees.
-- Drive the desktop when you mean to: mouse, keyboard, and window
-  control batched into one call.
-- Preview before you act: dry-run mode reports what a burst would do
-  without touching anything.
-- Run one file: a single `puppet.exe` with no interpreter or venv
-  to manage.
-- Trust the coordinates: every screenshot carries the math that maps
-  image pixels back to screen pixels.
+- Six tools to see and drive the desktop: `screenshot`, `list_windows`, `window`, `do`, `cursor`, and `elements` (src/schemas.rs).
+- Coordinates you can trust: every screenshot carries the map that turns image pixels back into screen pixels.
+- A small local footprint: one native binary over stdio; the launcher provisions it on first run and re-verifies the cache each time.
+- Input that never asks first: `do` drives the real desktop, so preview a risky burst with `dry_run`; input aimed at an elevated window is refused with a typed error (on `main`, ships in 4.4.0).
 
 ## Requirements
 
-- Windows 10 or 11, 64-bit. puppet calls the Win32 desktop APIs
-  directly, so there is no macOS or Linux build.
-- A stable Rust toolchain, needed only to build the binary.
-- An MCP client that can spawn a local stdio server.
+- Node 22.14 or newer (package engines, checked with `node --version`).
+- Windows x64. Other platforms are refused unless you set the diagnostics override named in `--help`.
+- The first run downloads the pinned server binary from the tagged GitHub Release, sha256-verified before and after extraction (docs/PUBLISHING.md).
 
 ## Links
 
 - Repo: https://github.com/nathwn12/puppet
+- Package: https://www.npmjs.com/package/puppet-mcp
 - Releases: https://github.com/nathwn12/puppet/releases
 - Issues: https://github.com/nathwn12/puppet/issues
-- License: MIT, see [LICENSE](LICENSE).
+- License: MIT, see [LICENSE](LICENSE)
+- Docs: [publishing](docs/PUBLISHING.md)
