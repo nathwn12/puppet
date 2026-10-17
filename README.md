@@ -1,85 +1,40 @@
-<p align="center">
-  <img src="assets/icon.svg" alt="puppet" width="120" height="120">
-</p>
-<h1 align="center">puppet</h1>
-<p align="center"><strong>Control the Windows desktop from any MCP client - screenshot, window, input, cursor - Rust.</strong></p>
-<p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/nathwn12/puppet" alt="License" /></a>
-  <img src="https://img.shields.io/github/languages/top/nathwn12/puppet" alt="Language" />
-  <img src="https://img.shields.io/badge/platform-windows--64bit-2b3137?logo=windows&logoColor=white" alt="Platform" />
-</p>
+# puppet
 
-## Project name and description
+**Give your coding agent eyes and hands for your Windows desktop.**
 
-**puppet** is a native-Rust Windows desktop-control MCP server speaking stdio (JSON-RPC 2.0
-over stdin/stdout). It exposes exactly 6 tools — `screenshot`, `list_windows`,
-`window`, `do`, `cursor`, `elements` — and reports MCP
-`serverInfo { name: "puppet", version: "4.3.0" }`. `stdout` carries protocol
-frames only; logs go to `stderr`. It ships as a single binary
-(`puppet.exe`) with no Python runtime or venv. A Rust port of the Python
-incumbent, so there is no interpreter to install and capture runs on the
-native DXGI path with a GDI fallback. Self-measured on the author's machine:
-desktop capture takes 15.82 ms default / 19.78 ms normalized against the
-Python incumbent's 35.78 / 35.99 ms; parity with the incumbent holds at 8/8
-core, 60/60 do-parity, 9/9 and 18/18 invoke resolution; and a self-measured
-head-to-head bench against a 10-server field ranked it 2/10. These figures
-are self-measured on one machine, not an external benchmark.
+## Easy install
 
-## Technology stack
-
-- **Rust** — edition 2021, `rust-version = "1.80"` (`Cargo.toml`); `Cargo.lock`
-  is committed and `--locked` is the build norm.
-- **Windows surface** — `windows-sys 0.61` (Win32: capture, `SendInput`, UIA,
-  desktops) plus `windows 0.61` (Direct3D11/DXGI capture path).
-- **Encoding** — `serde_json 1` (`preserve_order`), `png 0.17`,
-  `jpeg-encoder 0.6`, `base64 0.22`.
-
-## Architecture
-
-One stdio MCP server in a single binary: newline-delimited JSON-RPC 2.0 over
-stdin/stdout (`stdout` carries protocol frames only, logs go to `stderr`),
-dispatching to exactly 6 tools. Capture runs on the native DXGI path with a
-GDI fallback; input and window operations go through `SendInput` and UIA,
-including the opt-in `desktop:"hidden"` mode that drives a target on a
-private desktop without moving the owner's cursor.
-
-## Getting started
-
-### Prerequisites
-
-- Windows 10/11, x86-64 only. `puppet` is Windows-only by nature: it drives the
-  Win32 desktop (DXGI/GDI capture, SendInput, UIA), so there is no macOS or
-  Linux build and WSL cannot substitute for it. Other platforms are not
-  supported — GUI automation here means the Windows desktop API surface, which
-  does not exist elsewhere.
-- No interpreter or VM to install: no Python, no venv, no browser, no Node. One
-  binary (`puppet.exe`); the Rust toolchain is needed only to build from source.
-  It links the MSVC runtime (`VCRUNTIME140.dll`), so the Microsoft Visual C++
-  Redistributable is required — it is not a self-contained static build.
-
-### Install
-
-1. Download `puppet-<version>-windows-x86_64.zip` from the [GitHub Releases](https://github.com/nathwn12/puppet/releases) page and unzip it anywhere (it contains `puppet.exe`, `LICENSE`, `README.md`).
-2. Point your MCP client at it (pick your client). Replace `C:\\tools\\puppet\\puppet.exe` with the folder holding `puppet.exe`:
-
-OpenCode V2 (`opencode.json`):
-
-```jsonc
-{
-  "mcp": {
-    "servers": {
-      "puppet": {
-        "type": "local",
-        "command": ["C:\\tools\\puppet\\puppet.exe"]
-      }
-    }
-  }
-}
+```text
+git clone https://github.com/nathwn12/puppet
+cargo build --release --locked
 ```
 
-Claude Desktop (`claude_desktop_config.json`):
+There are no releases yet, so building from source is the only route.
+The client setup below takes about a minute.
 
-```jsonc
+## Let your AI install it
+
+```text
+Clone https://github.com/nathwn12/puppet, build it with
+cargo build --release --locked, and add the built puppet.exe
+to my MCP client config. Then prove it works by running
+puppet --version and making one read-only list_windows call.
+```
+
+## Install
+
+1. Install the stable Rust toolchain from https://rustup.rs.
+2. Clone the repo and build it:
+
+```text
+git clone https://github.com/nathwn12/puppet
+cargo build --release --locked
+```
+
+3. The build produces a single `target\release\puppet.exe`.
+   Add it to your MCP client:
+
+```json
 {
   "mcpServers": {
     "puppet": {
@@ -90,99 +45,73 @@ Claude Desktop (`claude_desktop_config.json`):
 }
 ```
 
-3. Restart the client. Building from source (below) is the alternative.
+Replace the command path with the folder holding your built `puppet.exe`,
+then restart the client. The client spawns the server over stdio,
+so you never launch the binary by hand.
 
-### Usage
+## Safety: what it touches
 
-Wire the binary into your MCP client config as in Install above and start the
-client — the client spawns the server over stdio, so there is nothing else to
-launch by hand. Manual run (the same binary the client would spawn):
+puppet drives your real Windows desktop. The seeing tools change nothing:
+`screenshot` captures without raising or focusing anything, `list_windows`
+and `cursor` only read state, and `elements` lists a window's controls with
+no screenshot, no focus change, and no input. The doing tools act for real:
+`do` moves the mouse, types, and sends keys, and `window` can focus, move,
+resize, minimize, maximize, restore, or close a window. Nothing asks you
+first, so preview a risky burst with `"dry_run": true`, which assembles
+the input without sending it.
 
-```text
-target\release\puppet.exe
+## Use it
+
+1. See what is open. Read-only, changes nothing. Call `list_windows` with:
+
+```json
+{}
 ```
 
-Transport: stdio MCP, newline-delimited JSON-RPC 2.0. `stdout` carries protocol
-frames only; logs go to `stderr`.
+You get back each visible window with `hwnd`, `pid`, `exe`, `title`,
+and its screen rect.
 
-### Build from source
+2. See the screen. Call `screenshot` with:
 
-Requires a Rust toolchain (stable) on Windows. `--locked` builds against the
-committed `Cargo.lock` for a reproducible dependency set:
-
-```text
-cargo build --release --locked
+```json
+{"max_px": 1280}
 ```
 
-The binary lands at `target\release\puppet.exe`; configure your client as in
-Install above.
+You get back an image frame plus a coordinate map that turns image pixels
+back into screen coordinates.
 
-## Project structure
+3. Send input, previewed first. Call `do` with:
 
-```text
-src/            burst, cap, dxgi, fixture, hidden, main, schemas, screen, serve, shot, uia, winop
-tests/          integration entry points (e.g. version.rs); unit tests live beside the code in src/
-build.rs        build-commit stamp reported via --version
-Cargo.toml      edition 2021, rust-version 1.80, --locked norm
-CHANGELOG.md    Keep a Changelog history
-bin/            local built-binary snapshots (gitignored dev scratch)
+```json
+{"actions": [{"type": "type", "text": "hello"}], "dry_run": true}
 ```
 
-## Key features
+You get back per-action results with `index`, `type`, `ok`, and `ms`.
+Remove `dry_run` to send the input for real.
 
-| Tool | One line |
-| --- | --- |
-| screenshot | Capture the desktop (default or normalized) and return it as an image frame. |
-| list_windows | List visible top-level windows as JSON. |
-| window | Inspect or act on a single window by handle or title match. |
-| do | Send input / window operations (mouse, keyboard, window ops), including `set_value` text writes via UIA ValuePattern (no click, no focus change; value never echoed), and the opt-in `desktop:"hidden"` mode that launches a target on a private desktop, drives it through the PostMessage path, captures it with PrintWindow, then tears the desktop down — the owner's cursor is never moved and foreground/focus stay untouched, except that an opt-in `focus_guard:true` burst re-foregrounds the pre-burst window when it observes a focus change (`src/burst.rs`). |
-| cursor | Report the current cursor position and monitor rects as JSON. |
-| elements | List structured UI elements for a window as JSON (zero-pixel). |
+## What you get
 
-## Development workflow
+- See the desktop from any MCP client: screenshots, window lists,
+  cursor position, and UI element trees.
+- Drive the desktop when you mean to: mouse, keyboard, and window
+  control batched into one call.
+- Preview before you act: dry-run mode reports what a burst would do
+  without touching anything.
+- Run one file: a single `puppet.exe` with no interpreter or venv
+  to manage.
+- Trust the coordinates: every screenshot carries the math that maps
+  image pixels back to screen pixels.
 
-Changes are recorded in [CHANGELOG.md](CHANGELOG.md) (Keep a Changelog
-format). CI (`.github/workflows/ci.yml`) fires on `workflow_dispatch` only
-while the repo is private, so no CI badge is shown — it gates on
-`cargo build --locked` and `cargo test --locked`, and every gate is proven
-locally. Releases are cut deliberately from a `v*` tag as
-`puppet-<version>-windows-x86_64.zip` (`.github/workflows/release.yml`).
+## Requirements
 
-## Coding standards
+- Windows 10 or 11, 64-bit. puppet calls the Win32 desktop APIs
+  directly, so there is no macOS or Linux build.
+- A stable Rust toolchain, needed only to build the binary.
+- An MCP client that can spawn a local stdio server.
 
-- Rust, edition 2021; `rust-version = "1.80"` is the floor — do not lower it.
-- `--locked` builds against the committed `Cargo.lock` for a reproducible
-  dependency set.
-- Tool errors are typed at the site; `set_value` never echoes the text value
-  back.
+## Links
 
-## Testing
-
-```text
-cargo test --locked
-```
-
-The suite is 50 unit and live-fixture tests; CI gates on `cargo build --locked`
-and `cargo test --locked` (`.github/workflows/ci.yml`).
-
-**Unverified** — as-is, use at your own risk.
-The live-input legs (`SendInput` and UIA activation against a live third-party application) are still unexercised: no real pointer, keyboard input, or focus change has ever been sent. Proven so far only against a self-owned offscreen fixture (a test-process window at -4000/-4000 shown with `SW_SHOWNOACTIVATE`, never activated): the UIA walk enumerated an Edit, a read-only Edit, and an OK button with populated `ref` values, and `set_value` wrote a value read back via `GetWindowTextW`.
-
-## Contributing
-
-There is no separate contributing guide in this repo. Issues are welcome; keep
-changes small and scoped, record user-visible changes in
-[CHANGELOG.md](CHANGELOG.md), and run `cargo test --locked` before opening a
-PR.
-
-## License
-
-MIT — see [LICENSE](LICENSE).
-
-<!-- nathwn12 house footer: identical in every repo. Do not edit. -->
-<p align="center">
-  <a href="https://github.com/nathwn12"><img src="assets/signature.svg" width="96" alt="nathwn12" /></a>
-</p>
-<p align="center">
-  <sub>Built by <a href="https://github.com/nathwn12">nathwn12</a> · <a href="https://github.com/nathwn12?tab=repositories">All projects</a></sub>
-</p>
+- Repo: https://github.com/nathwn12/puppet
+- Releases: https://github.com/nathwn12/puppet/releases
+- Issues: https://github.com/nathwn12/puppet/issues
+- License: MIT, see [LICENSE](LICENSE).
