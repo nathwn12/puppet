@@ -46,10 +46,17 @@ fn init_result(params: &Value) -> String {
         LATEST_VERSION
     };
     format!(
-        "{{\"protocolVersion\":{},\"capabilities\":{{\"logging\":{{}},\"prompts\":{{\"listChanged\":true}},\"resources\":{{\"subscribe\":false,\"listChanged\":true}},\"tools\":{{\"listChanged\":true}}}},\"serverInfo\":{{\"name\":\"puppet\",\"version\":\"4.3.0\"}}}}",
-        serde_json::to_string(echo).unwrap()
+        "{{\"protocolVersion\":{},\"capabilities\":{{\"logging\":{{}},\"prompts\":{{\"listChanged\":true}},\"resources\":{{\"subscribe\":false,\"listChanged\":true}},\"tools\":{{\"listChanged\":true}}}},\"serverInfo\":{{\"name\":\"puppet\",\"version\":\"4.3.0\"}},\"instructions\":{}}}",
+        serde_json::to_string(echo).unwrap(),
+        serde_json::to_string(INIT_INSTRUCTIONS).unwrap()
     )
 }
+
+/// Usage contract for a client/model that has never seen this server (gap
+/// 3): the six tools in one line each, the coordinate rule with the
+/// image-to-screen formula, batch + dry_run, and read-only-first on the
+/// owner's real desktop.
+const INIT_INSTRUCTIONS: &str = "puppet desktop-control MCP (Windows). Input hits the owner's real desktop: start every task with read-only calls (screenshot, elements, list_windows, cursor), batch work into one do burst per turn, then screenshot to verify.\nTools (one line each):\n- screenshot: capture the whole virtual desktop (display=-1), one monitor, a window, or a region; returns the image plus source{x,y,w,h}, scale, the monitor list, the cursor, and the image-to-screen formula. Coordinates are screen/virtual-desktop pixels: screen_x = source.x + round((img_x + 0.5) * source.w / image.w) (same for y).\n- list_windows: read-only visible top-level windows (hwnd/pid/exe/title/rects/elevated); never changes focus.\n- window: focus|move|resize|minimize|maximize|restore|close|topmost by selector or hwnd.\n- do: BURST tool: one call runs an ordered actions[] batch (move|click|down|up|drag|scroll|type|key|hotkey|wait|wait_for|focus_window|invoke|set_value); per-action ok, never aborts the rest. dry_run=true validates and reports without injecting anything. Coordinate actions take virtual-desktop pixels.\n- cursor: read-only cursor position plus monitor rects.\n- elements: read-only structured UI elements for a window (zero pixels, no focus change); each entry carries ref plus fp, a stable identity fingerprint. Prefer elements over pixel guessing; pass expect_fp to invoke/set_value to refuse stale refs instead of acting on the wrong control. When text is illegible, re-request the same window with a tight region plus max_px:null (full-resolution zoom).";
 
 fn tools_list_result() -> String {
     format!("{{\"tools\":[{TOOL_SCREENSHOT},{TOOL_LIST_WINDOWS},{TOOL_WINDOW},{TOOL_DO},{TOOL_CURSOR},{TOOL_ELEMENTS}]}}")
@@ -592,6 +599,46 @@ mod tests {
         let mut out = FailWriter;
         let code = pump(&framed[..], &mut out);
         assert_eq!(code, 1, "broken stdout must stop the pump with code 1");
+    }
+
+    /// Gap-3 proof (fails before the fix, passes after): the initialize
+    /// result must carry an `instructions` string with the usage contract --
+    /// the six tools, the coordinate rule, batch + dry_run, read-only first.
+    /// Essentials are asserted, never a byte-exact string.
+    #[test]
+    fn init_result_carries_usage_instructions() {
+        let params = serde_json::json!({"protocolVersion": "2025-11-25"});
+        let s = init_result(&params);
+        let v: Value = serde_json::from_str(&s).expect("init result must be JSON");
+        let ins = v
+            .get("instructions")
+            .and_then(|x| x.as_str())
+            .expect("initialize result must carry instructions");
+        for tool in [
+            "screenshot",
+            "list_windows",
+            "window",
+            "do",
+            "cursor",
+            "elements",
+        ] {
+            assert!(
+                ins.contains(tool),
+                "instructions must name the {tool} tool"
+            );
+        }
+        assert!(
+            ins.contains("dry_run"),
+            "instructions must document dry_run"
+        );
+        assert!(
+            ins.contains("source.x"),
+            "instructions must carry the image-to-screen formula"
+        );
+        assert!(
+            ins.contains("read-only"),
+            "instructions must tell read-only calls to come first"
+        );
     }
 
     fn elements_args(pairs: &[(&str, Value)]) -> Map<String, Value> {

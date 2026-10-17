@@ -14,14 +14,18 @@ use std::sync::{LazyLock, Mutex};
 use serde_json::{Map, Value};
 use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, SetLastError, HWND, LPARAM, POINT, RECT,
+    CloseHandle, GetLastError, SetLastError, HANDLE, HWND, LPARAM, POINT, RECT,
 };
 use windows_sys::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
 use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, HDC, HMONITOR};
+use windows_sys::Win32::Security::{
+    GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+};
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcess, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows_sys::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwareness, SetProcessDpiAwarenessContext,
@@ -786,7 +790,7 @@ fn virtual_rect() -> (i32, i32, i32, i32) {
     }
 }
 
-fn exe_of_pid(pid: u32) -> String {
+pub(crate) fn exe_of_pid(pid: u32) -> String {
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if h.is_null() {
@@ -815,7 +819,7 @@ fn exe_of_pid(pid: u32) -> String {
     }
 }
 
-fn pid_of(hwnd: HWND) -> u32 {
+pub(crate) fn pid_of(hwnd: HWND) -> u32 {
     unsafe {
         let mut pid: u32 = 0;
         GetWindowThreadProcessId(hwnd, &mut pid);
@@ -868,6 +872,84 @@ fn win_dpi(hwnd: HWND) -> i64 {
         // GetDpiForWindow returns 0 on failure per contract (python try/except).
         GetDpiForWindow(hwnd) as i64
     }
+}
+
+// ---------------------------------------------------------------- elevation / UIPI (gap 2)
+
+/// Elevation of one open token: Some(true) elevated, Some(false) not.
+/// The caller owns `tok` (opened via OpenProcessToken); it is not closed here.
+fn token_elevated(tok: HANDLE) -> Option<bool> {
+    unsafe {
+        let mut elev = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut len: u32 = 0;
+        let ok = GetTokenInformation(
+            tok,
+            TokenElevation,
+            &mut elev as *mut TOKEN_ELEVATION as *mut _,
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        );
+        if ok != 0 {
+            Some(elev.TokenIsElevated != 0)
+        } else {
+            None
+        }
+    }
+}
+
+/// Elevation of a process id via its token (gap 2): Some(true/false) when
+/// readable, None when not (fail-open: unknown is never NAMED elevated).
+/// Openable with PROCESS_QUERY_LIMITED_INFORMATION, the same handle level
+/// `exe_of_pid` already uses.
+pub(crate) fn process_elevated(pid: u32) -> Option<bool> {
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let mut tok: HANDLE = std::ptr::null_mut();
+        let v = if OpenProcessToken(h, TOKEN_QUERY, &mut tok) == 0 {
+            None
+        } else {
+            let v = token_elevated(tok);
+            CloseHandle(tok);
+            v
+        };
+        CloseHandle(h);
+        v
+    }
+}
+
+/// Elevation of this server process (gap 2). Unknown reads as false so the
+/// predicate below fails closed (refuse) rather than injecting blind.
+pub(crate) fn self_elevated() -> bool {
+    unsafe {
+        let mut tok: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut tok) == 0 {
+            return false;
+        }
+        let v = token_elevated(tok).unwrap_or(false);
+        CloseHandle(tok);
+        v
+    }
+}
+
+/// Pure UIPI predicate (gap 2): input from this process to the target is
+/// UIPI-doomed exactly when the target is determinably elevated and we are
+/// not. `SendInput` "neither GetLastError nor the return value will indicate
+/// the failure was caused by UIPI blocking", so this pre-check is the only
+/// signal that names the cause.
+pub(crate) fn uipi_blocked(target_elevated: Option<bool>, self_elev: bool) -> bool {
+    matches!(target_elevated, Some(true)) && !self_elev
+}
+
+/// Elevation of the process owning a window (gap 2).
+pub(crate) fn window_elevated(hwnd: HWND) -> Option<bool> {
+    let pid = pid_of(hwnd);
+    if pid == 0 {
+        return None;
+    }
+    process_elevated(pid)
 }
 
 fn client_rect_screen(hwnd: HWND) -> Vec<i32> {
@@ -958,6 +1040,16 @@ fn window_info(hwnd: HWND) -> Option<Map<String, Value>> {
         m.insert("cloaked".to_string(), Value::from(cloaked(hwnd)));
         m.insert("visible".to_string(), Value::from(true));
         m.insert("dpi".to_string(), Value::from(win_dpi(hwnd)));
+        // Gap 2: elevation names the UIPI condition. true = elevated target
+        // (input from this server is UIPI-blocked), false = not, null =
+        // unreadable (fail-open: unknown is never named elevated).
+        m.insert(
+            "elevated".to_string(),
+            match window_elevated(hwnd) {
+                Some(b) => Value::from(b),
+                None => Value::Null,
+            },
+        );
         if dwm_fb {
             m.insert("dwm_fallback".to_string(), Value::from(true));
         }

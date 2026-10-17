@@ -310,6 +310,31 @@ pub fn do_cursor() -> String {
 mod tests {
     use super::*;
 
+    /// Gap-2 proof (fails before the fix, passes after): every listed window
+    /// carries its elevation so a caller can tell an elevated target apart
+    /// from an unresponsive one.
+    #[test]
+    fn list_windows_entries_carry_elevated_flag() {
+        let out = do_list_windows();
+        let outer: Value = serde_json::from_str(&out).expect("outer frame");
+        let inner = outer
+            .get("structuredContent")
+            .and_then(|s| s.get("result"))
+            .and_then(|r| r.as_str())
+            .expect("structured result");
+        let arr: Value = serde_json::from_str(inner).expect("window list");
+        let wins = arr.as_array().expect("window list array");
+        for w in wins {
+            let o = w.as_object().expect("window object");
+            assert!(
+                o.contains_key("elevated"),
+                "list_windows entry must carry elevated, got keys: {:?}",
+                o.keys().collect::<Vec<_>>()
+            );
+        }
+        println!("ELEVATED_FLAG_WINDOWS={}", wins.len());
+    }
+
     #[test]
     fn out_of_i32_range_rejected_not_wrapped() {
         // 2^40 wraps to 0 under `as i32`; the helper must reject instead.

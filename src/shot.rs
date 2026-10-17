@@ -271,18 +271,23 @@ fn win32_element_list(hwnd: HWND) -> Result<(Vec<Map<String, Value>>, bool), Str
         };
         let inv = cls == "Button";
         if !name.is_empty() || !aid.is_empty() || inv {
+            let role = role_of_class(&cls).to_string();
             let mut e = Map::new();
             e.insert("win".to_string(), Value::from(hwnd as i64));
-            e.insert("role".to_string(), Value::from(role_of_class(&cls)));
-            e.insert("name".to_string(), Value::from(name));
-            e.insert("auto_id".to_string(), Value::from(aid));
-            e.insert("rect".to_string(), Value::from(rect));
+            e.insert("role".to_string(), Value::from(role.clone()));
+            e.insert("name".to_string(), Value::from(name.clone()));
+            e.insert("auto_id".to_string(), Value::from(aid.clone()));
+            e.insert("rect".to_string(), Value::from(rect.clone()));
             e.insert("invokable".to_string(), Value::from(inv));
             e.insert("path".to_string(), Value::from(i.to_string()));
             e.insert("hwnd".to_string(), Value::from(*h as i64));
             e.insert(
                 "ref".to_string(),
                 Value::from(format!("{}.{i}", hwnd as i64)),
+            );
+            e.insert(
+                "fp".to_string(),
+                Value::from(element_fp(&role, &name, &aid, &rect, inv)),
             );
             entries.push(e);
         }
@@ -295,6 +300,25 @@ pub struct ElementModel {
     pub truncated: bool,
     pub backend: String,
     pub detail: Map<String, Value>,
+}
+
+/// Stable per-element identity fingerprint (gap 1): FNV-1a 64 over
+/// role/name/auto_id/rect/invokable, rendered as 16 lowercase hex digits.
+/// Deliberately NOT DefaultHasher (random seed per process): a fingerprint
+/// captured in one `elements` snapshot stays comparable against a later
+/// re-walk. The path is the address, never part of the identity.
+pub fn element_fp(role: &str, name: &str, auto_id: &str, rect: &[i64], invokable: bool) -> String {
+    let r0 = rect.first().copied().unwrap_or(0);
+    let r1 = rect.get(1).copied().unwrap_or(0);
+    let r2 = rect.get(2).copied().unwrap_or(0);
+    let r3 = rect.get(3).copied().unwrap_or(0);
+    let s = format!("{role}\0{name}\0{auto_id}\0{r0},{r1},{r2},{r3}\0{invokable}");
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{h:016x}")
 }
 
 pub fn element_model(hwnd: HWND) -> ElementModel {
@@ -374,7 +398,7 @@ pub fn element_model(hwnd: HWND) -> ElementModel {
 /// Compact default per-entry shape for the standalone `elements` tool:
 /// everything except the raw `win` (and `hwnd` on the Win32 fallback)
 /// identifiers, which `detail=true` retains.
-pub const COMPACT_ELEMENT_KEYS: [&str; 7] = [
+pub const COMPACT_ELEMENT_KEYS: [&str; 8] = [
     "ref",
     "role",
     "name",
@@ -382,6 +406,7 @@ pub const COMPACT_ELEMENT_KEYS: [&str; 7] = [
     "rect",
     "invokable",
     "path",
+    "fp",
 ];
 
 /// Project one full walk entry to the compact default shape.
@@ -478,6 +503,10 @@ mod tests {
         e.insert("path".to_string(), Value::from("3"));
         e.insert("hwnd".to_string(), Value::from(199340));
         e.insert("ref".to_string(), Value::from("199210.3"));
+        e.insert(
+            "fp".to_string(),
+            Value::from(element_fp("Button", "OK", "2", &[10, 20, 80, 24], true)),
+        );
         e
     }
 
@@ -515,12 +544,29 @@ mod tests {
                 "auto_id",
                 "rect",
                 "invokable",
-                "path"
+                "path",
+                "fp"
             ],
             "compact default must carry exactly the documented keys, got: {keys:?}"
         );
         assert!(!c.contains_key("win"), "compact must omit win");
         assert!(!c.contains_key("hwnd"), "compact must omit hwnd");
+    }
+
+    #[test]
+    fn element_fp_stable_and_identity_sensitive() {
+        // The stale-ref gate stands on this: same identity hashes equal
+        // (deterministic across processes), any identity change re-hashes.
+        let a = element_fp("Button", "OK", "2", &[10, 20, 80, 24], true);
+        assert_eq!(a.len(), 16, "fp is 16 hex chars, got: {a}");
+        assert_eq!(a, element_fp("Button", "OK", "2", &[10, 20, 80, 24], true));
+        assert_ne!(
+            a,
+            element_fp("Button", "Cancel", "2", &[10, 20, 80, 24], true)
+        );
+        assert_ne!(a, element_fp("Button", "OK", "2", &[11, 20, 80, 24], true));
+        assert_ne!(a, element_fp("Edit", "OK", "2", &[10, 20, 80, 24], true));
+        assert_ne!(a, element_fp("Button", "OK", "3", &[10, 20, 80, 24], true));
     }
 
     #[test]

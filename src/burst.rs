@@ -1062,6 +1062,7 @@ fn element_public(e: &Map<String, Value>) -> Map<String, Value> {
     m.insert("role".to_string(), Value::from(entry_str(e, "role")));
     m.insert("auto_id".to_string(), Value::from(entry_str(e, "auto_id")));
     m.insert("ref".to_string(), Value::from(entry_str(e, "ref")));
+    m.insert("fp".to_string(), Value::from(entry_str(e, "fp")));
     m.insert(
         "rect".to_string(),
         e.get("rect")
@@ -1190,12 +1191,38 @@ fn element_pub_full(entry: &Map<String, Value>) -> Map<String, Value> {
         "rect",
         "invokable",
         "path",
+        "fp",
     ] {
         if let Some(v) = entry.get(k) {
             m.insert(k.to_string(), v.clone());
         }
     }
     m
+}
+
+/// Gap-1 freshness gate: when the action carries `expect_fp`, the freshly
+/// re-walked entry's fingerprint must equal it. Returns the typed refusal on
+/// mismatch, None when the gate passes (no/empty expect_fp, or a match).
+/// Applies live and under dry_run alike: a stale ref never acts.
+fn check_expect_fp(
+    a: &Map<String, Value>,
+    entry: &Map<String, Value>,
+    sel: &str,
+) -> Option<String> {
+    let want = match a.get("expect_fp") {
+        None | Some(Value::Null) => return None,
+        Some(v) => py_str(v),
+    };
+    if want.trim().is_empty() {
+        return None;
+    }
+    let got = entry_str(entry, "fp");
+    if got == want {
+        return None;
+    }
+    Some(format!(
+        "stale_ref: element \"{sel}\" changed since its snapshot (expected fp {want}, now {got}). Take a fresh `elements` snapshot and retry with the new ref/fp."
+    ))
 }
 
 // ---------------------------------------------------------------- invoke activation (UIA patterns + Win32 extent)
@@ -1264,6 +1291,102 @@ fn pixel_click_at(x: i64, y: i64) -> bool {
     }
 }
 
+// ---------------------------------------------------------------- UIPI / elevation (gap 2)
+
+/// Pure refusal text (gap 2): the typed, actionable error naming the
+/// elevated target. Separated from the live reader below for testability;
+/// essentials are pinned by `uipi_refusal_text_names_target_and_recovery`.
+fn format_uipi_refusal(exe: &str, pid: u32, hwnd: i64) -> String {
+    format!(
+        "uipi_blocked: target \"{exe}\" (pid {pid}, hwnd {hwnd}) runs elevated; input from this unelevated process would be silently dropped by UIPI (SendInput neither sends nor names it). Relaunch this server elevated and retry; under dry_run this refusal is reported without injecting anything."
+    )
+}
+
+/// Typed, actionable UIPI refusal naming the elevated target (gap 2). None
+/// when input may proceed: zero hwnd, non-elevated target, elevated self, or
+/// unreadable elevation (fail-open). Never injects, never switches modes.
+fn uipi_refusal(hwnd: i64) -> Option<String> {
+    if hwnd == 0 {
+        return None;
+    }
+    if !crate::uipi_blocked(crate::window_elevated(hwnd as HWND), crate::self_elevated()) {
+        return None;
+    }
+    let pid = crate::pid_of(hwnd as HWND);
+    Some(format_uipi_refusal(&crate::exe_of_pid(pid), pid, hwnd))
+}
+
+fn window_at(x: i64, y: i64) -> Option<i64> {
+    let (x, y) = (
+        x.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+        y.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+    );
+    unsafe {
+        let h = WindowFromPoint(POINT { x, y });
+        if h.is_null() {
+            None
+        } else {
+            Some(h as i64)
+        }
+    }
+}
+
+/// Windows that would receive one foreground input action (gap 2): the real
+/// recipient, not the cursor heuristic -- WindowFromPoint for coordinate
+/// actions, the foreground window for keyboard/scroll-without-coords. Empty
+/// when the action injects into no process (move), is unreadable, or is not
+/// foreground input at all. Parse failures yield no targets here; the action
+/// handler below reports its own argument error.
+fn uipi_targets_for_action(typ: &str, a: &Map<String, Value>) -> Vec<i64> {
+    let mut out = Vec::new();
+    let mut push_opt = |h: Option<i64>| {
+        if let Some(v) = h {
+            out.push(v);
+        }
+    };
+    match typ {
+        "click" | "down" | "up" => match (a.get("x"), a.get("y")) {
+            (Some(xv), Some(yv)) => match (py_int(xv), py_int(yv)) {
+                (Ok(x), Ok(y)) => push_opt(window_at(x, y)),
+                _ => {}
+            },
+            _ => {
+                let (cx, cy) = cursor_now();
+                push_opt(window_at(cx, cy));
+            }
+        },
+        "drag" => {
+            for key in ["from", "to"] {
+                if let Some(v) = a.get(key) {
+                    if let Ok((x, y)) = unpack2(v) {
+                        push_opt(window_at(x, y));
+                    }
+                }
+            }
+        }
+        "scroll" => match (a.get("x"), a.get("y")) {
+            (Some(xv), Some(yv)) => match (py_int(xv), py_int(yv)) {
+                (Ok(x), Ok(y)) => push_opt(window_at(x, y)),
+                _ => {}
+            },
+            _ => {
+                let f = fg_now();
+                if f != 0 {
+                    out.push(f);
+                }
+            }
+        },
+        "type" | "key" | "hotkey" => {
+            let f = fg_now();
+            if f != 0 {
+                out.push(f);
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
 // ---------------------------------------------------------------- burst state + flush (puppet.py:2747-2791)
 
 struct Burst {
@@ -1274,12 +1397,16 @@ struct Burst {
     events: i64,
     sendinput_ms: f64,
     dry_run: bool,
+    /// Gap 2: set when the last flush short-sent against an elevated
+    /// foreground (UIPI-suspected). Read by fail_since_flush at the call site.
+    flush_uipi: bool,
 }
 
 impl Burst {
     /// Empty pending -> (0, None), no call counted. Live partial sends
     /// retro-mark every covered action via fail_since_flush (caller).
     fn flush(&mut self) -> (f64, Option<String>) {
+        self.flush_uipi = false;
         if self.pending.is_empty() {
             return (0.0, None);
         }
@@ -1311,6 +1438,20 @@ impl Burst {
                     let code = GetLastError();
                     msg.push_str(&format!(": [WinError {code}]"));
                 }
+                // Gap 2 post-hoc: a zero-send against an elevated foreground
+                // is UIPI-suspected (SendInput never names UIPI itself).
+                // Pre-checks above refuse the known-elevated case before
+                // injecting; this names the race that slips between.
+                let fg = fg_now();
+                if crate::uipi_blocked(crate::window_elevated(fg as HWND), crate::self_elevated())
+                {
+                    let pid = crate::pid_of(fg as HWND);
+                    let exe = crate::exe_of_pid(pid);
+                    msg.push_str(&format!(
+                        "; UIPI-suspected: foreground \"{exe}\" (pid {pid}, hwnd {fg}) is elevated"
+                    ));
+                    self.flush_uipi = true;
+                }
             }
             self.events += sent as i64;
             self.pending.clear();
@@ -1322,13 +1463,21 @@ impl Burst {
     }
 }
 
-fn fail_since_flush(results: &mut [Map<String, Value>], marked: &mut Vec<usize>, msg: &str) {
+fn fail_since_flush(
+    results: &mut [Map<String, Value>],
+    marked: &mut Vec<usize>,
+    msg: &str,
+    uipi: bool,
+) {
     for &i in marked.iter() {
         if let Some(r) = results.get_mut(i) {
             let is_false = r.get("ok") == Some(&Value::from(false));
             if !is_false {
                 r.insert("ok".to_string(), Value::from(false));
                 r.insert("error".to_string(), Value::from(msg.to_string()));
+                if uipi {
+                    r.insert("blocked_by_uipi".to_string(), Value::from(true));
+                }
             }
         }
     }
@@ -1472,6 +1621,7 @@ pub fn do_burst(
         events: 0,
         sendinput_ms: 0.0,
         dry_run,
+        flush_uipi: false,
     };
 
     for (i, a) in actions.iter().enumerate() {
@@ -1501,6 +1651,21 @@ pub fn do_burst(
             );
 
         let step: Result<Option<Map<String, Value>>, String> = (|| {
+            // Gap-2 UIPI pre-check for foreground input: resolve the window
+            // that would receive this action and refuse BEFORE queueing
+            // anything when it is elevated. Background/invoke/set_value check
+            // their own explicit targets in their branches below. Reports
+            // under dry_run too, without injecting anything.
+            if !bg_mode {
+                for t in uipi_targets_for_action(typ, ad) {
+                    if let Some(msg) = uipi_refusal(t) {
+                        let mut m = base_entry(i, &typ_v, false, elapsed_ms(&t0));
+                        m.insert("error".to_string(), Value::from(msg));
+                        m.insert("blocked_by_uipi".to_string(), Value::from(true));
+                        return Ok(Some(m));
+                    }
+                }
+            }
             // Background PostMessage branch (puppet.py:2808-2876).
             if is_bg_postable {
                 if let Some(note) = bg_non_postable(typ) {
@@ -1524,6 +1689,25 @@ pub fn do_burst(
                     m.insert("error".to_string(), Value::from(be));
                     m.insert("note".to_string(), Value::from(BG_NOTE));
                     return Ok(Some(m));
+                }
+                // Gap-2 UIPI pre-check for background delivery (PostMessage to
+                // a higher-integrity window is dropped silently): refuse with
+                // a typed error instead of posting, under dry_run too. Never
+                // silently switches to foreground delivery.
+                if let Some(bh) = bg_hwnd {
+                    if let Some(msg) = uipi_refusal(bh) {
+                        let mut m = base_entry(i, &typ_v, false, elapsed_ms(&t0));
+                        m.insert("mode".to_string(), Value::from("background"));
+                        m.insert("bg_hwnd".to_string(), Value::from(bh));
+                        m.insert("posted".to_string(), Value::from(0));
+                        m.insert("error".to_string(), Value::from(msg));
+                        m.insert("blocked_by_uipi".to_string(), Value::from(true));
+                        m.insert("note".to_string(), Value::from(BG_NOTE));
+                        if dry_run {
+                            m.insert("dry_run".to_string(), Value::from(true));
+                        }
+                        return Ok(Some(m));
+                    }
                 }
                 if dry_run {
                     let mut m = base_entry(i, &typ_v, true, elapsed_ms(&t0));
@@ -1680,7 +1864,7 @@ pub fn do_burst(
                     let (_, ferr) = st.flush();
                     if let Some(fe) = ferr {
                         st.marked.retain(|&m| m != i);
-                        fail_since_flush(&mut st.results, &mut st.marked, &fe);
+                        fail_since_flush(&mut st.results, &mut st.marked, &fe, st.flush_uipi);
                         d.insert("ok".to_string(), Value::from(false));
                         d.insert("error".to_string(), Value::from(fe));
                         break;
@@ -1735,7 +1919,7 @@ pub fn do_burst(
             if typ == "clipboard_set" {
                 let (_, ferr) = st.flush();
                 if let Some(fe) = ferr {
-                    fail_since_flush(&mut st.results, &mut st.marked, &fe);
+                    fail_since_flush(&mut st.results, &mut st.marked, &fe, st.flush_uipi);
                 } else {
                     st.marked.clear();
                 }
@@ -1760,7 +1944,7 @@ pub fn do_burst(
             if typ == "clipboard_get" {
                 let (_, ferr) = st.flush();
                 if let Some(fe) = ferr {
-                    fail_since_flush(&mut st.results, &mut st.marked, &fe);
+                    fail_since_flush(&mut st.results, &mut st.marked, &fe, st.flush_uipi);
                 } else {
                     st.marked.clear();
                 }
@@ -1783,7 +1967,7 @@ pub fn do_burst(
             if typ == "invoke" {
                 let (_, ferr) = st.flush();
                 if let Some(fe) = ferr {
-                    fail_since_flush(&mut st.results, &mut st.marked, &fe);
+                    fail_since_flush(&mut st.results, &mut st.marked, &fe, st.flush_uipi);
                 } else {
                     st.marked.clear();
                 }
@@ -1812,6 +1996,21 @@ pub fn do_burst(
                             "bad_window: invoke needs a background target or a foreground window",
                         ),
                     );
+                    d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
+                    return Ok(Some(d));
+                }
+                // Gap-2 UIPI pre-check on the invoke target (UIA cannot drive
+                // an elevated window without UIAccess either): refuse with a
+                // typed error before resolving or firing, under dry_run too.
+                if let Some(msg) = uipi_refusal(tgt) {
+                    d.insert("ok".to_string(), Value::from(false));
+                    d.insert("error".to_string(), Value::from(msg));
+                    d.insert("blocked_by_uipi".to_string(), Value::from(true));
+                    d.insert("resolution".to_string(), Value::from("uipi_blocked"));
+                    d.insert("via".to_string(), Value::from("none"));
+                    if dry_run {
+                        d.insert("dry_run".to_string(), Value::from(true));
+                    }
                     d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
                     return Ok(Some(d));
                 }
@@ -1848,6 +2047,16 @@ pub fn do_burst(
                     return Ok(Some(d));
                 }
                 let entry = entry.unwrap();
+                // Gap-1 freshness gate (before the dry_run early-return so a
+                // stale ref refuses under dry_run too, never resolving).
+                if let Some(se) = check_expect_fp(ad, &entry, &py_str(ad.get("element").unwrap_or(&Value::Null))) {
+                    d.insert("ok".to_string(), Value::from(false));
+                    d.insert("error".to_string(), Value::from(se));
+                    d.insert("resolution".to_string(), Value::from("stale"));
+                    d.insert("via".to_string(), Value::from("none"));
+                    d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
+                    return Ok(Some(d));
+                }
                 if dry_run {
                     d.insert("ok".to_string(), Value::from(true));
                     d.insert("resolution".to_string(), Value::from("found"));
@@ -1930,7 +2139,7 @@ pub fn do_burst(
             if typ == "set_value" {
                 let (_, ferr) = st.flush();
                 if let Some(fe) = ferr {
-                    fail_since_flush(&mut st.results, &mut st.marked, &fe);
+                    fail_since_flush(&mut st.results, &mut st.marked, &fe, st.flush_uipi);
                 } else {
                     st.marked.clear();
                 }
@@ -1959,6 +2168,21 @@ pub fn do_burst(
                             "bad_window: set_value needs a background target or a foreground window",
                         ),
                     );
+                    d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
+                    return Ok(Some(d));
+                }
+                // Gap-2 UIPI pre-check on the set_value target, mirroring
+                // invoke: refuse with a typed error before resolving or
+                // writing, under dry_run too.
+                if let Some(msg) = uipi_refusal(tgt) {
+                    d.insert("ok".to_string(), Value::from(false));
+                    d.insert("error".to_string(), Value::from(msg));
+                    d.insert("blocked_by_uipi".to_string(), Value::from(true));
+                    d.insert("resolution".to_string(), Value::from("uipi_blocked"));
+                    d.insert("via".to_string(), Value::from("none"));
+                    if dry_run {
+                        d.insert("dry_run".to_string(), Value::from(true));
+                    }
                     d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
                     return Ok(Some(d));
                 }
@@ -2012,6 +2236,17 @@ pub fn do_burst(
                     return Ok(Some(d));
                 }
                 let entry = entry.unwrap();
+                // Gap-1 freshness gate (before text validation and the dry_run
+                // early-return: identity outranks arguments, and a stale ref
+                // refuses under dry_run too).
+                if let Some(se) = check_expect_fp(ad, &entry, &py_str(ad.get("element").unwrap_or(&Value::Null))) {
+                    d.insert("ok".to_string(), Value::from(false));
+                    d.insert("error".to_string(), Value::from(se));
+                    d.insert("resolution".to_string(), Value::from("stale"));
+                    d.insert("via".to_string(), Value::from("none"));
+                    d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
+                    return Ok(Some(d));
+                }
                 // Text is required; present values coerce via py_str like the
                 // `type` action (numbers become their string form). Missing or
                 // null is an argument failure, never a silent clear.
@@ -2083,7 +2318,7 @@ pub fn do_burst(
             if typ == "wait" {
                 let (_, ferr) = st.flush();
                 if let Some(fe) = ferr {
-                    fail_since_flush(&mut st.results, &mut st.marked, &fe);
+                    fail_since_flush(&mut st.results, &mut st.marked, &fe, st.flush_uipi);
                 } else {
                     st.marked.clear();
                 }
@@ -2101,7 +2336,7 @@ pub fn do_burst(
             if typ == "wait_for" {
                 let (_, ferr) = st.flush();
                 if let Some(fe) = ferr {
-                    fail_since_flush(&mut st.results, &mut st.marked, &fe);
+                    fail_since_flush(&mut st.results, &mut st.marked, &fe, st.flush_uipi);
                 } else {
                     st.marked.clear();
                 }
@@ -2121,7 +2356,7 @@ pub fn do_burst(
             if typ == "focus_window" {
                 let (_, ferr) = st.flush();
                 if let Some(fe) = ferr {
-                    fail_since_flush(&mut st.results, &mut st.marked, &fe);
+                    fail_since_flush(&mut st.results, &mut st.marked, &fe, st.flush_uipi);
                 } else {
                     st.marked.clear();
                 }
@@ -2170,7 +2405,7 @@ pub fn do_burst(
 
     let (_, ferr) = st.flush();
     if let Some(fe) = ferr {
-        fail_since_flush(&mut st.results, &mut st.marked, &fe);
+        fail_since_flush(&mut st.results, &mut st.marked, &fe, st.flush_uipi);
     } else {
         st.marked.clear();
     }
@@ -2809,6 +3044,156 @@ mod tests {
             "dry_run set_value must report found, got: {first:?}"
         );
         crate::fixture::check_foreground_left_clean(fx.hwnd_i64(), fg_before, "set_value:dry_run");
+    }
+
+    /// Gap-1 proof (fails before the fix, passes after): a fingerprint from
+    /// an older snapshot must not silently address a different control.
+    /// Resolve the live OK button, then invoke it with a WRONG expect_fp:
+    /// the burst must refuse with a typed stale_ref (plus fresh-snapshot
+    /// recovery advice), never act.
+    #[test]
+    fn invoke_stale_fp_refused_with_typed_error() {
+        let (fx, bg, _w, _ro) = edit_paths();
+        let _ = fx.hwnd();
+        let actions = vec![
+            serde_json::json!({"type": "invoke", "element": "name:OK", "expect_fp": "definitely-wrong-fingerprint"}),
+        ];
+        let (_, first) = burst_bg(&actions, &bg, true);
+        assert_eq!(
+            first.get("ok"),
+            Some(&Value::from(false)),
+            "stale fp must refuse, got: {first:?}"
+        );
+        let e = first.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            e.contains("stale_ref"),
+            "refusal must be typed stale_ref, got: {e}"
+        );
+        assert!(
+            e.contains("fresh"),
+            "refusal must advise a fresh snapshot, got: {e}"
+        );
+        assert_eq!(first.get("resolution"), Some(&Value::from("stale")));
+    }
+
+    #[test]
+    fn set_value_stale_fp_refused_with_typed_error() {
+        // Same mismatch path for set_value: wrong expect_fp refuses before
+        // any provider call, dry_run included.
+        let (fx, bg, wpath, _ro) = edit_paths();
+        let _ = fx.hwnd();
+        let _ = wpath;
+        let actions = vec![
+            serde_json::json!({"type": "set_value", "element": "name:OK", "text": "hi", "expect_fp": "definitely-wrong-fingerprint"}),
+        ];
+        let (_, first) = burst_bg(&actions, &bg, true);
+        assert_eq!(
+            first.get("ok"),
+            Some(&Value::from(false)),
+            "stale fp must refuse, got: {first:?}"
+        );
+        let e = first.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            e.contains("stale_ref"),
+            "refusal must be typed stale_ref, got: {e}"
+        );
+        assert_eq!(first.get("resolution"), Some(&Value::from("stale")));
+    }
+
+    #[test]
+    fn invoke_matching_fp_resolves() {
+        // Positive control for the fp gate: the CURRENT fingerprint from a
+        // fresh walk must resolve (dry_run, no activation).
+        let (fx, bg, _w, _ro) = edit_paths();
+        let _ = fx.hwnd();
+        let model = crate::shot::element_model(fx.hwnd());
+        let entry = model
+            .entries
+            .iter()
+            .find(|e| e.get("name").and_then(|v| v.as_str()) == Some("OK"))
+            .expect("fixture must list the OK button");
+        let fp = entry
+            .get("fp")
+            .and_then(|v| v.as_str())
+            .expect("entry must carry fp");
+        let actions =
+            vec![serde_json::json!({"type": "invoke", "element": "name:OK", "expect_fp": fp})];
+        let (_, first) = burst_bg(&actions, &bg, true);
+        assert_eq!(
+            first.get("ok"),
+            Some(&Value::from(true)),
+            "matching fp must resolve, got: {first:?}"
+        );
+        assert_eq!(first.get("resolution"), Some(&Value::from("found")));
+    }
+
+    /// Gap-2 proof: the detection logic under test. Blocked exactly when the
+    /// target is determinably elevated and this process is not -- elevated
+    /// self may inject, unknown targets fail open.
+    #[test]
+    fn uipi_predicate_matrix() {
+        assert!(crate::uipi_blocked(Some(true), false));
+        assert!(!crate::uipi_blocked(Some(true), true));
+        assert!(!crate::uipi_blocked(Some(false), false));
+        assert!(!crate::uipi_blocked(Some(false), true));
+        assert!(!crate::uipi_blocked(None, false));
+        assert!(!crate::uipi_blocked(None, true));
+        println!("UIPI_PREDICATE_MATRIX_OK=blockediff-target-elevated-and-self-not");
+    }
+
+    /// Gap-2 proof: the refusal text names the elevated target and the
+    /// recovery, pinned by essentials (never byte-exact). The live
+    /// end-to-end (medium server vs elevated target) is unproducible on a
+    /// box with EnableLUA=0, where every process token reads elevated;
+    /// reproduce it on a UAC-on box by running the server unelevated and
+    /// aiming a dry_run background action at an elevated window.
+    #[test]
+    fn uipi_refusal_text_names_target_and_recovery() {
+        let e = format_uipi_refusal("Taskmgr.exe", 1234, 5678);
+        assert!(
+            e.starts_with("uipi_blocked:"),
+            "refusal must be typed, got: {e}"
+        );
+        for bit in ["Taskmgr.exe", "1234", "5678", "elevated", "dry_run"] {
+            assert!(e.contains(bit), "refusal must name {bit}, got: {e}");
+        }
+    }
+
+    #[test]
+    fn uipi_own_process_readable_and_own_window_unblocked() {
+        // Live handles, deterministic on any box, elevated runner or not:
+        // our own token is always readable, and our own (necessarily
+        // same-integrity) fixture window is never a refusal.
+        let me_pid = std::process::id();
+        assert!(
+            crate::process_elevated(me_pid).is_some(),
+            "own process token must be readable"
+        );
+        let f = crate::fixture::Fixture::new();
+        assert!(
+            uipi_refusal(f.hwnd_i64()).is_none(),
+            "same-integrity target must never refuse"
+        );
+    }
+
+    #[test]
+    fn uipi_background_dry_run_reports_normally_when_not_elevated() {
+        // No-regression companion: a dry_run background action at a
+        // non-elevated target still reports ok:true with no blocked_by_uipi
+        // and posts nothing.
+        let (fx, bg) = fixture_bg();
+        let _ = fx.hwnd();
+        let actions = vec![serde_json::json!({"type": "click", "x": 1, "y": 1})];
+        let (_, first) = burst_bg(&actions, &bg, true);
+        assert_eq!(
+            first.get("ok"),
+            Some(&Value::from(true)),
+            "non-elevated dry_run must still report ok, got: {first:?}"
+        );
+        assert!(
+            first.get("blocked_by_uipi").is_none(),
+            "non-elevated target must carry no UIPI flag, got: {first:?}"
+        );
     }
 
     #[test]

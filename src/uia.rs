@@ -425,18 +425,22 @@ impl Walk {
             if !name.is_empty() || !aid.is_empty() || inv {
                 let mut e = Map::new();
                 e.insert("win".to_string(), Value::from(self.win));
-                e.insert("role".to_string(), Value::from(role));
-                e.insert("name".to_string(), Value::from(name));
-                e.insert("auto_id".to_string(), Value::from(aid));
+                e.insert("role".to_string(), Value::from(role.clone()));
+                e.insert("name".to_string(), Value::from(name.clone()));
+                e.insert("auto_id".to_string(), Value::from(aid.clone()));
                 e.insert(
                     "rect".to_string(),
-                    Value::from(rect.into_iter().map(Value::from).collect::<Vec<_>>()),
+                    Value::from(rect.iter().map(|v| Value::from(*v)).collect::<Vec<_>>()),
                 );
                 e.insert("invokable".to_string(), Value::from(inv));
                 e.insert("path".to_string(), Value::from(p.clone()));
                 e.insert(
                     "ref".to_string(),
                     Value::from(format!("{}.{}", self.win, p)),
+                );
+                e.insert(
+                    "fp".to_string(),
+                    Value::from(crate::shot::element_fp(&role, &name, &aid, &rect, inv)),
                 );
                 self.entries.push(e);
             }
