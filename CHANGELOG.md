@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.4.0] - 2026-10-18
+
+### Added
+
+- `instructions` in the `initialize` result: a usage contract for a
+  client/model that has never seen this server — the six tools in one line
+  each, the coordinate rule with the image-to-screen formula, batch +
+  `dry_run`, and read-only-first on the owner's real desktop.
+
+### Fixed
+
+- Typed stale-element-ref refusal: every `elements` entry carries `fp`, a
+  stable identity fingerprint, and `invoke`/`set_value` accept `expect_fp`
+  to refuse a stale ref instead of acting on the wrong control.
+- UIPI/elevation refusal: every `list_windows` entry carries `elevated` so
+  a caller can tell an elevated target apart from an unresponsive one, and
+  UIPI-blocked input is refused with a typed error instead of silently
+  doing nothing.
+- Test fix: the foreground assertions are environment-independent (new
+  `src/fixture.rs`), so the suite passes the same on a bare runner as on
+  the owner's desktop.
+
 ## [Unreleased]
 
 ### Added
