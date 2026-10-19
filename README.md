@@ -1,6 +1,8 @@
-# puppet
-
-**Give your coding agent eyes and hands for your Windows desktop.**
+<p align="center">
+  <img src="assets/icon.svg" width="120" height="120" alt="puppet icon" />
+</p>
+<h1 align="center">puppet</h1>
+<p align="center"><strong>Give your coding agent eyes and hands for your Windows desktop.</strong></p>
 
 ## Install
 
@@ -105,3 +107,11 @@ You get back per-action results with `index`, `type`, `ok`, and `ms`. Remove `dr
 - Issues: https://github.com/nathwn12/puppet/issues
 - License: MIT, see [LICENSE](LICENSE)
 - Docs: [publishing](docs/PUBLISHING.md)
+
+<!-- nathwn12 house footer: identical in every repo. Do not edit. -->
+<p align="center">
+  <a href="https://github.com/nathwn12"><img src="assets/signature.svg" width="96" alt="nathwn12" /></a>
+</p>
+<p align="center">
+  <sub>Built by <a href="https://github.com/nathwn12">nathwn12</a> · <a href="https://github.com/nathwn12?tab=repositories">All projects</a></sub>
+</p>
