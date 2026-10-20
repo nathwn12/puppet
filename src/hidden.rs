@@ -18,10 +18,9 @@
 //! capture also runs on the hidden-desktop thread so the device context
 //! belongs to that desktop.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows_sys::core::{BOOL, PWSTR};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, HWND, LPARAM, RECT, WAIT_OBJECT_0,
@@ -48,7 +47,33 @@ const DESKTOP_ALL_ACCESS: u32 = 0x000F_01FF;
 const SETUP_TIMEOUT_MS: u64 = 8000;
 const TEARDOWN_TIMEOUT_MS: u32 = 3000;
 
-static DESKTOP_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Per-request desktop name with no module-level mutable state.
+///
+/// Previously a process-global `static DESKTOP_SEQ: AtomicU64` counter was
+/// shared across requests to uniquify the hidden-desktop name. The name only
+/// needs to be unique per `spawn()` call, so every component here is derived
+/// from this call's context: process id + wall-clock nanos + calling thread
+/// id + the per-call stack address of a local. Concurrent `spawn()` calls
+/// share no mutable state (audit rule: no request state in globals); a
+/// same-nanosecond collision on one thread only risks a `CreateDesktopW`
+/// name clash, which surfaces as a setup error for that request alone.
+fn unique_desktop_name() -> String {
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tid_dbg = format!("{:?}", std::thread::current().id());
+    let tid_digits: String = tid_dbg
+        .bytes()
+        .filter(|b| b.is_ascii_digit())
+        .map(|b| b as char)
+        .collect();
+    // Address of a call-local: distinct per live `spawn()` frame, adds
+    // entropy when two calls land in the same nanosecond on one thread.
+    let stack_entropy = &nanos as *const _ as usize;
+    format!("puppet_hidden_{pid}_{nanos}_{tid_digits}_{stack_entropy:x}")
+}
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -171,11 +196,7 @@ pub fn spawn(program: &str) -> Hidden {
     let (tx_ready, rx_ready) = mpsc::channel::<Ready>();
     let (tx_go, rx_go) = mpsc::channel::<()>();
     let (tx_done, rx_done) = mpsc::channel::<Done>();
-    let name = format!(
-        "puppet_hidden_{}_{}",
-        std::process::id(),
-        DESKTOP_SEQ.fetch_add(1, Ordering::Relaxed)
-    );
+    let name = unique_desktop_name();
     let prog = program.to_string();
     let nm = name.clone();
     let join = std::thread::spawn(move || owner(prog, nm, tx_ready, rx_go, tx_done));

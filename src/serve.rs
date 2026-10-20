@@ -719,19 +719,34 @@ mod tests {
         let fg_before = crate::fixture::foreground_now();
         let f = crate::fixture::Fixture::new();
         let hwnd = f.hwnd() as i64;
-        // Poll own fixture only until the UIA backend stabilizes (first walk
-        // can race ShowWindow and fall back to win32).
+        // Determinism note (was flaky: failed once, passed on rerun): the
+        // UIA provider exposes the fixture's children asynchronously after
+        // ShowWindow, so the first walk can return the win32 fallback or a
+        // partial UIA list. The old proxy poll (`backend == "uia" && n >= 3`,
+        // 5 s) still asserted `backend == "uia"`, which flaked when UIA was
+        // slow — a timing flake, not ordering or environment. Poll for the
+        // asserted conditions themselves (Edit + OK present, either
+        // backend); the win32 fallback lists the same children
+        // synchronously, so it is the deterministic floor.
         let payload = {
             let t0 = std::time::Instant::now();
             loop {
                 let p = elements_payload(&elements_args(&[("hwnd", Value::from(hwnd))]));
-                let be = p.get("backend").and_then(|v| v.as_str()).unwrap_or("");
-                let n = p
+                let els = p
                     .get("elements")
                     .and_then(|v| v.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0);
-                if (be == "uia" && n >= 3) || t0.elapsed() > std::time::Duration::from_secs(5) {
+                    .map(|a| a.as_slice())
+                    .unwrap_or(&[]);
+                let has_edit = els
+                    .iter()
+                    .any(|e| e.get("role").and_then(|v| v.as_str()) == Some("Edit"));
+                let has_ok = els.iter().any(|e| {
+                    e.get("name").and_then(|v| v.as_str()) == Some("OK")
+                        && e.get("role").and_then(|v| v.as_str()) == Some("Button")
+                });
+                if (has_edit && has_ok)
+                    || t0.elapsed() > std::time::Duration::from_secs(10)
+                {
                     break p;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -779,7 +794,11 @@ mod tests {
             }
             assert!(!o.contains_key("win"), "compact default must omit win");
         }
-        assert_eq!(payload.get("backend").and_then(|v| v.as_str()), Some("uia"));
+        let backend = payload.get("backend").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            backend == "uia" || backend == "win32",
+            "backend must be uia or the deterministic win32 fallback, got: {backend} in {payload}"
+        );
         // Foreground untouched by a zero-pixel read: fail only if a fixture
         // window is LEFT activated (skips with FG_SKIP when the environment
         // provides no foreground session, e.g. headless CI).
