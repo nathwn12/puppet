@@ -41,7 +41,7 @@ Wire the server into your MCP client config:
 Pin an exact version instead of `@latest`:
 
 ```powershell
-npx -y puppet-mcp@4.4.0 --doctor
+npx -y puppet-mcp@latest --doctor
 ```
 
 Build from source when you want the working tree instead of the Release binary:
