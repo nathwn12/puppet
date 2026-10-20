@@ -26,9 +26,17 @@ jobs:
       - name: clippy
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        with:
-          config-path: .gitleaks.toml
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $Version = '8.24.3'
+          $Url = "https://github.com/gitleaks/gitleaks/releases/download/v$Version/gitleaks_${Version}_windows_x64.zip"
+          $Zip = Join-Path $env:TEMP "gitleaks_$Version.zip"
+          $Dir = Join-Path $env:TEMP "gitleaks_$Version"
+          Invoke-WebRequest -Uri $Url -OutFile $Zip
+          if (Test-Path $Dir) { Remove-Item -Recurse -Force $Dir }
+          Expand-Archive -Path $Zip -DestinationPath $Dir
+          & (Join-Path $Dir 'gitleaks.exe') detect --source . --config .gitleaks.toml --redact --no-banner
       - name: build
         run: cargo build --locked
       - name: test (live tests self-skip without PUPPET_LIVE_DESKTOP)
