@@ -3023,7 +3023,8 @@ mod tests {
     /// the EDIT on live runs -- so, unlike the live success path (see
     /// `set_value_success_writes_and_never_echoes`), the foreground contract
     /// IS stable here: skip with FG_SKIP when the environment provides no
-    /// foreground session, fail only when a fixture window is LEFT activated.
+    /// foreground session; owned-foreground after settle is reported
+    /// (FG_OWN_CHURN), never failed — a dry run performs no input.
     #[test]
     fn set_value_dry_run_leaves_foreground_clean() {
         let fg_before = crate::fixture::foreground_now();
