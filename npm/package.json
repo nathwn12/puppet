@@ -1,6 +1,6 @@
 {
   "name": "puppet-mcp",
-  "version": "4.5.0",
+  "version": "4.5.1",
   "description": "Windows desktop-control MCP server (npx launcher): provisions the pinned server binary from the GitHub Release on first run, then serves MCP over stdio",
   "license": "MIT",
   "repository": {
