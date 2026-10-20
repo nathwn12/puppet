@@ -36,13 +36,9 @@ Wire the server into your MCP client config:
 }
 ```
 
-### Offline or pinned
+### Overrides
 
-Pin an exact version instead of `@latest`:
-
-```powershell
-npx -y puppet-mcp@4.5.0 --doctor
-```
+Use `npx puppet-mcp@latest` for installs. A pinned version is only installable while its GitHub release still exists; the one-release policy deletes older releases, so pinned versions are not a supported long-term install.
 
 Build from source when you want the working tree instead of the Release binary:
 
@@ -119,11 +115,7 @@ You override two paths with env vars:
 - `PUPPET_ENGINE_CACHE` — absolute directory for the engine cache. Default: the engine cache lives under the OS local-app-data directory; `--help` prints the cache path template; the engine fills in the version and bundle when it provisions.
 - `PUPPET_MCP_ALLOW_NON_WINDOWS=1` — bypass the Windows-only gate for diagnostics. Default unset, so other platforms are refused. The server still runs on Windows x64 only.
 
-Pin an exact version with:
-
-```powershell
-npx -y puppet-mcp@4.5.0 --doctor
-```
+Use `npx puppet-mcp@latest` for installs. A pinned version is only installable while its GitHub release still exists; the one-release policy deletes older releases, so pinned versions are not a supported long-term install.
 
 ## Requirements
 

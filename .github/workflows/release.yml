@@ -4,9 +4,10 @@
 #   build   (windows-latest) builds + tests the crate, assembles the server
 #           runtime bundle, computes every hash from the REAL artifacts, and
 #           fills npm/engine-manifest.json.
-#   publish (ubuntu-latest) attaches those artifacts to the GitHub Release,
-#           then `npm publish`es the workflow-built npm package over OIDC
-#           trusted publishing (no token; provenance is automatic).
+#   publish (ubuntu-latest) creates the current release, attaches those
+#           artifacts, publishes npm over OIDC trusted publishing (no
+#           token; provenance is automatic), deletes the outgoing
+#           release, and skips a tag older than the current release.
 #
 # Action majors mirror the gladius release workflow (verified against the
 # GitHub Releases API on 2026-10-17 there):
@@ -20,6 +21,9 @@ on:
   push:
     tags:
       - 'v*'
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
 jobs:
   build:
     name: build server + manifest
@@ -115,9 +119,31 @@ jobs:
         with:
           name: npm-package
           path: npm-pkg
+      - name: check stale tag
+        id: release_mode
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          current_release=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[] | select(.draft == false) | .tag_name' | sort -V | tail -n1)
+          if [ -n "$current_release" ]; then
+            latest=$(printf '%s\n%s\n' "$current_release" "$GITHUB_REF_NAME" | sort -V | tail -n1)
+            if [ "$latest" != "$GITHUB_REF_NAME" ]; then
+              echo "current=false" >> "$GITHUB_OUTPUT"
+              echo "::warning::$GITHUB_REF_NAME is older than the current release $current_release; skipping"
+              exit 0
+            fi
+          fi
+          echo "current=true" >> "$GITHUB_OUTPUT"
       - name: attach archives to the GitHub Release
+        if: steps.release_mode.outputs.current == 'true'
         uses: softprops/action-gh-release@v3
         with:
+          name: ${{ github.event.repository.name }} ${{ github.ref_name }}
+          body: |
+            Release ${{ github.ref_name }}. See the repository CHANGELOG and the npm package for details.
+          overwrite_files: true
           files: |
             dist/*.zip
             dist/*.zip.sha256
@@ -139,4 +165,38 @@ jobs:
           test "$(node -p "require('./npm-pkg/package.json').version")" = "${GITHUB_REF_NAME#v}" || { echo "npm package version != tag version"; exit 1; }
           node -e "for (const f of ['./npm-pkg/package.json','./npm-pkg/engine-manifest.json','./npm-pkg/bin/puppet-mcp.js']) require('fs').accessSync(f); const p=require('./npm-pkg/package.json'); if (p.scripts!==undefined) { console.error('scripts field present'); process.exit(1) }; const m=require('./npm-pkg/engine-manifest.json'); if (m.package!=='puppet-mcp') { console.error('manifest names the wrong package'); process.exit(1) }; if (m.serverVersion!==p.version) { console.error('serverVersion != package version'); process.exit(1) }; for (const s of [m.runtime.archive.sha256, m.runtime.server.sha256]) if (!/^[0-9a-f]{64}$/.test(s)) { console.error('manifest still has placeholder hashes'); process.exit(1) }; console.log('npm package OK: no scripts field, serverVersion matches, all release hashes filled')"
       - name: publish to npm (OIDC trusted publishing)
-        run: npm publish ./npm-pkg
+        id: publish_npm
+        if: steps.release_mode.outputs.current == 'true'
+        run: |
+          set -euo pipefail
+          pkg=$(node -p "require('./npm-pkg/package.json').name")
+          version="${GITHUB_REF_NAME#v}"
+          if npm view "$pkg@$version" version >/dev/null 2>&1; then
+            echo "$pkg@$version is already published; skipping npm publish"
+            exit 0
+          fi
+          npm publish ./npm-pkg
+      - name: delete outgoing releases
+        if: always() && steps.release_mode.outputs.current == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "current release $GITHUB_REF_NAME is missing; keeping outgoing releases"
+            exit 0
+          fi
+          pkg=$(node -p "require('./npm-pkg/package.json').name")
+          version="${GITHUB_REF_NAME#v}"
+          if [ "${{ steps.publish_npm.outcome }}" != "success" ] && ! npm view "$pkg@$version" version >/dev/null 2>&1; then
+            echo "$pkg@$version is not live; keeping outgoing releases"
+            exit 0
+          fi
+          # One pinned release per repo: delete every other published release (tags stay).
+          # The current release was created above; npm publish has succeeded.
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[] | select(.draft == false) | .tag_name' |
+            while read -r tag; do
+              if [ "$tag" = "$GITHUB_REF_NAME" ]; then continue; fi
+              gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag=false
+            done
