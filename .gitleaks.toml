@@ -2,11 +2,22 @@
 #
 # The default ruleset is kept fully enabled; the only known hit is a
 # test-only dummy string, not a credential:
-#   src/burst.rs:2744  (`fixture-secret-4821` inside #[test]
-#                       set_value_success_writes_and_never_echoes @87e69fd)
+#   src/burst.rs (`fixture-secret-4821` inside #[test]
+#                 set_value_success_writes_and_never_echoes)
 # The test asserts set_value never echoes the value back, so the token is
 # intentionally a fake fixture. Allowlist ONLY that exact value, and ONLY in
 # src/burst.rs, so any other path or value still trips.
+#
+# Note (2026-10-20): gitleaks 8.24.3 history scan flags the same fixture
+# literal at src/burst.rs:2553 in commits 87e69fd and 3ae360e. The value
+# there is identical to the current fixture, so one exact-value entry
+# covers the working tree and both historical hits.
+#
+# Schema note: gitleaks 8.24.3 expects the global allowlist as a singular
+# `[allowlist]` map (plural `[[allowlists]]` is silently ignored -- verified:
+# even `regexes = ['.*']` in plural form still leaks). The plural blocks
+# below are kept for record/forward-compat; the singular `[allowlist]`
+# table is what 8.24.3 enforces.
 [extend]
 useDefault = true
 
@@ -14,4 +25,11 @@ useDefault = true
 description = "Test-only fixture dummy 'fixture-secret-4821' at src/burst.rs (#[test] set_value_success_writes_and_never_echoes @87e69fd); not a credential."
 condition = "AND"
 paths = ['''(^|[\\/])src[\\/]burst\.rs$''']
+regexes = ['''^fixture-secret-4821$''']
+
+[allowlist]
+description = "test fixture secret, not a live credential"
+condition = "AND"
+paths = ['''(^|[\\/])src[\\/]burst\.rs$''']
+rules = ["generic-api-key"]
 regexes = ['''^fixture-secret-4821$''']

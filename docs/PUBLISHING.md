@@ -16,8 +16,8 @@ granular token), and locally npm >= 11.5.1 with Node >= 22.14.0
    under whoever publishes first — confirm the handle at sign-in.
 
 2. Push the version tag (e.g. `v4.3.0`). The `release` workflow builds the
-   crate with the pinned toolchain, runs the suite, assembles the server
-   runtime bundle, fills `engine-manifest.json` with hashes computed from
+   crate with the pinned toolchain (1.85.0, per `rust-toolchain.toml`), runs
+   the suite, assembles the server runtime bundle, fills `engine-manifest.json` with hashes computed from
    the REAL artifacts, and creates the GitHub Release with the archives
    attached. Its `npm publish` step FAILS (no trusted publisher yet) —
    expected, not a problem. Nothing reaches npm.
@@ -66,7 +66,7 @@ A release tag `vX.Y.Z` requires, on that commit: `Cargo.toml` version
 `X.Y.Z`, `npm/package.json` version `X.Y.Z`, `npm/engine-manifest.json`
 `serverVersion` `X.Y.Z` with matching `runtime.source`/`runtime.archive`
 names (the workflow asserts all equal the tag and fills the hashes), and a
-`CHANGELOG.md` entry. The workflow fails closed on any mismatch.
+`CHANGELOG.md` entry (curated by hand; not workflow-checked).
 
 ## Why these exact values
 

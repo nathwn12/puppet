@@ -1,16 +1,25 @@
 //! screenshot tool handlers (window + desktop paths).
 
 use crate::cap::{bitblt_grab, finalize, resolve_selector, Img};
-use crate::dxgi::dxgi_grab;
+use crate::dxgi::{dxgi_grab, dxgi_outputs, pick_output};
 use crate::shot::{capture_window, elements_block};
 use crate::{
-    display_monitors, image_block, ok_blocks, py_round_n, text_block, virtual_rect, FORMULA,
+    display_monitor_handles, display_monitors, image_block, monitor_device, py_round_n,
+    screenshot_ok, text_block, tool_err_blocks, virtual_rect, FORMULA,
 };
 use base64::Engine as _;
 use serde_json::{Map, Value};
 use std::time::Instant;
 use windows_sys::Win32::Foundation::POINT;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
+
+/// Grab-size bound: no single BitBlt/DXGI capture may exceed this edge.
+/// Regions and small monitors stay well under it; a virtual-desktop span
+/// across big monitors is refused instead of allocating gigabytes.
+const MAX_GRAB_EDGE: i64 = 8192;
+
+/// Virtual-desktop rectangle as (left, top, right, bottom) device pixels.
+type VirtualRect = (i32, i32, i32, i32);
 
 pub struct ShotArgs {
     pub display: i64,
@@ -24,10 +33,10 @@ pub struct ShotArgs {
     pub elements: bool,
 }
 
-/// Screenshot error-as-data: fastmcp aggregates a bare list result into ONE
-/// text block holding the compact-JSON list (pydantic dump_json).
+/// Screenshot domain error: the aggregated text block is unchanged for
+/// legacy clients; P2a reports it as a real tool failure (`isError: true`).
 pub fn shot_err_list(items: Vec<String>) -> String {
-    ok_blocks(&[text_block(&serde_json::to_string(&items).unwrap())])
+    tool_err_blocks(&[text_block(&serde_json::to_string(&items).unwrap())])
 }
 
 fn py_int_elem(v: &Value) -> Option<i64> {
@@ -42,7 +51,7 @@ fn py_int_elem(v: &Value) -> Option<i64> {
                     None
                 }
             } else if let Some(f) = n.as_f64() {
-                if f.is_finite() && f >= -9223372036854775808.0 && f < 9223372036854775808.0 {
+                if f.is_finite() && (-9223372036854775808.0..9223372036854775808.0).contains(&f) {
                     Some(f.trunc() as i64)
                 } else {
                     None
@@ -73,12 +82,10 @@ fn py_int_elem(v: &Value) -> Option<i64> {
                     return Some(-(mag as i64));
                 }
                 None
+            } else if mag <= i64::MAX as u64 {
+                Some(mag as i64)
             } else {
-                if mag <= i64::MAX as u64 {
-                    Some(mag as i64)
-                } else {
-                    None
-                }
+                None
             }
         }
         _ => None,
@@ -126,14 +133,14 @@ fn cursor_xy(fallback: (i64, i64)) -> (i64, i64) {
     }
 }
 
-fn monitors_block() -> (Vec<[i32; 4]>, i64, (i32, i32, i32, i32)) {
+fn monitors_block() -> (Vec<[i32; 4]>, i64, VirtualRect) {
     let mons = display_monitors();
     let (vx, vy, vr, vb) = virtual_rect();
     let n = mons.len() as i64;
     (mons, n, (vx, vy, vr, vb))
 }
 
-fn cmaps_monitors(n: i64, v: (i32, i32, i32, i32)) -> Map<String, Value> {
+fn cmaps_monitors(n: i64, v: VirtualRect) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("count".to_string(), Value::from(n));
     m.insert(
@@ -307,12 +314,12 @@ pub fn screenshot_window(a: &ShotArgs) -> String {
             &base64::engine::general_purpose::STANDARD.encode(&data),
             mime,
         ),
-        text_block(&crate::py_dumps(&Value::Object(cmap))),
+        text_block(&crate::py_dumps(&Value::Object(cmap.clone()))),
     ];
     if a.elements {
         blocks.push(text_block(&elements_block(hwnd)));
     }
-    ok_blocks(&blocks)
+    screenshot_ok(&blocks, &Value::Object(cmap))
 }
 
 /// 0-based monitor choice over the `EnumDisplayMonitors` list. Shared by the
@@ -325,6 +332,21 @@ pub fn monitor_rect(mons: &[[i32; 4]], display: i64) -> Result<[i32; 4], String>
         ));
     }
     Ok(mons[display as usize])
+}
+
+/// Resolve a `display` index to a real DXGI (adapter, output) pair. Never
+/// assumes `display` == output: a same-size wrong monitor would pass
+/// `check_size` and poison the per-pair session cache, so anything but an
+/// identity match is Err (caller falls back to GDI).
+fn dxgi_match_output(display: i64, mons: &[[i32; 4]]) -> Result<(u32, u32), String> {
+    let rect = monitor_rect(mons, display)?;
+    let handles = display_monitor_handles();
+    let (hmon, device) = handles
+        .get(display as usize)
+        .map(|(_, h)| (*h as i64, monitor_device(*h)))
+        .unwrap_or((0, String::new()));
+    let outputs = dxgi_outputs()?;
+    pick_output(rect, hmon, &device, &outputs)
 }
 
 pub fn screenshot_desktop(a: &ShotArgs) -> String {
@@ -359,6 +381,31 @@ pub fn screenshot_desktop(a: &ShotArgs) -> String {
         Ok(r) => r,
         Err(e) => return shot_err_list(vec![e]),
     };
+    if let Some(r) = &region {
+        // Overflow-safe region gate: the shared validator never subtracts
+        // in i64 before validating, so MIN/MAX extremes are typed errors
+        // (no debug panic, no release wraparound bypass). Checked
+        // pre-intersection so a huge off-desktop rect cannot slip through.
+        match crate::validate_region(r[0], r[1], r[2], r[3], MAX_GRAB_EDGE) {
+            Ok(_) => {}
+            Err(crate::RegionReject::Order) => {
+                return shot_err_list(vec![
+                    "error: bad_region: region must have right>left and bottom>top".to_string(),
+                ]);
+            }
+            Err(crate::RegionReject::Extreme) => {
+                return shot_err_list(vec![
+                    "error: bad_region: region coordinates outside i32 range (would truncate on cast)"
+                        .to_string(),
+                ]);
+            }
+            Err(crate::RegionReject::OverCap(rw, rh)) => {
+                return shot_err_list(vec![format!(
+                    "error: bad_region: region edges absurd (>8192, got {rw}x{rh})"
+                )]);
+            }
+        }
+    }
     let (cx0, cy0, cx1, cy1, kind): (i64, i64, i64, i64, String) = match region {
         Some(r) => (
             gl.max(r[0]),
@@ -374,43 +421,101 @@ pub fn screenshot_desktop(a: &ShotArgs) -> String {
             "error: empty_crop: crop rect is empty/outside the capture".to_string(),
         ]);
     }
-    let note: Option<String> = if n_mon > 1 && grab_scope == "virtual" {
+    let mut note: Option<String> = if n_mon > 1 && grab_scope == "virtual" {
         if kind == "virtual" {
             Some(format!(
-                "virtual span across {n_mon} monitors is per-output for DXGI; used mss directly"
+                "virtual span across {n_mon} monitors is per-output for DXGI; grabbed directly with GDI"
             ))
         } else {
-            Some(format!("crop on a {n_mon}-monitor desktop; mss grabs the rect directly (DXGI is per-output full-frame)"))
+            Some(format!("crop on a {n_mon}-monitor desktop; GDI grabs the rect directly (DXGI is per-output full-frame)"))
         }
     } else {
         None
     };
     let t0 = Instant::now();
-    // Backend per scope (puppet.py _grab_rect parity): DXGI serves whole
-    // outputs, so a virtual-desktop span across >1 monitor goes straight to
-    // GDI; otherwise try the DXGI fast path and fall back to GDI per call.
+    // Region captures grab the crop rect directly with GDI: no full-frame
+    // grab followed by an in-memory crop, so peak memory is the region
+    // itself rather than the whole monitor or desktop.
+    // Otherwise (puppet.py _grab_rect parity): DXGI serves whole outputs, so
+    // a virtual-desktop span across >1 monitor goes straight to GDI;
+    // otherwise try the DXGI fast path and fall back to GDI per call.
     let force_gdi = n_mon > 1 && grab_scope == "virtual";
-    let (mut img, backend): (Img, String) = if force_gdi {
-        match bitblt_grab(gl as i32, gt as i32, gw as i32, gh as i32) {
+    let (mut img, backend): (Img, String) = if kind == "region" {
+        let (cw, ch) = (cx1 - cx0, cy1 - cy0);
+        note = Some("region grabbed directly via GDI (no full-frame grab)".to_string());
+        match bitblt_grab(cx0 as i32, cy0 as i32, cw as i32, ch as i32) {
             Ok(im) => (im, "gdi".to_string()),
             Err(e) => return shot_err_list(vec![format!("error: capture_failed: {e}")]),
         }
     } else {
-        let output = if grab_scope == "monitor" {
-            a.display as u32
+        if gw > MAX_GRAB_EDGE || gh > MAX_GRAB_EDGE {
+            return shot_err_list(vec![format!(
+                "error: capture_failed: request edges absurd (>8192, got {gw}x{gh})"
+            )]);
+        }
+        if force_gdi {
+            match bitblt_grab(gl as i32, gt as i32, gw as i32, gh as i32) {
+                Ok(im) => (im, "gdi".to_string()),
+                Err(e) => return shot_err_list(vec![format!("error: capture_failed: {e}")]),
+            }
         } else {
-            0
-        };
-        match dxgi_grab(output, gw as i32, gh as i32) {
-            Ok(im) => (im, "dxgi".to_string()),
-            Err(fb) => {
-                eprintln!("puppet: dxgi unavailable ({fb}), using gdi");
-                match bitblt_grab(gl as i32, gt as i32, gw as i32, gh as i32) {
-                    Ok(im) => (im, "gdi".to_string()),
-                    Err(e) => return shot_err_list(vec![format!("error: capture_failed: {e}")]),
+            // No default pair: every scope resolves the real DXGI (adapter,
+            // output) pair through matching. Monitor scope uses its rect;
+            // single-monitor virtual scope matches the whole span. An unmatched
+            // monitor goes straight to GDI with a note — a same-size wrong
+            // output would pass check_size and poison the cache.
+            let matched: Result<(u32, u32), String> = if grab_scope == "monitor" {
+                dxgi_match_output(a.display, &mons)
+            } else {
+                let handles = display_monitor_handles();
+                let (hmon, device) = handles
+                    .first()
+                    .map(|(_, h)| (*h as i64, monitor_device(*h)))
+                    .unwrap_or((0, String::new()));
+                match dxgi_outputs() {
+                    Ok(outs) => pick_output(
+                        [gl as i32, gt as i32, (gl + gw) as i32, (gt + gh) as i32],
+                        hmon,
+                        &device,
+                        &outs,
+                    ),
+                    Err(e) => Err(e),
                 }
+            };
+            match matched {
+                Err(e) => {
+                    note = Some(match note {
+                        Some(n) => format!("{n}; dxgi output unmatched ({e}); gdi"),
+                        None => format!("dxgi output unmatched ({e}); gdi"),
+                    });
+                    match bitblt_grab(gl as i32, gt as i32, gw as i32, gh as i32) {
+                        Ok(im) => (im, "gdi".to_string()),
+                        Err(e) => {
+                            return shot_err_list(vec![format!("error: capture_failed: {e}")])
+                        }
+                    }
+                }
+                Ok((ai, oi)) => match dxgi_grab(ai, oi, gw as i32, gh as i32) {
+                    Ok(im) => (im, "dxgi".to_string()),
+                    Err(fb) => {
+                        eprintln!("puppet: dxgi unavailable ({fb}), using gdi");
+                        match bitblt_grab(gl as i32, gt as i32, gw as i32, gh as i32) {
+                            Ok(im) => (im, "gdi".to_string()),
+                            Err(e) => {
+                                return shot_err_list(vec![format!("error: capture_failed: {e}")])
+                            }
+                        }
+                    }
+                },
             }
         }
+    };
+    // Region grabs are already cropped: rebase the grab origin onto the
+    // crop origin so the shared size check and crop below are no-ops.
+    let (gl, gt, gw, gh) = if kind == "region" {
+        (cx0, cy0, cx1 - cx0, cy1 - cy0)
+    } else {
+        (gl, gt, gw, gh)
     };
     let cap_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let (curx, cury) = cursor_xy((gl, gt));
@@ -505,7 +610,7 @@ pub fn screenshot_desktop(a: &ShotArgs) -> String {
             &base64::engine::general_purpose::STANDARD.encode(&data),
             mime,
         ),
-        text_block(&crate::py_dumps(&Value::Object(cmap))),
+        text_block(&crate::py_dumps(&Value::Object(cmap.clone()))),
     ];
     if a.elements {
         let fg = unsafe { GetForegroundWindow() };
@@ -516,7 +621,7 @@ pub fn screenshot_desktop(a: &ShotArgs) -> String {
         }
         blocks.push(text_block(&elements_block(fg)));
     }
-    ok_blocks(&blocks)
+    screenshot_ok(&blocks, &Value::Object(cmap))
 }
 
 pub fn dispatch_screenshot(a: &ShotArgs) -> String {
@@ -549,7 +654,7 @@ mod tests {
     fn display_out_of_range_rejected() {
         assert!(monitor_rect(&two_mons(), 2).is_err());
         assert!(monitor_rect(&two_mons(), -1).is_err());
-        assert!(monitor_rect(&vec![[0, 0, 1920, 1080]], 0).is_ok());
+        assert!(monitor_rect(&[[0, 0, 1920, 1080]], 0).is_ok());
     }
 
     #[test]

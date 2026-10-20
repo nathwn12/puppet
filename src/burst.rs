@@ -15,13 +15,15 @@ use crate::{
 use base64::Engine as _;
 use serde_json::{Map, Value};
 use std::time::{Duration, Instant};
-use windows_sys::Win32::Foundation::{GetLastError, GlobalFree, HGLOBAL, HWND, LPARAM, POINT};
+use windows_sys::Win32::Foundation::{
+    GetLastError, GlobalFree, HGLOBAL, HWND, LPARAM, POINT, RECT,
+};
 use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
     SetClipboardData,
 };
-use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock};
+use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock};
 use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -38,14 +40,37 @@ const M_RUP: u32 = 0x0010;
 const M_MDOWN: u32 = 0x0020;
 const M_MUP: u32 = 0x0040;
 const M_WHEEL: u32 = 0x0800;
+const M_HWHEEL: u32 = 0x1000;
 const K_UP: u32 = 0x0002;
 const K_UNICODE: u32 = 0x0004;
 
 const BG_NOTE: &str = "background PostMessage delivery is best-effort: it is NOT honoured by every app and is NOT equivalent to real (SendInput) input.";
 const BG_SUFFIX: &str = "; omit background for real SendInput delivery";
 const MAX_CLICK_COUNT: i64 = 100;
-const MAX_STABLE_EDGE: i64 = 16384;
+const MAX_STABLE_EDGE: i64 = 4096;
 
+/// Default stable-watch region: the foreground window's monitor, not the
+/// whole virtual desktop — a full-span grab every poll is the memory win
+/// this avoids. Falls back to the virtual desktop with no foreground
+/// window. The 4096 cap still applies downstream.
+fn default_stable_region() -> Vec<i64> {
+    let mons = crate::display_monitors();
+    let fg = fg_now();
+    if fg != 0 {
+        unsafe {
+            let mut rc = RECT::default();
+            if GetWindowRect(fg as HWND, &mut rc) != 0 {
+                let cx = (rc.left as i64 + rc.right as i64) / 2;
+                let cy = (rc.top as i64 + rc.bottom as i64) / 2;
+                if let Some(m) = monitor_for_point(&mons, cx, cy) {
+                    return vec![m[0] as i64, m[1] as i64, m[2] as i64, m[3] as i64];
+                }
+            }
+        }
+    }
+    let (vx, vy, vr, vb) = virtual_rect();
+    vec![vx as i64, vy as i64, vr as i64, vb as i64]
+}
 fn bg_non_postable(typ: &str) -> Option<&'static str> {
     match typ {
         "move" => Some("move has no window-message equivalent (it drives the system cursor, not a window)"),
@@ -194,6 +219,22 @@ fn elapsed_ms(t: &Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1000.0
 }
 
+/// Cancellable sleep in <=50ms slices. Returns true when the current
+/// `tools/call` was cancelled mid-sleep so the caller can return promptly
+/// (the worker drops the response; no late reply is sent).
+fn sleep_cancellable(ms: u64) -> bool {
+    let mut left = ms;
+    while left > 0 {
+        if crate::cancel::cancelled() {
+            return true;
+        }
+        let s = left.min(50);
+        std::thread::sleep(Duration::from_millis(s));
+        left = left.saturating_sub(s);
+    }
+    crate::cancel::cancelled()
+}
+
 // ---------------------------------------------------------------- foreground input builders
 
 fn mi_move(x: i64, y: i64) -> INPUT {
@@ -218,6 +259,47 @@ fn mi_move(x: i64, y: i64) -> INPUT {
             },
         },
     }
+}
+
+/// Pure wheel resolution: axis flag plus WHEEL_DELTA-scaled data.
+/// |amount| is bounded (no wrapping); vertical behavior is unchanged.
+/// The range test avoids `abs` so `i64::MIN` cannot overflow past it.
+fn scroll_wheel(axis: &str, amt: i64) -> Result<(u32, u32), String> {
+    let flag = match axis {
+        "v" => M_WHEEL,
+        "h" => M_HWHEEL,
+        _ => return Err(format!("unknown scroll axis \"{axis}\" (want v|h)")),
+    };
+    if !(-1000..=1000).contains(&amt) {
+        return Err(format!(
+            "scroll amount out of range -1000..1000 (got {amt})"
+        ));
+    }
+    Ok((flag, (amt as i32).wrapping_mul(120) as u32))
+}
+
+/// Pure relative-move event: raw signed deltas, `M_MOVE` only (no
+/// absolute/virtual-desktop mapping). Unit-testable flags + payload.
+fn mi_move_rel(dx: i64, dy: i64) -> Result<INPUT, String> {
+    // Range test (not abs) so i64::MIN cannot overflow past it.
+    if !(-32767..=32767).contains(&dx) || !(-32767..=32767).contains(&dy) {
+        return Err(format!(
+            "move delta out of range -32767..32767 (got {dx},{dy})"
+        ));
+    }
+    Ok(INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: dx as i32,
+                dy: dy as i32,
+                mouseData: 0,
+                dwFlags: M_MOVE,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    })
 }
 
 fn mi_btn(flag: u32, data: u32) -> INPUT {
@@ -249,6 +331,91 @@ fn ki(vk: u16, scan: u16, flags: u32) -> INPUT {
             },
         },
     }
+}
+
+/// Pure key-event sequence for one resolved code: Shift down, key down/up,
+/// Shift up — or a Unicode down/up pair per UTF-16 unit. Unit-testable order;
+/// the dispatch only extends `pending` with the result.
+fn key_inputs(code: &KeyCode) -> Vec<INPUT> {
+    let mut out = key_down_inputs(code);
+    out.extend(key_up_inputs(code));
+    out
+}
+
+/// Key-down half of `key_inputs`: Shift down + key down (or Unicode downs).
+/// Split out so hold/repeat can sleep between down and up.
+fn key_down_inputs(code: &KeyCode) -> Vec<INPUT> {
+    let mut out = Vec::new();
+    match code {
+        KeyCode::Vk(vk, shift) => {
+            if *shift {
+                out.push(ki(VK_SHIFT, 0, 0));
+            }
+            out.push(ki(*vk, 0, 0));
+        }
+        KeyCode::Uni(ch) => {
+            for unit in utf16_units(&ch.to_string()) {
+                out.push(ki(0, unit, K_UNICODE));
+            }
+        }
+    }
+    out
+}
+
+/// Key-up half of `key_inputs`: key up + Shift up (or Unicode ups).
+fn key_up_inputs(code: &KeyCode) -> Vec<INPUT> {
+    let mut out = Vec::new();
+    match code {
+        KeyCode::Vk(vk, shift) => {
+            out.push(ki(*vk, 0, K_UP));
+            if *shift {
+                out.push(ki(VK_SHIFT, 0, K_UP));
+            }
+        }
+        KeyCode::Uni(ch) => {
+            for unit in utf16_units(&ch.to_string()) {
+                out.push(ki(0, unit, K_UNICODE | K_UP));
+            }
+        }
+    }
+    out
+}
+
+/// Pure hotkey-event sequence: presses in order (each Shift-wrapped),
+/// releases in reverse. Unit-testable order; no input performed.
+fn hotkey_inputs(codes: &[KeyCode]) -> Vec<INPUT> {
+    let mut out = Vec::new();
+    for c in codes {
+        match c {
+            KeyCode::Vk(vk, shift) => {
+                if *shift {
+                    out.push(ki(VK_SHIFT, 0, 0));
+                }
+                out.push(ki(*vk, 0, 0));
+            }
+            KeyCode::Uni(ch) => {
+                for unit in utf16_units(&ch.to_string()) {
+                    out.push(ki(0, unit, K_UNICODE));
+                }
+            }
+        }
+    }
+    for c in codes.iter().rev() {
+        match c {
+            KeyCode::Vk(vk, shift) => {
+                out.push(ki(*vk, 0, K_UP));
+                if *shift {
+                    out.push(ki(VK_SHIFT, 0, K_UP));
+                }
+            }
+            KeyCode::Uni(ch) => {
+                for unit in utf16_units(&ch.to_string()) {
+                    out.push(ki(0, unit, K_UNICODE | K_UP));
+                }
+            }
+        }
+    }
+    out
 }
 
 fn btn_pair(raw: Option<&Value>) -> Result<(u32, u32), String> {
@@ -295,7 +462,16 @@ fn utf16_units(s: &str) -> Vec<u16> {
 
 // ---------------------------------------------------------------- _vk (puppet.py:1571-1623)
 
-fn vk_of(name: &str) -> Result<u16, String> {
+/// Resolved key: a virtual-key code (plus whether Shift must be held for the
+/// layout's high byte) or a Unicode fallback when VkKeyScanW has no
+/// translation (`sc == -1`) or the char needs Ctrl/Alt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyCode {
+    Vk(u16, bool),
+    Uni(char),
+}
+
+fn vk_of(name: &str) -> Result<KeyCode, String> {
     let key = name.to_lowercase();
     let named: Option<u16> = match key.as_str() {
         "enter" | "return" => Some(0x0D),
@@ -329,30 +505,83 @@ fn vk_of(name: &str) -> Result<u16, String> {
         _ => None,
     };
     if let Some(v) = named {
-        return Ok(v);
+        return Ok(KeyCode::Vk(v, false));
     }
-    if key.starts_with('f') {
-        if let Ok(i) = key[1..].parse::<u32>() {
-            if (1..=24).contains(&i) {
-                return Ok((0x6F + i) as u16);
-            }
-        }
+    if let Some(vk) = key
+        .strip_prefix('f')
+        .and_then(|r| r.parse::<u32>().ok())
+        .filter(|i| (1..=24).contains(i))
+    {
+        return Ok(KeyCode::Vk((0x6F + vk) as u16, false));
     }
     if name.chars().count() == 1 {
-        let ch = name.chars().next().unwrap() as u32;
+        let ch = name.chars().next().unwrap();
         unsafe {
             let sc = VkKeyScanW(ch as u16);
-            if sc != -1 {
-                return Ok((sc as u16) & 0xFF);
+            if sc == -1 {
+                return Ok(KeyCode::Uni(ch));
             }
+            let vk = (sc as u16) & 0xFF;
+            let mods = ((sc as u16) >> 8) as u8;
+            if mods & 0x06 != 0 {
+                // Ctrl/Alt-required chars have no SendInput key sequence
+                // that types them; deliver as Unicode like `type`.
+                return Ok(KeyCode::Uni(ch));
+            }
+            return Ok(KeyCode::Vk(vk, mods & 0x01 != 0));
         }
     }
     Err(format!("unknown key name \"{name}\""))
 }
 
+/// Monitor containing a virtual-desktop point, for defaulting a watch
+/// region to the foreground window's monitor instead of the whole
+/// virtual desktop. Pure and unit-tested; `None` when no monitor
+/// contains the point (caller falls back to the virtual desktop).
+fn monitor_for_point(mons: &[[i32; 4]], x: i64, y: i64) -> Option<[i32; 4]> {
+    mons.iter()
+        .find(|m| x >= m[0] as i64 && x < m[2] as i64 && y >= m[1] as i64 && y < m[3] as i64)
+        .copied()
+}
+
 // ---------------------------------------------------------------- clipboard (puppet.py:2547-2602)
 
+/// Clipboard text budget: 1 MiB of characters. Reads truncate, writes
+/// fail typed — never silently, never unbounded.
+pub(crate) const MAX_CLIP_CHARS: usize = 1_048_576;
+
+/// Typed bound check shared by clipboard_set (before OpenClipboard, so a
+/// rejection never touches the clipboard).
+fn check_clip_len(n_chars: usize) -> Result<(), String> {
+    if n_chars > MAX_CLIP_CHARS {
+        return Err(format!(
+            "clipboard text too large ({n_chars} chars, max {MAX_CLIP_CHARS})"
+        ));
+    }
+    Ok(())
+}
+
+/// Bounded NUL-terminated UTF-16 read: scans at most `max_units` for the
+/// terminator (the GlobalSize bound), then decodes lossily. A missing NUL
+/// is an error, never an over-read.
+unsafe fn clip_read_u16(ptr: *const u16, max_units: usize) -> Result<String, String> {
+    let mut len = 0usize;
+    while len < max_units {
+        if *ptr.add(len) == 0 {
+            break;
+        }
+        len += 1;
+    }
+    if len == max_units {
+        return Err("clipboard text is not NUL-terminated within its GlobalSize".to_string());
+    }
+    let slice = std::slice::from_raw_parts(ptr, len);
+    Ok(String::from_utf16_lossy(slice))
+}
+
 fn clipboard_set(text: &str) -> Result<(), String> {
+    // Bound first: a rejection never touches the clipboard.
+    check_clip_len(text.chars().count())?;
     unsafe {
         let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
         let bytes = wide.len() * 2;
@@ -414,19 +643,26 @@ fn clipboard_get() -> Result<String, String> {
             if h.is_null() {
                 return Err("GetClipboardData failed".to_string());
             }
+            // Bound the scan by the allocation size: never read past what
+            // GlobalSize reports, and require the NUL terminator inside it.
+            let bytes = GlobalSize(h) as usize;
+            if bytes < 2 {
+                return Err("clipboard text is empty or unreadable (GlobalSize)".to_string());
+            }
+            let max_units = bytes / 2;
             let p = GlobalLock(h);
             if p.is_null() {
                 return Err("GlobalLock failed".to_string());
             }
-            let wp = p as *const u16;
-            let mut len = 0usize;
-            while *wp.add(len) != 0 {
-                len += 1;
-            }
-            let slice = std::slice::from_raw_parts(wp, len);
-            let s = String::from_utf16_lossy(slice);
+            let s = clip_read_u16(p as *const u16, max_units);
             GlobalUnlock(h);
-            Ok(s)
+            let s = s?;
+            // Cap the return at MAX_CLIP_CHARS (truncate, documented).
+            if s.chars().count() > MAX_CLIP_CHARS {
+                Ok(s.chars().take(MAX_CLIP_CHARS).collect())
+            } else {
+                Ok(s)
+            }
         })();
         if opened {
             CloseClipboard();
@@ -470,6 +706,77 @@ fn bg_key_lparam(vk: u16, keyup: bool) -> LPARAM {
 
 fn bg_post(hwnd: i64, msg: u32, w: u64, l: LPARAM) -> bool {
     unsafe { PostMessageW(hwnd as HWND, msg, w as usize, l) != 0 }
+}
+
+/// Class probe for text-input controls (classic EDIT plus RichEdit
+/// flavors such as RichEditD2DPT backing the Win11 Notepad document).
+fn bg_is_text_control(h: HWND) -> bool {
+    unsafe {
+        let mut buf = vec![0u16; 256];
+        let n = GetClassNameW(h, buf.as_mut_ptr(), buf.len() as i32);
+        if n <= 0 {
+            return false;
+        }
+        let cls = String::from_utf16_lossy(&buf[..n as usize]).to_lowercase();
+        cls.contains("edit") || cls.contains("rich")
+    }
+}
+
+fn bg_descend(h: HWND, out: &mut Vec<HWND>) {
+    if let Ok(kids) = crate::enum_child_windows(h) {
+        for k in kids {
+            out.push(k);
+            bg_descend(k, out);
+        }
+    }
+}
+
+/// Text-input target under background delivery (plain `background` and
+/// `desktop:"hidden"` share `bg_execute`): keyboard messages posted to a
+/// top-level frame are dispatched to the frame's own window proc, which for
+/// editors (Notepad) never reaches the child EDIT control — so the hidden
+/// readback comes back empty. Resolve the control that would actually
+/// receive typed text: the thread's focused control when it is itself text
+/// input (GetGUIThreadInfo, the caret owner), else the first visible +
+/// enabled text control in the descendant tree (the document), else the
+/// window itself. A bare focus window (tab strip, toolbar) would swallow
+/// WM_CHAR, so focus only counts when it is text input. The descendant
+/// walk is recursive because modern editors nest the document deeper than
+/// one level. Never activates or focuses; PostMessage-only, so the owner's
+/// desktop is untouched.
+fn bg_text_target(hwnd: i64) -> i64 {
+    unsafe {
+        let target = hwnd as HWND;
+        if IsWindow(target) == 0 {
+            return hwnd;
+        }
+        let thread = GetWindowThreadProcessId(target, std::ptr::null_mut());
+        if thread != 0 {
+            let mut info: GUITHREADINFO = std::mem::zeroed();
+            info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+            if GetGUIThreadInfo(thread, &mut info) != 0 {
+                let f = info.hwndFocus;
+                if !f.is_null()
+                    && f as i64 != hwnd
+                    && IsChild(target, f) != 0
+                    && bg_is_text_control(f)
+                {
+                    return f as i64;
+                }
+            }
+        }
+        let mut descendants: Vec<HWND> = Vec::new();
+        bg_descend(target, &mut descendants);
+        for k in descendants {
+            if IsWindowVisible(k) == 0 || IsWindowEnabled(k) == 0 {
+                continue;
+            }
+            if bg_is_text_control(k) {
+                return k as i64;
+            }
+        }
+        hwnd
+    }
 }
 
 fn bg_buttons(btn: &str) -> Option<(u32, u32, u64)> {
@@ -597,9 +904,13 @@ fn bg_execute(hwnd: i64, a: &Map<String, Value>) -> (bool, Option<String>, i64) 
             None => String::new(),
             Some(v) => py_str(v),
         };
+        // Keyboard input lands in the text control, not the frame: post
+        // WM_CHAR to the focused/edit child (same fix plain `background`
+        // needs — it shares this path).
+        let tgt = bg_text_target(hwnd);
         let mut n = 0i64;
         for unit in utf16_units(&text) {
-            if !bg_post(hwnd, 0x0102, unit as u64, 1) {
+            if !bg_post(tgt, 0x0102, unit as u64, 1) {
                 return (
                     false,
                     Some("PostMessage failed (target may have closed)".to_string()),
@@ -615,30 +926,75 @@ fn bg_execute(hwnd: i64, a: &Map<String, Value>) -> (bool, Option<String>, i64) 
             None => String::new(),
             Some(v) => py_str(v),
         };
-        let vk = match vk_of(&name) {
+        let code = match vk_of(&name) {
             Ok(v) => v,
             Err(e) => return (false, Some(e), 0),
         };
-        let (dm, um) = if vk == 0x12 {
-            (0x0104, 0x0105)
-        } else {
-            (0x0100, 0x0101)
-        };
-        if !bg_post(hwnd, dm, vk as u64, bg_key_lparam(vk, false)) {
-            return (
-                false,
-                Some("PostMessage failed (target may have closed)".to_string()),
-                0,
-            );
+        // Same text-target rule as `type`: key messages posted to the frame
+        // never reach the edit control.
+        let tgt = bg_text_target(hwnd);
+        match code {
+            KeyCode::Vk(vk, shift) => {
+                let (dm, um) = if vk == 0x12 {
+                    (0x0104, 0x0105)
+                } else {
+                    (0x0100, 0x0101)
+                };
+                let mut n = 0i64;
+                if shift && !bg_post(tgt, dm, VK_SHIFT as u64, bg_key_lparam(VK_SHIFT, false)) {
+                    return (
+                        false,
+                        Some("PostMessage failed (target may have closed)".to_string()),
+                        n,
+                    );
+                }
+                if shift {
+                    n += 1;
+                }
+                if !bg_post(tgt, dm, vk as u64, bg_key_lparam(vk, false)) {
+                    return (
+                        false,
+                        Some("PostMessage failed (target may have closed)".to_string()),
+                        n,
+                    );
+                }
+                n += 1;
+                if !bg_post(tgt, um, vk as u64, bg_key_lparam(vk, true)) {
+                    return (
+                        false,
+                        Some("PostMessage failed (target may have closed)".to_string()),
+                        n,
+                    );
+                }
+                n += 1;
+                if shift && !bg_post(tgt, um, VK_SHIFT as u64, bg_key_lparam(VK_SHIFT, true)) {
+                    return (
+                        false,
+                        Some("PostMessage failed (target may have closed)".to_string()),
+                        n,
+                    );
+                }
+                if shift {
+                    n += 1;
+                }
+                return (true, None, n);
+            }
+            KeyCode::Uni(ch) => {
+                // No key sequence types this char: WM_CHAR like `type`.
+                let mut n = 0i64;
+                for unit in utf16_units(&ch.to_string()) {
+                    if !bg_post(tgt, 0x0102, unit as u64, 1) {
+                        return (
+                            false,
+                            Some("PostMessage failed (target may have closed)".to_string()),
+                            n,
+                        );
+                    }
+                    n += 1;
+                }
+                return (true, None, n);
+            }
         }
-        if !bg_post(hwnd, um, vk as u64, bg_key_lparam(vk, true)) {
-            return (
-                false,
-                Some("PostMessage failed (target may have closed)".to_string()),
-                1,
-            );
-        }
-        return (true, None, 2);
     }
     if typ == "hotkey" {
         let keys: Result<Vec<String>, String> = match a.get("keys") {
@@ -654,38 +1010,95 @@ fn bg_execute(hwnd: i64, a: &Map<String, Value>) -> (bool, Option<String>, i64) 
         if keys.is_empty() {
             return (false, Some("hotkey needs non-empty keys".to_string()), 0);
         }
-        let mut vks = Vec::with_capacity(keys.len());
+        let mut codes = Vec::with_capacity(keys.len());
         for k in &keys {
             match vk_of(k) {
-                Ok(v) => vks.push(v),
+                Ok(v) => codes.push(v),
                 Err(e) => return (false, Some(e), 0),
             }
         }
-        let (dm, um) = if vks.contains(&0x12) {
+        let has_alt = codes
+            .iter()
+            .any(|c| matches!(c, KeyCode::Vk(vk, _) if *vk == 0x12));
+        let (dm, um) = if has_alt {
             (0x0104, 0x0105)
         } else {
             (0x0100, 0x0101)
         };
         let mut n = 0i64;
-        for vk in &vks {
-            if !bg_post(hwnd, dm, *vk as u64, bg_key_lparam(*vk, false)) {
-                return (
-                    false,
-                    Some("PostMessage failed (target may have closed)".to_string()),
-                    n,
-                );
+        // Same text-target rule as `type`.
+        let tgt = bg_text_target(hwnd);
+        for c in &codes {
+            match c {
+                KeyCode::Vk(vk, shift) => {
+                    if *shift {
+                        if !bg_post(tgt, dm, VK_SHIFT as u64, bg_key_lparam(VK_SHIFT, false)) {
+                            return (
+                                false,
+                                Some("PostMessage failed (target may have closed)".to_string()),
+                                n,
+                            );
+                        }
+                        n += 1;
+                    }
+                    if !bg_post(tgt, dm, *vk as u64, bg_key_lparam(*vk, false)) {
+                        return (
+                            false,
+                            Some("PostMessage failed (target may have closed)".to_string()),
+                            n,
+                        );
+                    }
+                    n += 1;
+                }
+                KeyCode::Uni(ch) => {
+                    for unit in utf16_units(&ch.to_string()) {
+                        if !bg_post(tgt, 0x0102, unit as u64, 1) {
+                            return (
+                                false,
+                                Some("PostMessage failed (target may have closed)".to_string()),
+                                n,
+                            );
+                        }
+                        n += 1;
+                    }
+                }
             }
-            n += 1;
         }
-        for vk in vks.iter().rev() {
-            if !bg_post(hwnd, um, *vk as u64, bg_key_lparam(*vk, true)) {
-                return (
-                    false,
-                    Some("PostMessage failed (target may have closed)".to_string()),
-                    n,
-                );
+        for c in codes.iter().rev() {
+            match c {
+                KeyCode::Vk(vk, shift) => {
+                    if !bg_post(tgt, um, *vk as u64, bg_key_lparam(*vk, true)) {
+                        return (
+                            false,
+                            Some("PostMessage failed (target may have closed)".to_string()),
+                            n,
+                        );
+                    }
+                    n += 1;
+                    if *shift {
+                        if !bg_post(tgt, um, VK_SHIFT as u64, bg_key_lparam(VK_SHIFT, true)) {
+                            return (
+                                false,
+                                Some("PostMessage failed (target may have closed)".to_string()),
+                                n,
+                            );
+                        }
+                        n += 1;
+                    }
+                }
+                KeyCode::Uni(ch) => {
+                    for unit in utf16_units(&ch.to_string()) {
+                        if !bg_post(tgt, 0x0102, unit as u64, 1) {
+                            return (
+                                false,
+                                Some("PostMessage failed (target may have closed)".to_string()),
+                                n,
+                            );
+                        }
+                        n += 1;
+                    }
+                }
             }
-            n += 1;
         }
         return (true, None, n);
     }
@@ -711,6 +1124,36 @@ fn bg_cursor_client(hwnd: i64, x: i32, y: i32) -> Option<(i64, i64)> {
 
 // ---------------------------------------------------------------- wait_for (puppet.py:1795-1892)
 
+/// Pure element-wait decision: given whether a matching control was found
+/// and (when found) whether it is enabled, decide per `state`. Unit-tested;
+/// the polling loop only feeds it live observations.
+fn element_wait_satisfied(state: &str, found: bool, enabled: Option<bool>) -> bool {
+    match state {
+        "disappear" => !found,
+        "appear" => found,
+        "enabled" => found && enabled == Some(true),
+        "disabled" => found && enabled == Some(false),
+        _ => false,
+    }
+}
+
+/// Enabled state for a matched entry: UIA CurrentIsEnabled by path on the
+/// uia backend, Win32 IsWindowEnabled on the entry hwnd otherwise. None on
+/// any failure (unreadable, unhosted, stale) — the waiter treats that as
+/// unsatisfied and keeps polling rather than failing the burst.
+fn wf_element_enabled(tgt: i64, backend: &str, entry: &Map<String, Value>) -> Option<bool> {
+    if backend == "uia" {
+        let path = entry_str(entry, "path");
+        crate::uia::uia_is_enabled(tgt as HWND, &path).ok()
+    } else {
+        let h = entry.get("hwnd").and_then(|v| v.as_i64()).unwrap_or(0);
+        if h == 0 {
+            return None;
+        }
+        unsafe { Some(IsWindowEnabled(h as HWND) != 0) }
+    }
+}
+
 fn wf_done(t0: &Instant, ok: bool, sat: bool, err: Option<String>) -> Map<String, Value> {
     let mut d = Map::new();
     d.insert("ok".to_string(), Value::from(ok));
@@ -725,14 +1168,25 @@ fn wf_done(t0: &Instant, ok: bool, sat: bool, err: Option<String>) -> Map<String
     d
 }
 
-fn wf_nap(t0: &Instant, timeout_s: f64, poll_s: f64) {
+fn wf_nap(t0: &Instant, timeout_s: f64, poll_s: f64) -> bool {
     let remain = timeout_s - t0.elapsed().as_secs_f64();
     let nap = if remain > 0.001 {
         poll_s.min(remain)
     } else {
         0.001
     };
-    std::thread::sleep(Duration::from_secs_f64(nap.max(0.0)));
+    // Sleep in <=50ms slices so a `notifications/cancelled` wakes the
+    // `wait_for` poll loop promptly. True = cancelled.
+    let mut left = nap.max(0.0);
+    while left > 0.0 {
+        if crate::cancel::cancelled() {
+            return true;
+        }
+        let s = left.min(0.05);
+        std::thread::sleep(Duration::from_secs_f64(s));
+        left -= s;
+    }
+    crate::cancel::cancelled()
 }
 
 fn wait_for(a: &Map<String, Value>, t0: &Instant) -> Map<String, Value> {
@@ -803,6 +1257,9 @@ fn wait_for(a: &Map<String, Value>, t0: &Instant) -> Map<String, Value> {
         };
         let want_present = kind == "window_appear";
         loop {
+            if crate::cancel::cancelled() {
+                return wf_done(t0, false, false, Some("cancelled".to_string()));
+            }
             let (h, _, _) = resolve_selector(&sel);
             if h.is_some() == want_present {
                 return wf_done(t0, true, true, None);
@@ -810,7 +1267,9 @@ fn wait_for(a: &Map<String, Value>, t0: &Instant) -> Map<String, Value> {
             if t0.elapsed().as_secs_f64() >= timeout_s {
                 return wf_done(t0, true, false, None);
             }
-            wf_nap(t0, timeout_s, poll_s);
+            if wf_nap(t0, timeout_s, poll_s) {
+                return wf_done(t0, false, false, Some("cancelled".to_string()));
+            }
         }
     }
     if kind == "pixel" {
@@ -856,6 +1315,9 @@ fn wait_for(a: &Map<String, Value>, t0: &Instant) -> Map<String, Value> {
             );
         }
         loop {
+            if crate::cancel::cancelled() {
+                return wf_done(t0, false, false, Some("cancelled".to_string()));
+            }
             if let Ok(img) = bitblt_grab(x as i32, y as i32, 1, 1) {
                 if img.px.len() >= 3 && (0..3).all(|k| (img.px[k] as i64 - color[k]).abs() <= tol) {
                     return wf_done(t0, true, true, None);
@@ -864,15 +1326,14 @@ fn wait_for(a: &Map<String, Value>, t0: &Instant) -> Map<String, Value> {
             if t0.elapsed().as_secs_f64() >= timeout_s {
                 return wf_done(t0, true, false, None);
             }
-            wf_nap(t0, timeout_s, poll_s);
+            if wf_nap(t0, timeout_s, poll_s) {
+                return wf_done(t0, false, false, Some("cancelled".to_string()));
+            }
         }
     }
     if kind == "stable" {
         let region = match a.get("region") {
-            None => {
-                let (vx, vy, vr, vb) = virtual_rect();
-                vec![vx as i64, vy as i64, vr as i64, vb as i64]
-            }
+            None => default_stable_region(),
             Some(Value::Array(r)) if r.len() == 4 => {
                 let mut out = [0i64; 4];
                 let mut ok = true;
@@ -905,28 +1366,46 @@ fn wait_for(a: &Map<String, Value>, t0: &Instant) -> Map<String, Value> {
             }
         };
         let (rl, rt, rr, rb) = (region[0], region[1], region[2], region[3]);
-        if rr <= rl || rb <= rt {
-            return wf_done(
-                t0,
-                false,
-                false,
-                Some("region must have right>left and bottom>top".to_string()),
-            );
-        }
-        let (rw, rh) = (rr - rl, rb - rt);
-        if rw > MAX_STABLE_EDGE || rh > MAX_STABLE_EDGE {
-            return wf_done(
-                t0,
-                false,
-                false,
-                Some(format!(
-                    "region must be at most {MAX_STABLE_EDGE}x{MAX_STABLE_EDGE} (got {rw}x{rh})"
-                )),
-            );
-        }
+        // Overflow-safe region gate: the shared validator never subtracts
+        // in i64 before validating, so MIN/MAX extremes are typed errors
+        // (no debug panic, no release wraparound bypass).
+        let (rw, rh) = match crate::validate_region(rl, rt, rr, rb, MAX_STABLE_EDGE) {
+            Ok(wh) => wh,
+            Err(crate::RegionReject::Order) => {
+                return wf_done(
+                    t0,
+                    false,
+                    false,
+                    Some("region must have right>left and bottom>top".to_string()),
+                );
+            }
+            Err(crate::RegionReject::Extreme) => {
+                return wf_done(
+                    t0,
+                    false,
+                    false,
+                    Some(
+                        "region coordinates outside i32 range (would truncate on cast)".to_string(),
+                    ),
+                );
+            }
+            Err(crate::RegionReject::OverCap(w, h)) => {
+                return wf_done(
+                    t0,
+                    false,
+                    false,
+                    Some(format!(
+                        "region must be at most {MAX_STABLE_EDGE}x{MAX_STABLE_EDGE} (got {w}x{h})"
+                    )),
+                );
+            }
+        };
         let mut prev: Option<Vec<u8>> = None;
         loop {
-            match bitblt_grab(rl as i32, rt as i32, (rr - rl) as i32, (rb - rt) as i32) {
+            if crate::cancel::cancelled() {
+                return wf_done(t0, false, false, Some("cancelled".to_string()));
+            }
+            match bitblt_grab(rl as i32, rt as i32, rw as i32, rh as i32) {
                 Ok(img) => {
                     if prev.as_ref() == Some(&img.px) {
                         return wf_done(t0, true, true, None);
@@ -940,7 +1419,199 @@ fn wait_for(a: &Map<String, Value>, t0: &Instant) -> Map<String, Value> {
             if t0.elapsed().as_secs_f64() >= timeout_s {
                 return wf_done(t0, true, false, None);
             }
-            wf_nap(t0, timeout_s, poll_s);
+            if wf_nap(t0, timeout_s, poll_s) {
+                return wf_done(t0, false, false, Some("cancelled".to_string()));
+            }
+        }
+    }
+    if kind == "element" {
+        // Element wait: poll the UIA element model for a control matching
+        // the invoke-style selector, optionally checking its enabled
+        // state. Read-only (no focus/input); a timeout is not an error.
+        let win_sel: Option<String> = match a.get("window") {
+            None | Some(Value::Null) => None,
+            Some(v) => {
+                let s = py_str(v);
+                if s.trim().is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            }
+        };
+        let elem_v = a.get("element").cloned().unwrap_or(Value::Null);
+        if !py_truthy(&elem_v) || py_str(&elem_v).trim().is_empty() {
+            return wf_done(
+                t0,
+                false,
+                false,
+                Some(
+                    "wait_for kind=element needs \"element\" (e.g. \"name:OK\", \"path:0\")"
+                        .to_string(),
+                ),
+            );
+        }
+        let elem_s = py_str(&elem_v);
+        let (ekind, _) = match elem_s.find(':') {
+            Some(p) => (
+                elem_s[..p].trim().to_lowercase(),
+                elem_s[p + 1..].trim().to_string(),
+            ),
+            None => ("name".to_string(), elem_s.trim().to_string()),
+        };
+        if !["name", "auto_id", "autoid", "automationid", "id", "path"].contains(&ekind.as_str()) {
+            return wf_done(
+                t0,
+                false,
+                false,
+                Some(format!(
+                    "unknown element selector kind \"{ekind}\" (want name:|auto_id:|path:)"
+                )),
+            );
+        }
+        let state = match a.get("state") {
+            None | Some(Value::Null) => "appear".to_string(),
+            Some(v) => py_str(v).to_lowercase(),
+        };
+        if !["appear", "disappear", "enabled", "disabled"].contains(&state.as_str()) {
+            return wf_done(
+                t0,
+                false,
+                false,
+                Some(
+                    "wait_for kind=element state must be appear|disappear|enabled|disabled"
+                        .to_string(),
+                ),
+            );
+        }
+        // Static shape check for an explicit window selector: unparseable
+        // hwnd:/pid: values and empty title:/exe:/class: values are malformed
+        // (per-action error), never something to poll for. Anything else
+        // resolves per-poll; absence then just means "not here yet".
+        if let Some(sel) = win_sel.as_deref() {
+            let (kind, val) = crate::parse_selector(sel);
+            let bad = match kind.as_str() {
+                "hwnd" | "pid" => crate::parse_int_loose(&val).is_none(),
+                "exe" | "title" | "class" => val.is_empty(),
+                _ => false,
+            };
+            if bad {
+                return wf_done(
+                    t0,
+                    false,
+                    false,
+                    Some(format!(
+                        "wait_for kind=element: bad window selector {sel:?}"
+                    )),
+                );
+            }
+        }
+        loop {
+            if crate::cancel::cancelled() {
+                return wf_done(t0, false, false, Some("cancelled".to_string()));
+            }
+            // Resolve the target window each poll: an explicit selector or
+            // the current foreground window. A failed resolve (absent,
+            // recycled, or ambiguous window) is transient absence, not an
+            // error: disappear treats it as satisfied, every other state
+            // keeps polling. Only statically malformed selectors fail fast
+            // (checked above).
+            let tgt: Option<HWND> = match win_sel.as_deref() {
+                Some(sel) => resolve_selector(sel).0,
+                None => {
+                    let f = fg_now();
+                    if f == 0 {
+                        return wf_done(
+                            t0,
+                            true,
+                            false,
+                            Some("wait_for kind=element: no foreground window".to_string()),
+                        );
+                    }
+                    Some(f as HWND)
+                }
+            };
+            // A dead window mid-wait reads as gone: disappear is satisfied,
+            // every other state keeps polling for its return.
+            let alive = tgt.is_some_and(|h| unsafe { IsWindow(h) != 0 });
+            if !alive {
+                if state == "disappear" {
+                    return wf_done(t0, true, true, None);
+                }
+            } else {
+                let h = tgt.unwrap() as i64;
+                // Paged scan: the control may live past the 200-entry first
+                // page, so walk offset 0, 200, ... to the end counting total
+                // matches. 0 -> absent handling below; 1 -> satisfied
+                // check; >1 -> ambiguous per-action error, fail fast, never
+                // spun to timeout. A page-local ambiguous refusal already
+                // proves >1 overall. Cancellation is checked between pages,
+                // not just between polls.
+                let mut hits: Vec<(Map<String, Value>, String)> = Vec::new();
+                let mut refused: Option<String> = None;
+                let mut offset = 0usize;
+                loop {
+                    if crate::cancel::cancelled() {
+                        return wf_done(t0, false, false, Some("cancelled".to_string()));
+                    }
+                    let model = element_model(h as HWND, crate::UIA_DEPTH_LIMIT, offset);
+                    let (entry, merr, mcands) = match_element(&model.entries, Some(&elem_v), None);
+                    if let Some(me) = merr {
+                        if mcands.is_some() || me.contains("unknown element selector kind") {
+                            // Ambiguous within the page (>=2 overall) or
+                            // malformed: a per-action error, never silent
+                            // and never spun to timeout.
+                            refused = Some(me);
+                            break;
+                        }
+                        // Not on this page: keep scanning later pages.
+                    } else if let Some(e) = entry {
+                        // One page yields at most one match without
+                        // refusing, so a second hit across pages proves
+                        // ambiguity; stop counting there.
+                        if hits.is_empty() {
+                            hits.push((e, model.backend));
+                        } else {
+                            refused = Some(format!(
+                                "ambiguous element: multiple elements match \"{elem_s}\" across pages"
+                            ));
+                            break;
+                        }
+                    }
+                    match model.next_offset {
+                        Some(n) => offset = n,
+                        None => break,
+                    }
+                }
+                if let Some(me) = refused {
+                    return wf_done(t0, false, false, Some(me));
+                }
+                match hits.pop() {
+                    None => {
+                        // Absent on every page: disappear is satisfied, the
+                        // rest keep polling for its arrival.
+                        if state == "disappear" {
+                            return wf_done(t0, true, true, None);
+                        }
+                    }
+                    Some((e, backend)) => {
+                        let enabled = if state == "enabled" || state == "disabled" {
+                            wf_element_enabled(h, &backend, &e)
+                        } else {
+                            None
+                        };
+                        if element_wait_satisfied(&state, true, enabled) {
+                            return wf_done(t0, true, true, None);
+                        }
+                    }
+                }
+            }
+            if t0.elapsed().as_secs_f64() >= timeout_s {
+                return wf_done(t0, true, false, None);
+            }
+            if wf_nap(t0, timeout_s, poll_s) {
+                return wf_done(t0, false, false, Some("cancelled".to_string()));
+            }
         }
     }
     wf_done(
@@ -948,7 +1619,7 @@ fn wait_for(a: &Map<String, Value>, t0: &Instant) -> Map<String, Value> {
         false,
         false,
         Some(format!(
-            "unknown wait_for kind \"{kind}\" (want window_appear|window_disappear|pixel|stable)"
+            "unknown wait_for kind \"{kind}\" (want window_appear|window_disappear|pixel|stable|element)"
         )),
     )
 }
@@ -995,15 +1666,15 @@ fn restore_foreground(hwnd: i64) -> bool {
         };
         let tgt_tid = GetWindowThreadProcessId(h, std::ptr::null_mut());
         let mut attached: Vec<u32> = Vec::new();
-        if fg_tid != 0 && fg_tid != cur_tid {
-            if AttachThreadInput(cur_tid, fg_tid, 1) != 0 {
-                attached.push(fg_tid);
-            }
+        if fg_tid != 0 && fg_tid != cur_tid && AttachThreadInput(cur_tid, fg_tid, 1) != 0 {
+            attached.push(fg_tid);
         }
-        if tgt_tid != 0 && tgt_tid != cur_tid && tgt_tid != fg_tid {
-            if AttachThreadInput(cur_tid, tgt_tid, 1) != 0 {
-                attached.push(tgt_tid);
-            }
+        if tgt_tid != 0
+            && tgt_tid != cur_tid
+            && tgt_tid != fg_tid
+            && AttachThreadInput(cur_tid, tgt_tid, 1) != 0
+        {
+            attached.push(tgt_tid);
         }
         SetForegroundWindow(h);
         for tid in attached {
@@ -1013,15 +1684,24 @@ fn restore_foreground(hwnd: i64) -> bool {
     }
 }
 
-/// _resolve_window with untyped action values (puppet.py:625-636).
-fn resolve_window_val(
-    title: Option<&Value>,
-    hwnd: Option<&Value>,
-) -> (
+/// Window-resolution outcome: target hwnd, human error, or disambiguation
+/// candidates when the selector matches several windows.
+type ResolveOut = (
     Option<HWND>,
     Option<String>,
     Option<Vec<Map<String, Value>>>,
-) {
+);
+
+/// Element-match outcome: the entry, a typed error, or disambiguation
+/// candidates when the selector matches several controls.
+type MatchOut = (
+    Option<Map<String, Value>>,
+    Option<String>,
+    Option<Vec<Map<String, Value>>>,
+);
+
+/// _resolve_window with untyped action values (puppet.py:625-636).
+fn resolve_window_val(title: Option<&Value>, hwnd: Option<&Value>) -> ResolveOut {
     if let Some(hv) = hwnd {
         match py_int(hv) {
             Ok(h) => return resolve_selector(&format!("hwnd:{h}")),
@@ -1076,11 +1756,7 @@ fn match_element(
     entries: &[Map<String, Value>],
     spec: Option<&Value>,
     index: Option<&Value>,
-) -> (
-    Option<Map<String, Value>>,
-    Option<String>,
-    Option<Vec<Map<String, Value>>>,
-) {
+) -> MatchOut {
     let s = match spec {
         None => String::new(),
         Some(v) => {
@@ -1274,14 +1950,33 @@ fn win32_activate(entry: &Map<String, Value>) -> (bool, String, Option<String>) 
         );
     }
     unsafe {
-        SendMessageW(kids[idx as usize], 0x00F5, 0, 0);
+        // P1b: never wedge a worker on a hung window. SendMessageTimeoutW
+        // with SMTO_ABORTIFHUNG + 2s turns a hung target into a per-action
+        // error; the reader and the other workers stay alive.
+        let mut _res: usize = 0;
+        let r = SendMessageTimeoutW(
+            kids[idx as usize],
+            0x00F5,
+            0,
+            0,
+            SMTO_ABORTIFHUNG,
+            2000,
+            &mut _res,
+        );
+        if r == 0 {
+            return (
+                false,
+                String::new(),
+                Some("win32-click failed: target did not respond within 2s".to_string()),
+            );
+        }
     }
     (true, "win32-click".to_string(), None)
 }
 
 /// Synchronous SendInput move + left click (puppet.py:1465-1469). Live only.
 fn pixel_click_at(x: i64, y: i64) -> bool {
-    let seq = vec![mi_move(x, y), mi_btn(M_LDOWN, 0), mi_btn(M_LUP, 0)];
+    let seq = [mi_move(x, y), mi_btn(M_LDOWN, 0), mi_btn(M_LUP, 0)];
     unsafe {
         SendInput(
             seq.len() as u32,
@@ -1346,10 +2041,11 @@ fn uipi_targets_for_action(typ: &str, a: &Map<String, Value>) -> Vec<i64> {
     };
     match typ {
         "click" | "down" | "up" => match (a.get("x"), a.get("y")) {
-            (Some(xv), Some(yv)) => match (py_int(xv), py_int(yv)) {
-                (Ok(x), Ok(y)) => push_opt(window_at(x, y)),
-                _ => {}
-            },
+            (Some(xv), Some(yv)) => {
+                if let (Ok(x), Ok(y)) = (py_int(xv), py_int(yv)) {
+                    push_opt(window_at(x, y));
+                }
+            }
             _ => {
                 let (cx, cy) = cursor_now();
                 push_opt(window_at(cx, cy));
@@ -1365,10 +2061,11 @@ fn uipi_targets_for_action(typ: &str, a: &Map<String, Value>) -> Vec<i64> {
             }
         }
         "scroll" => match (a.get("x"), a.get("y")) {
-            (Some(xv), Some(yv)) => match (py_int(xv), py_int(yv)) {
-                (Ok(x), Ok(y)) => push_opt(window_at(x, y)),
-                _ => {}
-            },
+            (Some(xv), Some(yv)) => {
+                if let (Ok(x), Ok(y)) = (py_int(xv), py_int(yv)) {
+                    push_opt(window_at(x, y));
+                }
+            }
             _ => {
                 let f = fg_now();
                 if f != 0 {
@@ -1403,6 +2100,75 @@ struct Burst {
 }
 
 impl Burst {
+    /// Held/repeated key delivery guard: down -> flush -> hold -> up ->
+    /// flush per repeat, with a cancellable gap between repeats. The
+    /// `cancelled` predicate is `crate::cancel::cancelled` live; tests
+    /// inject a scripted one. Returns `Some(result)` on early exit
+    /// (cancellation or flush error), `None` when every repeat completed.
+    /// A cancellation after a key-down always emits the matching key-up
+    /// (plus Shift when held) and flushes before returning: no exit path
+    /// leaves a key held down.
+    #[allow(clippy::too_many_arguments)]
+    fn run_hold_repeats(
+        &mut self,
+        i: usize,
+        typ_v: &Value,
+        code: &KeyCode,
+        repeat: i64,
+        hold_ms: u64,
+        gap_ms: u64,
+        dry_run: bool,
+        t0: Instant,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Option<Map<String, Value>> {
+        self.marked.push(i);
+        for r in 0..repeat {
+            self.pending.extend(key_down_inputs(code));
+            let (_, ferr) = self.flush();
+            if let Some(fe) = ferr {
+                // The down may have partially sent: release before failing.
+                self.pending.extend(key_up_inputs(code));
+                let _ = self.flush();
+                self.marked.clear();
+                fail_since_flush(&mut self.results, &mut self.marked, &fe, self.flush_uipi);
+                let mut d = base_entry(i, typ_v, false, elapsed_ms(&t0));
+                d.insert("error".to_string(), Value::from(fe));
+                return Some(d);
+            }
+            self.marked.clear();
+            if (!dry_run && hold_ms > 0 && sleep_cancellable(hold_ms)) || cancelled() {
+                // Release the held key (+Shift) before reporting: no exit
+                // path leaves a key down.
+                self.pending.extend(key_up_inputs(code));
+                let _ = self.flush();
+                self.marked.clear();
+                let mut d = base_entry(i, typ_v, false, elapsed_ms(&t0));
+                d.insert("error".to_string(), Value::from("cancelled"));
+                return Some(d);
+            }
+            self.pending.extend(key_up_inputs(code));
+            let (_, ferr) = self.flush();
+            if let Some(fe) = ferr {
+                self.marked.clear();
+                fail_since_flush(&mut self.results, &mut self.marked, &fe, self.flush_uipi);
+                let mut d = base_entry(i, typ_v, false, elapsed_ms(&t0));
+                d.insert("error".to_string(), Value::from(fe));
+                return Some(d);
+            }
+            self.marked.clear();
+            if r + 1 < repeat
+                && !dry_run
+                && gap_ms > 0
+                && (sleep_cancellable(gap_ms) || cancelled())
+            {
+                let mut d = base_entry(i, typ_v, false, elapsed_ms(&t0));
+                d.insert("error".to_string(), Value::from("cancelled"));
+                return Some(d);
+            }
+        }
+        None
+    }
+
     /// Empty pending -> (0, None), no call counted. Live partial sends
     /// retro-mark every covered action via fail_since_flush (caller).
     fn flush(&mut self) -> (f64, Option<String>) {
@@ -1443,8 +2209,7 @@ impl Burst {
                 // Pre-checks above refuse the known-elevated case before
                 // injecting; this names the race that slips between.
                 let fg = fg_now();
-                if crate::uipi_blocked(crate::window_elevated(fg as HWND), crate::self_elevated())
-                {
+                if crate::uipi_blocked(crate::window_elevated(fg as HWND), crate::self_elevated()) {
                     let pid = crate::pid_of(fg as HWND);
                     let exe = crate::exe_of_pid(pid);
                     msg.push_str(&format!(
@@ -1508,11 +2273,28 @@ fn unpack2(v: &Value) -> Result<(i64, i64), String> {
     }
 }
 
+/// Optional ExpandCollapse directive for `invoke`: `state` "expand" /
+/// "collapse" (or absent for plain activation). Anything else is a typed
+/// argument error. Pure; unit-tested.
+fn expand_arg(v: Option<&Value>) -> Result<Option<bool>, String> {
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(x) => match py_str(x).to_lowercase().as_str() {
+            "expand" => Ok(Some(true)),
+            "collapse" => Ok(Some(false)),
+            s => Err(format!(
+                "unknown invoke state \"{s}\" (want expand|collapse)"
+            )),
+        },
+    }
+}
+
 // ---------------------------------------------------------------- the tool
 
 pub fn do_burst(
     actions: &[Value],
     background: Option<String>,
+    background_args: Option<Vec<String>>,
     focus_guard: bool,
     settle_ms: i64,
     dry_run: bool,
@@ -1558,9 +2340,10 @@ pub fn do_burst(
     let bg_mode = background.is_some() || hidden_mode;
     let (bg_hwnd, bg_error): (Option<i64>, Option<String>) = if hidden_mode {
         // Opt-in mode: `background` names the program to launch on a private
-        // desktop; its window is resolved with EnumDesktopWindows (never the
-        // owner's EnumWindows) and then driven through the same PostMessage
-        // branch below.
+        // desktop (`background_args` supplies argv, ignored on the plain
+        // background path); its window is resolved with EnumDesktopWindows
+        // (never the owner's EnumWindows) and then driven through the same
+        // PostMessage branch below.
         let prog = match background.as_deref() {
             None => Err(
                 "bad_window: desktop=\"hidden\" needs background to name the program to launch (e.g. exe:notepad.exe)"
@@ -1571,7 +2354,8 @@ pub fn do_burst(
         match prog {
             Err(e) => (None, Some(e)),
             Ok(p) => {
-                let h = crate::hidden::spawn(&p);
+                let empty: Vec<String> = Vec::new();
+                let h = crate::hidden::spawn(&p, background_args.as_ref().unwrap_or(&empty));
                 hidden_created = h.ready.created;
                 hidden_set_desktop = h.ready.set_desktop;
                 hidden_pid = h.ready.pid;
@@ -1625,6 +2409,14 @@ pub fn do_burst(
     };
 
     for (i, a) in actions.iter().enumerate() {
+        // P1b: the `do` action loop is cancellable between actions so a
+        // `notifications/cancelled` stops the burst promptly (no late reply).
+        if crate::cancel::cancelled() {
+            let mut m = base_entry(i, &Value::from("cancelled"), false, 0.0);
+            m.insert("error".to_string(), Value::from("cancelled"));
+            st.results.push(m);
+            break;
+        }
         let t0 = Instant::now();
         let ad = match a {
             Value::Object(m) if m.contains_key("type") => m,
@@ -1644,11 +2436,17 @@ pub fn do_burst(
         };
         let typ_v = ad["type"].clone();
         let typ = typ_v.as_str().unwrap_or("\u{0}");
+        // Element scroll resolves a UIA pattern on an explicit window (like
+        // invoke/set_value), never a posted message: keep it out of the
+        // background-PostMessage branch so it reaches its own dispatch,
+        // which targets bg_hwnd directly.
+        let has_scroll_element = typ == "scroll"
+            && matches!(ad.get("element"), Some(v) if py_truthy(v) && !py_str(v).trim().is_empty());
         let is_bg_postable = bg_mode
-            && matches!(
+            && (matches!(
                 typ,
-                "click" | "type" | "key" | "hotkey" | "down" | "up" | "move" | "drag" | "scroll"
-            );
+                "click" | "type" | "key" | "hotkey" | "down" | "up" | "move" | "drag"
+            ) || (typ == "scroll" && !has_scroll_element));
 
         let step: Result<Option<Map<String, Value>>, String> = (|| {
             // Gap-2 UIPI pre-check for foreground input: resolve the window
@@ -1737,6 +2535,35 @@ pub fn do_burst(
                 return Ok(Some(m));
             }
             if typ == "move" {
+                let has_abs = ad.contains_key("x") || ad.contains_key("y");
+                let has_rel = ad.contains_key("dx")
+                    || ad.contains_key("dy")
+                    || ad.get("relative").is_some_and(py_truthy);
+                if has_abs && has_rel {
+                    return Err(
+                        "move takes x/y or dx/dy, not both (absolute or relative, never mixed)"
+                            .to_string(),
+                    );
+                }
+                if has_rel {
+                    let dx = match ad.get("dx") {
+                        None | Some(Value::Null) => {
+                            return Err("relative move needs dx and dy (got only one)".to_string())
+                        }
+                        Some(v) => py_int(v).map_err(|_| key_err("dx"))?,
+                    };
+                    let dy = match ad.get("dy") {
+                        None | Some(Value::Null) => {
+                            return Err("relative move needs dx and dy (got only one)".to_string())
+                        }
+                        Some(v) => py_int(v).map_err(|_| key_err("dy"))?,
+                    };
+                    // No desktop gate: a relative nudge is legal from
+                    // anywhere, including outside the virtual desktop.
+                    st.pending.push(mi_move_rel(dx, dy)?);
+                    st.marked.push(i);
+                    return Ok(Some(base_entry(i, &typ_v, true, elapsed_ms(&t0))));
+                }
                 let mx = py_int(ad.get("x").unwrap_or(&Value::Null)).map_err(|_| key_err("x"))?;
                 let my = py_int(ad.get("y").unwrap_or(&Value::Null)).map_err(|_| key_err("y"))?;
                 require_on_desktop(mx, my)?;
@@ -1790,15 +2617,177 @@ pub fn do_burst(
                 return Ok(Some(base_entry(i, &typ_v, true, elapsed_ms(&t0))));
             }
             if typ == "scroll" {
-                if ad.contains_key("x") && ad.contains_key("y") {
+                // Element scroll is UIA-only: x/y alongside element is a
+                // typed error, never a queued mouse move. This check runs
+                // before any window resolution so it holds headless too.
+                let elem_sel: Option<Value> = match ad.get("element") {
+                    None | Some(Value::Null) => None,
+                    Some(v) if !py_truthy(v) || py_str(v).trim().is_empty() => None,
+                    Some(v) => Some(v.clone()),
+                };
+                let has_xy = ad.contains_key("x") || ad.contains_key("y");
+                if elem_sel.is_some() && has_xy {
+                    return Err(
+                        "scroll takes x/y or element, not both (element scroll never moves the mouse)"
+                            .to_string(),
+                    );
+                }
+                if elem_sel.is_none() && ad.contains_key("x") && ad.contains_key("y") {
                     let sx = py_int(&ad["x"])?;
                     let sy = py_int(&ad["y"])?;
                     require_on_desktop(sx, sy)?;
                     st.pending.push(mi_move(sx, sy));
                 }
                 let amt = opt_py_int(ad, "amount", 1)?;
-                let data = ((amt as i64).wrapping_mul(120) & 0xFFFFFFFF) as u32;
-                st.pending.push(mi_btn(M_WHEEL, data));
+                let axis = match ad.get("axis") {
+                    None | Some(Value::Null) => "v".to_string(),
+                    Some(v) => py_str(v).to_lowercase(),
+                };
+                // A non-empty `element` switches from the wheel to UIA
+                // ScrollPattern on the matched control. Absent/empty keeps
+                // the legacy wheel behavior.
+                if let Some(elem_v) = elem_sel {
+                    let (_, ferr) = st.flush();
+                    if let Some(fe) = ferr {
+                        fail_since_flush(&mut st.results, &mut st.marked, &fe, st.flush_uipi);
+                    } else {
+                        st.marked.clear();
+                    }
+                    let mut d = base_entry(i, &typ_v, false, 0.0);
+                    // A failed background resolution is terminal for the
+                    // element path: report it instead of falling back to
+                    // the foreground window (which could scroll an
+                    // unintended control).
+                    if bg_mode && (bg_error.is_some() || bg_hwnd.is_none()) {
+                        d.insert(
+                            "error".to_string(),
+                            Value::from(
+                                bg_error
+                                    .clone()
+                                    .unwrap_or("bad_window: no background target".to_string()),
+                            ),
+                        );
+                        d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
+                        return Ok(Some(d));
+                    }
+                    let tgt = match (bg_mode, bg_hwnd) {
+                        (true, Some(h)) => h,
+                        _ => fg_now(),
+                    };
+                    d.insert("target_hwnd".to_string(), Value::from(tgt));
+                    if tgt == 0 {
+                        d.insert(
+                            "error".to_string(),
+                            Value::from(
+                                "bad_window: scroll element needs a background target or a foreground window",
+                            ),
+                        );
+                        d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
+                        return Ok(Some(d));
+                    }
+                    if let Some(msg) = uipi_refusal(tgt) {
+                        d.insert("ok".to_string(), Value::from(false));
+                        d.insert("error".to_string(), Value::from(msg));
+                        d.insert("blocked_by_uipi".to_string(), Value::from(true));
+                        d.insert("resolution".to_string(), Value::from("uipi_blocked"));
+                        d.insert("via".to_string(), Value::from("none"));
+                        if dry_run {
+                            d.insert("dry_run".to_string(), Value::from(true));
+                        }
+                        d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
+                        return Ok(Some(d));
+                    }
+                    let model = element_model(tgt as HWND, crate::UIA_DEPTH_LIMIT, 0);
+                    if dry_run {
+                        d.insert("dry_run".to_string(), Value::from(true));
+                    }
+                    d.insert("backend".to_string(), Value::from(model.backend.clone()));
+                    let (entry, merr, mcands) =
+                        match_element(&model.entries, Some(&elem_v), ad.get("index"));
+                    if let Some(me) = merr {
+                        d.insert("error".to_string(), Value::from(me));
+                        d.insert(
+                            "resolution".to_string(),
+                            Value::from(if mcands.is_some() {
+                                "ambiguous"
+                            } else {
+                                "not-found"
+                            }),
+                        );
+                        if let Some(c) = mcands {
+                            d.insert(
+                                "candidates".to_string(),
+                                Value::from(c.into_iter().map(Value::Object).collect::<Vec<_>>()),
+                            );
+                        }
+                        if dry_run {
+                            d.insert("via".to_string(), Value::from("none"));
+                        }
+                        d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
+                        return Ok(Some(d));
+                    }
+                    let entry = entry.unwrap();
+                    if let Some(se) = check_expect_fp(ad, &entry, &py_str(&elem_v)) {
+                        d.insert("ok".to_string(), Value::from(false));
+                        d.insert("error".to_string(), Value::from(se));
+                        d.insert("resolution".to_string(), Value::from("stale"));
+                        d.insert("via".to_string(), Value::from("none"));
+                        d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
+                        return Ok(Some(d));
+                    }
+                    if dry_run {
+                        d.insert("ok".to_string(), Value::from(true));
+                        d.insert("resolution".to_string(), Value::from("found"));
+                        d.insert("element".to_string(), Value::from(element_pub_full(&entry)));
+                        d.insert("via".to_string(), Value::from("none"));
+                        d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
+                        return Ok(Some(d));
+                    }
+                    d.insert("element".to_string(), Value::from(element_pub_full(&entry)));
+                    d.insert("resolution".to_string(), Value::from("found"));
+                    if model.backend != "uia" {
+                        d.insert("ok".to_string(), Value::from(false));
+                        d.insert(
+                            "error".to_string(),
+                            Value::from(
+                                "scroll element needs the UIA backend (Win32 fallback has no ScrollPattern)",
+                            ),
+                        );
+                        d.insert("via".to_string(), Value::from("none"));
+                        d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
+                        return Ok(Some(d));
+                    }
+                    let (h, v) = match crate::uia::scroll_pattern_args(&axis, amt) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            d.insert("ok".to_string(), Value::from(false));
+                            d.insert("error".to_string(), Value::from(e));
+                            d.insert("via".to_string(), Value::from("none"));
+                            d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
+                            return Ok(Some(d));
+                        }
+                    };
+                    let (ok_v, via, verr) =
+                        crate::uia::uia_scroll(tgt, &entry_str(&entry, "path"), h, v);
+                    d.insert(
+                        "via".to_string(),
+                        Value::from(if via.is_empty() {
+                            "none".to_string()
+                        } else {
+                            via
+                        }),
+                    );
+                    d.insert("ok".to_string(), Value::from(ok_v));
+                    if let Some(e) = verr {
+                        if !ok_v {
+                            d.insert("error".to_string(), Value::from(e));
+                        }
+                    }
+                    d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
+                    return Ok(Some(d));
+                }
+                let (flag, data) = scroll_wheel(&axis, amt)?;
+                st.pending.push(mi_btn(flag, data));
                 st.marked.push(i);
                 return Ok(Some(base_entry(i, &typ_v, true, elapsed_ms(&t0))));
             }
@@ -1872,8 +2861,17 @@ pub fn do_burst(
                     st.marked.clear();
                     if ci + 1 < chunks.len() {
                         st.marked.push(i);
-                        if cm != 0 && !dry_run {
-                            std::thread::sleep(Duration::from_millis(cm as u64));
+                        if cm != 0 && !dry_run && sleep_cancellable(cm as u64) {
+                            d.insert("ok".to_string(), Value::from(false));
+                            d.insert("error".to_string(), Value::from("cancelled"));
+                            d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
+                            return Ok(Some(d));
+                        }
+                        if crate::cancel::cancelled() {
+                            d.insert("ok".to_string(), Value::from(false));
+                            d.insert("error".to_string(), Value::from("cancelled"));
+                            d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
+                            return Ok(Some(d));
                         }
                     }
                 }
@@ -1885,10 +2883,48 @@ pub fn do_burst(
                     None => String::new(),
                     Some(v) => py_str(v),
                 };
-                let vk = vk_of(&name)?;
-                st.pending.push(ki(vk, 0, 0));
-                st.pending.push(ki(vk, 0, K_UP));
-                st.marked.push(i);
+                let code = vk_of(&name)?;
+                let hold_ms = opt_py_int(ad, "hold_ms", 0)?;
+                let repeat = opt_py_int(ad, "repeat", 1)?;
+                let gap_ms = opt_py_int(ad, "gap_ms", 0)?;
+                if !(0..=60000).contains(&hold_ms) {
+                    return Err(format!("hold_ms out of range 0..60000 (got {hold_ms})"));
+                }
+                if !(1..=100).contains(&repeat) {
+                    return Err(format!("key repeat out of range 1..100 (got {repeat})"));
+                }
+                if !(0..=60000).contains(&gap_ms) {
+                    return Err(format!("gap_ms out of range 0..60000 (got {gap_ms})"));
+                }
+                if repeat == 1 && hold_ms == 0 {
+                    // Legacy fast path: one coalesced down/up pair.
+                    st.pending.extend(key_inputs(&code));
+                    st.marked.push(i);
+                    return Ok(Some(base_entry(i, &typ_v, true, elapsed_ms(&t0))));
+                }
+                // Held/repeated path: flush first so the hold sequence
+                // stands alone, then run the guarded repeat loop below.
+                // Dry-run assembles every event without sleeping.
+                let (_, ferr) = st.flush();
+                if let Some(fe) = ferr {
+                    fail_since_flush(&mut st.results, &mut st.marked, &fe, st.flush_uipi);
+                } else {
+                    st.marked.clear();
+                }
+                let t0h = Instant::now();
+                if let Some(d) = st.run_hold_repeats(
+                    i,
+                    &typ_v,
+                    &code,
+                    repeat,
+                    hold_ms as u64,
+                    gap_ms as u64,
+                    dry_run,
+                    t0h,
+                    &crate::cancel::cancelled,
+                ) {
+                    return Ok(Some(d));
+                }
                 return Ok(Some(base_entry(i, &typ_v, true, elapsed_ms(&t0))));
             }
             if typ == "hotkey" {
@@ -1903,16 +2939,11 @@ pub fn do_burst(
                 if keys.is_empty() {
                     return Err("hotkey needs non-empty keys".to_string());
                 }
-                let mut vks = Vec::with_capacity(keys.len());
+                let mut codes = Vec::with_capacity(keys.len());
                 for k in &keys {
-                    vks.push(vk_of(k)?);
+                    codes.push(vk_of(k)?);
                 }
-                for vk in &vks {
-                    st.pending.push(ki(*vk, 0, 0));
-                }
-                for vk in vks.iter().rev() {
-                    st.pending.push(ki(*vk, 0, K_UP));
-                }
+                st.pending.extend(hotkey_inputs(&codes));
                 st.marked.push(i);
                 return Ok(Some(base_entry(i, &typ_v, true, elapsed_ms(&t0))));
             }
@@ -1923,15 +2954,22 @@ pub fn do_burst(
                 } else {
                     st.marked.clear();
                 }
+                let text = match ad.get("text") {
+                    None => String::new(),
+                    Some(v) => py_str(v),
+                };
+                // Bound before anything else (including the dry_run
+                // early-return): over-cap input never touches the clipboard.
+                if let Err(e) = check_clip_len(text.chars().count()) {
+                    let mut m = base_entry(i, &typ_v, false, elapsed_ms(&t0));
+                    m.insert("error".to_string(), Value::from(e));
+                    return Ok(Some(m));
+                }
                 if dry_run {
                     let mut m = base_entry(i, &typ_v, true, elapsed_ms(&t0));
                     m.insert("dry_run".to_string(), Value::from(true));
                     return Ok(Some(m));
                 }
-                let text = match ad.get("text") {
-                    None => String::new(),
-                    Some(v) => py_str(v),
-                };
                 match clipboard_set(&text) {
                     Ok(_) => return Ok(Some(base_entry(i, &typ_v, true, elapsed_ms(&t0)))),
                     Err(e) => {
@@ -2017,7 +3055,7 @@ pub fn do_burst(
                 // UIA-first element model (puppet.py:1253-1331); element_model
                 // never raises here: an EnumChildWindows failure surfaces as
                 // an empty win32 list with an empty_reason.
-                let model = element_model(tgt as HWND);
+                let model = element_model(tgt as HWND, crate::UIA_DEPTH_LIMIT, 0);
                 if dry_run {
                     d.insert("dry_run".to_string(), Value::from(true));
                 }
@@ -2049,7 +3087,11 @@ pub fn do_burst(
                 let entry = entry.unwrap();
                 // Gap-1 freshness gate (before the dry_run early-return so a
                 // stale ref refuses under dry_run too, never resolving).
-                if let Some(se) = check_expect_fp(ad, &entry, &py_str(ad.get("element").unwrap_or(&Value::Null))) {
+                if let Some(se) = check_expect_fp(
+                    ad,
+                    &entry,
+                    &py_str(ad.get("element").unwrap_or(&Value::Null)),
+                ) {
                     d.insert("ok".to_string(), Value::from(false));
                     d.insert("error".to_string(), Value::from(se));
                     d.insert("resolution".to_string(), Value::from("stale"));
@@ -2057,6 +3099,25 @@ pub fn do_burst(
                     d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
                     return Ok(Some(d));
                 }
+                // Optional ExpandCollapse directive: validated before the
+                // dry_run early-return so a bad state fails typed under
+                // dry_run too, never resolving. With `state` set, ONLY the
+                // ExpandCollapse pattern fires — never Invoke (a SplitButton
+                // supports both, and Invoke could open a menu instead of
+                // collapsing it) and never the pixel-click fallback below.
+                let expand_req = match expand_arg(ad.get("state")) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let mut d = base_entry(i, &typ_v, false, 0.0);
+                        d.insert("target_hwnd".to_string(), Value::from(tgt));
+                        d.insert("backend".to_string(), Value::from(model.backend.clone()));
+                        d.insert("error".to_string(), Value::from(e));
+                        d.insert("resolution".to_string(), Value::from("not-found"));
+                        d.insert("via".to_string(), Value::from("none"));
+                        d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
+                        return Ok(Some(d));
+                    }
+                };
                 if dry_run {
                     d.insert("ok".to_string(), Value::from(true));
                     d.insert("resolution".to_string(), Value::from("found"));
@@ -2070,7 +3131,22 @@ pub fn do_burst(
                 // puppet.py:3253-3258: UIA backend fires pattern activation,
                 // Win32 backend BM_CLICKs. Pattern calls are implemented but
                 // marked `unconfirmed: activation needs owner permission`.
-                let (ok_v, mut via, mut verr) = if model.backend == "uia" {
+                let (ok_v, mut via, mut verr) = if let Some(want) = expand_req {
+                    if model.backend != "uia" {
+                        (
+                            false,
+                            "none".to_string(),
+                            Some(
+                                "invoke state needs the UIA backend (Win32 fallback has no ExpandCollapse)"
+                                    .to_string(),
+                            ),
+                        )
+                    } else {
+                        let (ok_e, via_e, err_e) =
+                            crate::uia::uia_expand_collapse(tgt, &entry_str(&entry, "path"), want);
+                        (ok_e, via_e, err_e)
+                    }
+                } else if model.backend == "uia" {
                     crate::uia::uia_activate(tgt, &entry_str(&entry, "path"))
                 } else {
                     win32_activate(&entry)
@@ -2079,7 +3155,10 @@ pub fn do_burst(
                     None => String::new(),
                     Some(v) => py_str(v).to_lowercase(),
                 };
-                if !ok_v && fallback == "click" {
+                // State-directed invoke is ExpandCollapse ONLY: a failed
+                // ExpandCollapse never falls through to a pixel click (the
+                // click would act while reporting the pattern's error away).
+                if !ok_v && fallback == "click" && expand_req.is_none() {
                     let rect: Vec<i64> = match entry.get("rect") {
                         Some(Value::Array(r)) => {
                             r.iter().map(|v| v.as_i64().unwrap_or(0)).collect()
@@ -2131,6 +3210,17 @@ pub fn do_burst(
                 if let Some(e) = verr {
                     if !ok_now {
                         d.insert("error".to_string(), Value::from(e));
+                    }
+                }
+                // ExpandCollapse read-back: the post-action state, for the
+                // live expand/collapse proof. Best-effort (a failed read
+                // omits the field rather than failing the action).
+                if expand_req.is_some() && model.backend == "uia" {
+                    if let Ok(st) = crate::uia::uia_expand_state(tgt, &entry_str(&entry, "path")) {
+                        d.insert(
+                            "expand_state".to_string(),
+                            Value::from(crate::uia::expand_state_name(st)),
+                        );
                     }
                 }
                 d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
@@ -2186,7 +3276,7 @@ pub fn do_burst(
                     d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
                     return Ok(Some(d));
                 }
-                let model = element_model(tgt as HWND);
+                let model = element_model(tgt as HWND, crate::UIA_DEPTH_LIMIT, 0);
                 if dry_run {
                     d.insert("dry_run".to_string(), Value::from(true));
                 }
@@ -2195,10 +3285,7 @@ pub fn do_burst(
                 // name:|auto_id:|path: forms as invoke; ref: stays rejected
                 // by match_element's unknown-kind path). Empty here gets the
                 // set_value-typed message instead of invoke's.
-                let elem_ok = match ad.get("element") {
-                    Some(v) if py_truthy(v) && !py_str(v).trim().is_empty() => true,
-                    _ => false,
-                };
+                let elem_ok = matches!(ad.get("element"), Some(v) if py_truthy(v) && !py_str(v).trim().is_empty());
                 if !elem_ok {
                     d.insert(
                         "error".to_string(),
@@ -2239,7 +3326,11 @@ pub fn do_burst(
                 // Gap-1 freshness gate (before text validation and the dry_run
                 // early-return: identity outranks arguments, and a stale ref
                 // refuses under dry_run too).
-                if let Some(se) = check_expect_fp(ad, &entry, &py_str(ad.get("element").unwrap_or(&Value::Null))) {
+                if let Some(se) = check_expect_fp(
+                    ad,
+                    &entry,
+                    &py_str(ad.get("element").unwrap_or(&Value::Null)),
+                ) {
                     d.insert("ok".to_string(), Value::from(false));
                     d.insert("error".to_string(), Value::from(se));
                     d.insert("resolution".to_string(), Value::from("stale"));
@@ -2306,6 +3397,13 @@ pub fn do_burst(
                 d.insert("ok".to_string(), Value::from(ok_v));
                 if ok_v {
                     d.insert("value_len".to_string(), Value::from(value_len));
+                    // RangeValue read-back: on numeric controls the write
+                    // went through RangeValue.SetValue, so report the value
+                    // UIA now holds. Absent on the ValuePattern path (no
+                    // pattern to read) and on read failure — never an error.
+                    if let Ok(v) = crate::uia::uia_range_value(tgt, &entry_str(&entry, "path")) {
+                        d.insert("value".to_string(), Value::from(v));
+                    }
                 }
                 if let Some(e) = verr {
                     if !ok_v {
@@ -2330,7 +3428,11 @@ pub fn do_burst(
                 } else if wait_n > 60000 {
                     return Err(format!("wait ms absurd (>60000): {wait_n}"));
                 }
-                std::thread::sleep(Duration::from_millis(wait_n as u64));
+                if sleep_cancellable(wait_n as u64) {
+                    let mut m = base_entry(i, &typ_v, false, elapsed_ms(&t0));
+                    m.insert("error".to_string(), Value::from("cancelled"));
+                    return Ok(Some(m));
+                }
                 return Ok(Some(base_entry(i, &typ_v, true, elapsed_ms(&t0))));
             }
             if typ == "wait_for" {
@@ -2409,8 +3511,8 @@ pub fn do_burst(
     } else {
         st.marked.clear();
     }
-    if settle_n != 0 {
-        std::thread::sleep(Duration::from_millis(settle_n as u64));
+    if settle_n != 0 && !crate::cancel::cancelled() {
+        sleep_cancellable(settle_n as u64);
     }
     let total_ms = t_all.elapsed().as_secs_f64() * 1000.0;
     let mut focus_after = fg_now();
@@ -2436,7 +3538,16 @@ pub fn do_burst(
     // Hidden-desktop finalization: capture + readback run on the hidden-desktop
     // thread, then the desktop is torn down and the proof recorded.
     let mut hidden_meta: Option<Map<String, Value>> = None;
+    let mut hidden_png: Option<Vec<u8>> = None;
     if let Some(owner) = hidden_owner.take() {
+        // Posted keyboard input is processed by the target's own message
+        // loop; give it a beat to land before the owner thread reads back,
+        // or the evidence read races the queue (notably the single-action
+        // hidden test). Hidden-only, live-only: dry_run posts nothing, and
+        // a failed setup has no target, so neither settles.
+        if !dry_run && bg_error.is_none() && hidden_hwnd.is_some() {
+            sleep_cancellable(1000);
+        }
         let mut hd = Map::new();
         hd.insert("requested".to_string(), Value::from("hidden"));
         hd.insert("desktop_name".to_string(), Value::from(hidden_name.clone()));
@@ -2484,6 +3595,24 @@ pub fn do_burst(
             "text_readback".to_string(),
             done.text.clone().map(Value::from).unwrap_or(Value::Null),
         );
+        // Same-fixture revert evidence: the target text before any driven
+        // input and after the revert, plus whether they match. Hidden mode
+        // only; plain `do` has no hidden_desktop object at all.
+        hd.insert(
+            "pre_drive_text".to_string(),
+            done.pre_drive_text
+                .clone()
+                .map(Value::from)
+                .unwrap_or(Value::Null),
+        );
+        hd.insert(
+            "post_revert_text".to_string(),
+            done.post_revert_text
+                .clone()
+                .map(Value::from)
+                .unwrap_or(Value::Null),
+        );
+        hd.insert("reverted".to_string(), Value::from(done.reverted));
         match done.capture.as_ref() {
             Some(c) => {
                 let mut cap = Map::new();
@@ -2500,6 +3629,12 @@ pub fn do_burst(
                         "png_b64".to_string(),
                         Value::from(base64::engine::general_purpose::STANDARD.encode(png)),
                     );
+                    // P3a: the same PNG also rides as a real MCP `image`
+                    // content block next to the text JSON (see the envelope
+                    // below); the base64-in-JSON stays for legacy clients.
+                    if c.ok && !png.is_empty() {
+                        hidden_png = Some(png.clone());
+                    }
                 }
                 if let Some(e) = c.error.as_ref() {
                     cap.insert("error".to_string(), Value::from(e.clone()));
@@ -2598,7 +3733,15 @@ pub fn do_burst(
     if let Some(hd) = hidden_meta {
         payload.insert("hidden_desktop".to_string(), Value::Object(hd));
     }
-    wrapped_text(&crate::py_dumps(&Value::Object(payload)))
+    let text = crate::py_dumps(&Value::Object(payload));
+    match hidden_png {
+        Some(png) if !png.is_empty() => crate::wrapped_text_with_image(
+            &text,
+            &base64::engine::general_purpose::STANDARD.encode(&png),
+            "image/png",
+        ),
+        _ => wrapped_text(&text),
+    }
 }
 
 #[cfg(test)]
@@ -2606,14 +3749,12 @@ mod tests {
     use super::*;
 
     fn burst_first(actions: &[Value]) -> Map<String, Value> {
-        let out = do_burst(actions, None, false, 0, true, None);
+        let out = do_burst(actions, None, None, false, 0, true, None);
         let outer: Value = serde_json::from_str(&out).expect("outer frame");
-        let inner = outer
+        let payload = outer
             .get("structuredContent")
-            .and_then(|s| s.get("result"))
-            .and_then(|r| r.as_str())
-            .expect("structured result");
-        let payload: Value = serde_json::from_str(inner).expect("payload");
+            .cloned()
+            .expect("structuredContent is the payload object");
         let results = payload
             .get("results")
             .and_then(|r| r.as_array())
@@ -2642,6 +3783,410 @@ mod tests {
         let actions = vec![serde_json::json!({"type": "click", "count": 2})];
         let first = burst_first(&actions);
         assert_eq!(first.get("ok"), Some(&Value::from(true)));
+    }
+
+    fn burst_payload(actions: &[Value]) -> Map<String, Value> {
+        let out = do_burst(actions, None, None, false, 0, true, None);
+        let outer: Value = serde_json::from_str(&out).expect("outer frame");
+        outer
+            .get("structuredContent")
+            .and_then(|v| v.as_object())
+            .expect("structuredContent is the payload object")
+            .clone()
+    }
+
+    #[test]
+    fn vk_of_reports_shift_from_layout_high_byte() {
+        // US layout: capitals and shifted symbols need Shift held.
+        assert_eq!(vk_of("A"), Ok(KeyCode::Vk(0x41, true)));
+        assert_eq!(vk_of("!"), Ok(KeyCode::Vk(0x31, true)));
+        assert_eq!(vk_of("+"), Ok(KeyCode::Vk(0xBB, true)));
+        assert_eq!(vk_of("a"), Ok(KeyCode::Vk(0x41, false)));
+        assert_eq!(vk_of("1"), Ok(KeyCode::Vk(0x31, false)));
+        assert_eq!(vk_of("="), Ok(KeyCode::Vk(0xBB, false)));
+        assert_eq!(vk_of("enter"), Ok(KeyCode::Vk(0x0D, false)));
+        assert_eq!(vk_of("F5"), Ok(KeyCode::Vk(0x74, false)));
+        assert!(vk_of("not_a_key_xyz").is_err());
+    }
+
+    #[test]
+    fn key_shift_wraps_in_dry_run_events() {
+        // `A` must coalesce to Shift-down, key down/up, Shift-up (4
+        // events); `a` stays a bare key pair (2 events).
+        let p = burst_payload(&[serde_json::json!({"type": "key", "name": "A"})]);
+        assert_eq!(p.get("events"), Some(&Value::from(4)));
+        let p = burst_payload(&[serde_json::json!({"type": "key", "name": "a"})]);
+        assert_eq!(p.get("events"), Some(&Value::from(2)));
+        // Shifted hotkey member wraps too: ctrl down, A-shift down, A up,
+        // shift up, ctrl up.
+        let p = burst_payload(&[serde_json::json!({"type": "hotkey", "keys": ["ctrl", "A"]})]);
+        assert_eq!(p.get("events"), Some(&Value::from(6)));
+    }
+
+    #[test]
+    fn expand_arg_parses_state_directive() {
+        assert_eq!(expand_arg(None), Ok(None));
+        assert_eq!(
+            expand_arg(Some(&Value::Null)),
+            Ok(None),
+            "explicit null state means plain activation"
+        );
+        assert_eq!(expand_arg(Some(&Value::from("expand"))), Ok(Some(true)));
+        assert_eq!(
+            expand_arg(Some(&Value::from("Collapse"))),
+            Ok(Some(false)),
+            "state matching is case-insensitive"
+        );
+        let e = expand_arg(Some(&Value::from("open"))).unwrap_err();
+        assert!(
+            e.contains("expand|collapse"),
+            "bad state must name the accepted values, got: {e}"
+        );
+    }
+
+    #[test]
+    fn invoke_state_validated_before_dry_run_return() {
+        // Dry-run must validate `state` before the early ok:true return:
+        // bogus state fails typed even though the element resolves.
+        let (fx, bg) = fixture_bg();
+        let _ = fx.hwnd();
+        let actions =
+            vec![serde_json::json!({"type": "invoke", "element": "name:OK", "state": "sideways"})];
+        let (_, first) = burst_bg(&actions, &bg, true);
+        assert_eq!(
+            first.get("ok"),
+            Some(&Value::from(false)),
+            "dry-run bogus state must fail, got: {first:?}"
+        );
+        assert!(
+            first
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .contains("expand|collapse"),
+            "dry-run bogus state must name the accepted values, got: {first:?}"
+        );
+    }
+
+    #[test]
+    fn invoke_state_expand_resolves_under_dry_run() {
+        // Valid state passes dry-run resolution (ok, found, no firing).
+        let (fx, bg) = fixture_bg();
+        let _ = fx.hwnd();
+        let actions =
+            vec![serde_json::json!({"type": "invoke", "element": "name:OK", "state": "expand"})];
+        let (_, first) = burst_bg(&actions, &bg, true);
+        assert_eq!(
+            first.get("ok"),
+            Some(&Value::from(true)),
+            "dry-run valid state must resolve, got: {first:?}"
+        );
+        assert_eq!(
+            first.get("resolution").and_then(|v| v.as_str()),
+            Some("found"),
+            "dry-run valid state must report found, got: {first:?}"
+        );
+    }
+
+    fn ki_pair(ev: &INPUT) -> (u16, u32) {
+        unsafe { (ev.Anonymous.ki.wVk, ev.Anonymous.ki.dwFlags) }
+    }
+
+    #[test]
+    fn key_inputs_shift_order_and_hotkey_reverse_release() {
+        // Shift must bracket the key: down, key down/up, up.
+        let seq = key_inputs(&KeyCode::Vk(0x41, true));
+        let got: Vec<(u16, u32)> = seq.iter().map(ki_pair).collect();
+        assert_eq!(
+            got,
+            vec![(VK_SHIFT, 0), (0x41, 0), (0x41, K_UP), (VK_SHIFT, K_UP)],
+            "shift must wrap the key, got: {got:?}"
+        );
+        let seq = key_inputs(&KeyCode::Vk(0x41, false));
+        let got: Vec<(u16, u32)> = seq.iter().map(ki_pair).collect();
+        assert_eq!(got, vec![(0x41, 0), (0x41, K_UP)]);
+        // Hotkey releases in reverse: ctrl down, shift down, A down, A up,
+        // shift up, ctrl up.
+        let codes = vec![KeyCode::Vk(0x11, false), KeyCode::Vk(0x41, true)];
+        let seq = hotkey_inputs(&codes);
+        let got: Vec<(u16, u32)> = seq.iter().map(ki_pair).collect();
+        assert_eq!(
+            got,
+            vec![
+                (0x11, 0),
+                (VK_SHIFT, 0),
+                (0x41, 0),
+                (0x41, K_UP),
+                (VK_SHIFT, K_UP),
+                (0x11, K_UP)
+            ],
+            "hotkey must press in order and release reversed, got: {got:?}"
+        );
+    }
+
+    #[test]
+    fn scroll_wheel_flag_data_and_bounds() {
+        assert_eq!(scroll_wheel("v", 1), Ok((M_WHEEL, 120)));
+        assert_eq!(scroll_wheel("v", -3), Ok((M_WHEEL, (-360i32) as u32)));
+        assert_eq!(scroll_wheel("h", 2), Ok((M_HWHEEL, 240)));
+        assert_eq!(scroll_wheel("h", -1), Ok((M_HWHEEL, (-120i32) as u32)));
+        assert!(scroll_wheel("x", 1).is_err());
+        assert!(scroll_wheel("v", 1001).is_err());
+        assert!(scroll_wheel("h", -1001).is_err());
+        assert!(scroll_wheel("v", 1000).is_ok());
+        assert!(scroll_wheel("h", -1000).is_ok());
+        // i64::MIN must not overflow past the bound via abs().
+        assert!(scroll_wheel("v", i64::MIN).is_err());
+        assert!(scroll_wheel("h", i64::MIN).is_err());
+        assert!(scroll_wheel("v", i64::MAX).is_err());
+    }
+
+    #[test]
+    fn scroll_axis_h_selects_horizontal_wheel_dry_run() {
+        // Dry run assembles the INPUT; ok:true proves the axis parsed.
+        // Flag identity is pinned by the scroll_wheel unit above.
+        let p = burst_payload(&[serde_json::json!({"type": "scroll", "amount": 2, "axis": "h"})]);
+        let results = p
+            .get("results")
+            .and_then(|r| r.as_array())
+            .expect("results");
+        assert_eq!(results[0].get("ok"), Some(&Value::from(true)));
+        assert_eq!(p.get("events"), Some(&Value::from(1)));
+        let p =
+            burst_payload(&[serde_json::json!({"type": "scroll", "amount": 2, "axis": "bogus"})]);
+        let results = p
+            .get("results")
+            .and_then(|r| r.as_array())
+            .expect("results");
+        assert_eq!(results[0].get("ok"), Some(&Value::from(false)));
+    }
+
+    fn mi_trip(ev: &INPUT) -> (i32, i32, u32) {
+        unsafe {
+            (
+                ev.Anonymous.mi.dx,
+                ev.Anonymous.mi.dy,
+                ev.Anonymous.mi.dwFlags,
+            )
+        }
+    }
+
+    #[test]
+    fn move_relative_builder_flags_and_payload() {
+        // Relative moves are raw signed deltas with M_MOVE only — never the
+        // absolute/virtual-desktop mapping.
+        let ev = mi_move_rel(120, -30).expect("in-range deltas");
+        assert_eq!(mi_trip(&ev), (120, -30, M_MOVE));
+        let ev = mi_move_rel(-32767, 32767).expect("bound extremes");
+        assert_eq!(mi_trip(&ev), (-32767, 32767, M_MOVE));
+        assert!(mi_move_rel(32768, 0).is_err(), "above bound must fail");
+        assert!(mi_move_rel(0, -32769).is_err(), "below bound must fail");
+        assert!(mi_move_rel(i64::MIN, 0).is_err(), "i64::MIN must fail");
+        assert!(mi_move_rel(0, i64::MAX).is_err(), "i64::MAX must fail");
+    }
+
+    #[test]
+    fn move_relative_dry_run_skips_desktop_gate() {
+        // In-range deltas far outside any desktop still dispatch (1 event).
+        let p = burst_payload(&[serde_json::json!({"type": "move", "dx": 30000, "dy": -30000})]);
+        let results = p
+            .get("results")
+            .and_then(|r| r.as_array())
+            .expect("results");
+        assert_eq!(results[0].get("ok"), Some(&Value::from(true)));
+        assert_eq!(p.get("events"), Some(&Value::from(1)));
+        // Absolute moves still hit the desktop gate.
+        let bad = burst_first(&[serde_json::json!({"type": "move", "x": 99999999, "y": 0})]);
+        assert_eq!(bad.get("ok"), Some(&Value::from(false)));
+        // Absolute and relative together are refused, never guessed.
+        let mixed =
+            burst_first(&[serde_json::json!({"type": "move", "x": 10, "y": 10, "dx": 1, "dy": 1})]);
+        assert_eq!(mixed.get("ok"), Some(&Value::from(false)));
+        // Only one delta is incomplete.
+        let half = burst_first(&[serde_json::json!({"type": "move", "dx": 5})]);
+        assert_eq!(half.get("ok"), Some(&Value::from(false)));
+    }
+
+    #[test]
+    fn key_repeat_dry_run_counts_events() {
+        // repeat=3 assembles 3 down/up pairs (6 events) with no sleeps.
+        let p = burst_payload(&[
+            serde_json::json!({"type": "key", "name": "a", "repeat": 3, "hold_ms": 10}),
+        ]);
+        let results = p
+            .get("results")
+            .and_then(|r| r.as_array())
+            .expect("results");
+        assert_eq!(results[0].get("ok"), Some(&Value::from(true)));
+        assert_eq!(p.get("events"), Some(&Value::from(6)));
+        // Default repeat is a single pair.
+        let p = burst_payload(&[serde_json::json!({"type": "key", "name": "a"})]);
+        assert_eq!(p.get("events"), Some(&Value::from(2)));
+    }
+
+    #[test]
+    fn key_hold_repeat_bounds_rejected() {
+        for bad in [
+            serde_json::json!({"type": "key", "name": "a", "repeat": 0}),
+            serde_json::json!({"type": "key", "name": "a", "repeat": 101}),
+            serde_json::json!({"type": "key", "name": "a", "hold_ms": 60001}),
+            serde_json::json!({"type": "key", "name": "a", "gap_ms": 60001}),
+            serde_json::json!({"type": "key", "name": "a", "hold_ms": -1}),
+        ] {
+            let first = burst_first(&[bad]);
+            assert_eq!(
+                first.get("ok"),
+                Some(&Value::from(false)),
+                "out-of-range hold/repeat must fail, got: {first:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn key_hold_cancel_releases_before_return() {
+        // Scripted cancellation on the 2nd hold-check: the 2nd down was
+        // already flushed, so the exit must emit its matching up —
+        // down+up per repeat, never a held key.
+        let calls = std::cell::Cell::new(0);
+        let pred = || {
+            let n = calls.get();
+            calls.set(n + 1);
+            n >= 1
+        };
+        let mut st = Burst {
+            pending: Vec::new(),
+            marked: Vec::new(),
+            results: Vec::new(),
+            calls: 0,
+            events: 0,
+            sendinput_ms: 0.0,
+            dry_run: true,
+            flush_uipi: false,
+        };
+        let typ_v = Value::from("key");
+        let code = vk_of("a").expect("a resolves");
+        let out = st.run_hold_repeats(0, &typ_v, &code, 3, 50, 10, true, Instant::now(), &pred);
+        let d = out.expect("cancelled run must return early");
+        assert_eq!(d.get("ok"), Some(&Value::from(false)));
+        assert!(
+            d.get("error").and_then(|v| v.as_str()) == Some("cancelled"),
+            "exit must be typed cancelled, got: {d:?}"
+        );
+        assert_eq!(
+            st.events, 4,
+            "cancel after a flushed down must still emit its up, events={}",
+            st.events
+        );
+    }
+
+    #[test]
+    fn scroll_element_dry_run_assembles_no_wheel() {
+        // Element scroll resolves instead of wheeling: dry run assembles
+        // zero INPUT events (no wheel queued), ok + found.
+        let (fx, bg) = fixture_bg();
+        let _ = fx.hwnd();
+        let out = do_burst(
+            &[serde_json::json!({"type": "scroll", "element": "name:OK", "axis": "h"})],
+            Some(bg),
+            None,
+            false,
+            0,
+            true,
+            None,
+        );
+        let outer: Value = serde_json::from_str(&out).expect("outer frame");
+        let payload = outer
+            .get("structuredContent")
+            .and_then(|v| v.as_object())
+            .expect("payload");
+        assert_eq!(payload.get("events"), Some(&Value::from(0)));
+        let first = payload
+            .get("results")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .expect("first result");
+        assert_eq!(first.get("ok"), Some(&Value::from(true)));
+    }
+
+    #[test]
+    fn scroll_element_without_pattern_is_typed() {
+        // The fixture OK button has no ScrollPattern: UIA-only pattern
+        // error, never a wheel fallback, never any input. Headless-safe:
+        // the pattern query fails before any actuation, on our own window.
+        let fx = crate::fixture::Fixture::new();
+        let _ = fx.hwnd();
+        let model = crate::shot::element_model(fx.hwnd(), crate::UIA_DEPTH_LIMIT, 0);
+        let (entry, merr, _) = match_element(&model.entries, Some(&Value::from("name:OK")), None);
+        assert!(merr.is_none(), "fixture must list OK, got: {merr:?}");
+        let entry = entry.expect("OK entry");
+        let path = entry_str(&entry, "path");
+        let (ok, via, err) = crate::uia::uia_scroll(fx.hwnd_i64(), &path, 4, 2);
+        assert!(!ok, "scroll without the pattern must fail");
+        let err = err.expect("typed error");
+        assert!(
+            err.contains("no ScrollPattern"),
+            "missing pattern must be named, got: {err}"
+        );
+        assert_eq!(via, "uia-scroll", "failure stays on the pattern path");
+    }
+
+    #[test]
+    fn scroll_element_bg_error_never_falls_back_to_foreground() {
+        // A failed background resolution is terminal: the element path
+        // must report the background error, never resolve fg_now.
+        let actions = vec![serde_json::json!({"type": "scroll", "element": "name:OK"})];
+        let out = do_burst(
+            &actions,
+            Some("title:NoSuchWindowXYZ".to_string()),
+            None,
+            false,
+            0,
+            true,
+            None,
+        );
+        let outer: Value = serde_json::from_str(&out).expect("outer frame");
+        let first = outer
+            .get("structuredContent")
+            .and_then(|v| v.get("results"))
+            .and_then(|r| r.as_array())
+            .and_then(|a| a.first())
+            .expect("first result");
+        assert_eq!(first.get("ok"), Some(&Value::from(false)));
+        let err = first.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            err.contains("NoSuchWindowXYZ"),
+            "must surface the background failure, not a foreground fallback, got: {err}"
+        );
+    }
+
+    #[test]
+    fn scroll_element_rejects_xy_without_mouse() {
+        // Element scroll is UIA-only: x/y alongside element is a typed
+        // error and queues no mouse movement.
+        let actions =
+            vec![serde_json::json!({"type": "scroll", "element": "name:OK", "x": 10, "y": 10})];
+        let out = do_burst(&actions, None, None, false, 0, true, None);
+        let outer: Value = serde_json::from_str(&out).expect("outer frame");
+        let payload = outer
+            .get("structuredContent")
+            .and_then(|v| v.as_object())
+            .expect("payload");
+        let first = payload
+            .get("results")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .expect("first result");
+        assert_eq!(first.get("ok"), Some(&Value::from(false)));
+        let err = first.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            err.contains("never moves the mouse"),
+            "x/y with element must be refused as mouse input, got: {err}"
+        );
+        assert_eq!(
+            payload.get("events"),
+            Some(&Value::from(0)),
+            "refused element scroll must queue nothing, got: {payload:?}"
+        );
     }
 
     #[test]
@@ -2680,6 +4225,231 @@ mod tests {
         assert!(
             err.contains("region must"),
             "huge region should hit the region guard, got: {err}"
+        );
+    }
+
+    #[test]
+    fn stable_region_i64_extremes_typed_error() {
+        // Verifier repro: MIN left edge must be a typed region error, never
+        // a debug panic (subtraction overflow) or release bypass.
+        let mut a = Map::new();
+        a.insert("kind".to_string(), Value::from("stable"));
+        a.insert(
+            "region".to_string(),
+            Value::from(vec![
+                Value::from(i64::MIN),
+                Value::from(0),
+                Value::from(5000),
+                Value::from(1),
+            ]),
+        );
+        a.insert("timeout_ms".to_string(), Value::from(1000));
+        let t0 = Instant::now();
+        let r = wait_for(&a, &t0);
+        assert_eq!(r.get("ok"), Some(&Value::from(false)));
+        let err = r.get("error").and_then(|e| e.as_str()).unwrap_or("");
+        assert!(
+            err.contains("region"),
+            "MIN-edge stable region must be a typed region error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn stable_region_bound_is_4096() {
+        // Memory bound: 5000px edges exceed the 4096 cap (not 16384).
+        let mut a = Map::new();
+        a.insert("kind".to_string(), Value::from("stable"));
+        a.insert(
+            "region".to_string(),
+            Value::from(vec![
+                Value::from(0),
+                Value::from(0),
+                Value::from(5000),
+                Value::from(5000),
+            ]),
+        );
+        a.insert("timeout_ms".to_string(), Value::from(1000));
+        let t0 = Instant::now();
+        let r = wait_for(&a, &t0);
+        assert_eq!(r.get("ok"), Some(&Value::from(false)));
+        let err = r.get("error").and_then(|e| e.as_str()).unwrap_or("");
+        assert!(
+            err.contains("4096"),
+            "5000px region must name the 4096 bound, got: {err}"
+        );
+    }
+
+    #[test]
+    fn monitor_for_point_picks_containing_monitor() {
+        let mons = vec![
+            [0, 0, 1920, 1080],
+            [1920, 0, 3840, 1080],
+            [-1920, 0, 0, 1080],
+        ];
+        assert_eq!(monitor_for_point(&mons, 100, 100), Some([0, 0, 1920, 1080]));
+        assert_eq!(
+            monitor_for_point(&mons, 2000, 500),
+            Some([1920, 0, 3840, 1080])
+        );
+        assert_eq!(
+            monitor_for_point(&mons, -100, 500),
+            Some([-1920, 0, 0, 1080]),
+            "negative-origin monitors must match"
+        );
+        assert_eq!(monitor_for_point(&mons, 9000, 9000), None);
+        assert_eq!(monitor_for_point(&[], 0, 0), None);
+    }
+
+    #[test]
+    fn check_clip_len_bounds() {
+        assert!(check_clip_len(0).is_ok());
+        assert!(check_clip_len(MAX_CLIP_CHARS).is_ok());
+        let e = check_clip_len(MAX_CLIP_CHARS + 1).unwrap_err();
+        assert!(
+            e.contains("1048576"),
+            "over-cap text must name the bound, got: {e}"
+        );
+    }
+
+    #[test]
+    fn clip_read_u16_requires_nul_within_bounds() {
+        let buf: Vec<u16> = "hi".encode_utf16().chain(std::iter::once(0)).collect();
+        let s = unsafe { clip_read_u16(buf.as_ptr(), 10).expect("nul-terminated") };
+        assert_eq!(s, "hi");
+        let no_nul: Vec<u16> = "hi".encode_utf16().collect();
+        assert!(
+            unsafe { clip_read_u16(no_nul.as_ptr(), 2) }.is_err(),
+            "missing NUL must fail instead of over-reading"
+        );
+        let mut big = vec!['x' as u16; 100];
+        big.push(0);
+        assert!(
+            unsafe { clip_read_u16(big.as_ptr(), 10) }.is_err(),
+            "scan must stop at the GlobalSize bound even with a later NUL"
+        );
+        let empty: Vec<u16> = vec![0];
+        assert_eq!(unsafe { clip_read_u16(empty.as_ptr(), 1).unwrap() }, "");
+    }
+
+    #[test]
+    fn clipboard_over_cap_set_rejected_before_touch() {
+        // Validation runs before OpenClipboard: the owner clipboard is
+        // never opened, and dry_run proves it without side effects.
+        let big = "x".repeat(1_048_576 + 1);
+        let actions = vec![serde_json::json!({"type": "clipboard_set", "text": big})];
+        let out = do_burst(&actions, None, None, false, 0, true, None);
+        let outer: Value = serde_json::from_str(&out).expect("outer frame");
+        let first = outer
+            .get("structuredContent")
+            .and_then(|v| v.get("results"))
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .expect("first result");
+        assert_eq!(first.get("ok"), Some(&Value::from(false)));
+        assert!(
+            first
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .contains("1048576"),
+            "over-cap set must name the bound, got: {first:?}"
+        );
+    }
+
+    #[test]
+    fn element_wait_predicate_truth_table() {
+        // Pure decision table: found/absent crossed with every state.
+        assert!(element_wait_satisfied("appear", true, None));
+        assert!(!element_wait_satisfied("appear", false, None));
+        assert!(element_wait_satisfied("disappear", false, None));
+        assert!(!element_wait_satisfied("disappear", true, None));
+        assert!(element_wait_satisfied("enabled", true, Some(true)));
+        assert!(!element_wait_satisfied("enabled", true, Some(false)));
+        assert!(!element_wait_satisfied("enabled", true, None));
+        assert!(!element_wait_satisfied("enabled", false, None));
+        assert!(element_wait_satisfied("disabled", true, Some(false)));
+        assert!(!element_wait_satisfied("disabled", true, Some(true)));
+        assert!(!element_wait_satisfied("disabled", true, None));
+        assert!(!element_wait_satisfied("disabled", false, Some(false)));
+        assert!(!element_wait_satisfied("bogus", true, Some(true)));
+        assert!(!element_wait_satisfied("bogus", false, None));
+    }
+
+    #[test]
+    fn element_wait_rejects_malformed_arguments() {
+        let t0 = Instant::now();
+        // Missing element.
+        let mut a = Map::new();
+        a.insert("kind".to_string(), Value::from("element"));
+        a.insert("timeout_ms".to_string(), Value::from(0));
+        let r = wait_for(&a, &t0);
+        assert_eq!(r.get("ok"), Some(&Value::from(false)));
+        assert!(
+            r.get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("")
+                .contains("needs \"element\""),
+            "missing element must be a typed per-action error, got: {r:?}"
+        );
+        // Unknown selector kind.
+        let mut b = Map::new();
+        b.insert("kind".to_string(), Value::from("element"));
+        b.insert("element".to_string(), Value::from("ref:12.3"));
+        b.insert("timeout_ms".to_string(), Value::from(0));
+        let r2 = wait_for(&b, &t0);
+        assert_eq!(r2.get("ok"), Some(&Value::from(false)));
+        assert!(
+            r2.get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("")
+                .contains("unknown element selector kind"),
+            "ref: must be rejected, got: {r2:?}"
+        );
+        // Unknown state.
+        let mut c = Map::new();
+        c.insert("kind".to_string(), Value::from("element"));
+        c.insert("element".to_string(), Value::from("name:OK"));
+        c.insert("state".to_string(), Value::from("hovered"));
+        c.insert("timeout_ms".to_string(), Value::from(0));
+        let r3 = wait_for(&c, &t0);
+        assert_eq!(r3.get("ok"), Some(&Value::from(false)));
+        // Unknown kind still lists element as accepted.
+        let mut d = Map::new();
+        d.insert("kind".to_string(), Value::from("nope_not_a_kind"));
+        let r4 = wait_for(&d, &t0);
+        assert_eq!(r4.get("ok"), Some(&Value::from(false)));
+        assert!(
+            r4.get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("")
+                .contains("stable|element"),
+            "unknown kind must name the accepted kinds, got: {r4:?}"
+        );
+    }
+
+    #[test]
+    fn element_wait_rejects_malformed_window_fast() {
+        // hwnd:/pid: with a non-integer value fails before any polling.
+        let t0 = Instant::now();
+        let mut a = Map::new();
+        a.insert("kind".to_string(), Value::from("element"));
+        a.insert("element".to_string(), Value::from("path:0"));
+        a.insert("window".to_string(), Value::from("hwnd:nope"));
+        a.insert("timeout_ms".to_string(), Value::from(0));
+        let t_start = Instant::now();
+        let r = wait_for(&a, &t0);
+        assert_eq!(r.get("ok"), Some(&Value::from(false)));
+        assert!(
+            r.get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("")
+                .contains("bad window selector"),
+            "unparseable hwnd must fail fast, got: {r:?}"
+        );
+        assert!(
+            t_start.elapsed() < Duration::from_secs(2),
+            "malformed window must not poll, took {:?}",
+            t_start.elapsed()
         );
     }
 
@@ -2789,14 +4559,12 @@ mod tests {
     // ---------------------------------------------------------------- set_value (4.3.0)
 
     fn burst_bg(actions: &[Value], bg: &str, dry_run: bool) -> (String, Map<String, Value>) {
-        let out = do_burst(actions, Some(bg.to_string()), false, 0, dry_run, None);
+        let out = do_burst(actions, Some(bg.to_string()), None, false, 0, dry_run, None);
         let outer: Value = serde_json::from_str(&out).expect("outer frame");
-        let inner = outer
+        let payload = outer
             .get("structuredContent")
-            .and_then(|s| s.get("result"))
-            .and_then(|r| r.as_str())
-            .expect("structured result");
-        let payload: Value = serde_json::from_str(inner).expect("payload");
+            .cloned()
+            .expect("structuredContent is the payload object");
         let first = payload
             .get("results")
             .and_then(|r| r.as_array())
@@ -2907,7 +4675,7 @@ mod tests {
         // controls (or 5s elapses and the caller asserts on the real state).
         let t0 = Instant::now();
         loop {
-            let m = element_model(hwnd);
+            let m = element_model(hwnd, crate::UIA_DEPTH_LIMIT, 0);
             let has_edit = m
                 .entries
                 .iter()
@@ -2928,7 +4696,7 @@ mod tests {
         let f = crate::fixture::Fixture::new();
         let bg = format!("hwnd:{}", f.hwnd_i64());
         wait_uia_stable(f.hwnd());
-        let model = element_model(f.hwnd());
+        let model = element_model(f.hwnd(), crate::UIA_DEPTH_LIMIT, 0);
         let mut edits: Vec<(i64, String)> = Vec::new();
         for e in &model.entries {
             if e.get("role").and_then(|v| v.as_str()).unwrap_or("") == "Edit" {
@@ -3107,7 +4875,7 @@ mod tests {
         // fresh walk must resolve (dry_run, no activation).
         let (fx, bg, _w, _ro) = edit_paths();
         let _ = fx.hwnd();
-        let model = crate::shot::element_model(fx.hwnd());
+        let model = crate::shot::element_model(fx.hwnd(), crate::UIA_DEPTH_LIMIT, 0);
         let entry = model
             .entries
             .iter()
@@ -3224,12 +4992,9 @@ mod tests {
             serde_json::json!({"type": "set_value", "element": "name:NoSuchXYZ", "text": "x"}),
             serde_json::json!({"type": "set_value", "element": format!("path:{wpath}"), "text": "after-failure"}),
         ];
-        let out = do_burst(&actions, Some(bg.to_string()), false, 0, false, None);
+        let out = do_burst(&actions, Some(bg.to_string()), None, false, 0, false, None);
         let outer: Value = serde_json::from_str(&out).expect("outer");
-        let inner = outer["structuredContent"]["result"]
-            .as_str()
-            .expect("inner");
-        let payload: Value = serde_json::from_str(inner).expect("payload");
+        let payload = outer["structuredContent"].clone();
         let res = payload["results"].as_array().expect("results");
         assert_eq!(res.len(), 2);
         assert_eq!(res[0].get("ok"), Some(&Value::from(false)));

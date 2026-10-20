@@ -1,13 +1,13 @@
 [package]
 name = "puppet"
-version = "4.4.1"
+version = "4.5.0"
 edition = "2021"
 license = "MIT"
 description = "Native-Rust Windows desktop-control MCP server over stdio: screenshot, windows, input, cursor."
 repository = "https://github.com/nathwn12/puppet"
 keywords = ["mcp", "windows", "automation", "desktop", "screenshot"]
 categories = ["command-line-utilities"]
-rust-version = "1.80"
+rust-version = "1.85"
 
 [dependencies]
 windows-sys = { version = "0.61", features = [
@@ -19,10 +19,12 @@ windows-sys = { version = "0.61", features = [
   "Win32_System_Com",
   "Win32_System_Diagnostics_Debug",
   "Win32_System_DataExchange",
+  "Win32_System_LibraryLoader",
   "Win32_System_Memory",
   "Win32_System_StationsAndDesktops",
   "Win32_System_Threading",
   "Win32_UI_Accessibility",
+  "Win32_UI_Controls",
   "Win32_UI_HiDpi",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_WindowsAndMessaging",
@@ -37,6 +39,7 @@ windows = { version = "0.61", features = [
   "Win32_Graphics_Direct3D11",
   "Win32_Graphics_Dxgi",
   "Win32_Graphics_Dxgi_Common",
+  "Win32_Graphics_Gdi",
 ] }
 
 # ---------------------------------------------------------------- build speed

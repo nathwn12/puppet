@@ -41,7 +41,7 @@ Wire the server into your MCP client config:
 Pin an exact version instead of `@latest`:
 
 ```powershell
-npx -y puppet-mcp@4.4.1 --doctor
+npx -y puppet-mcp@4.5.0 --doctor
 ```
 
 Build from source when you want the working tree instead of the Release binary:
@@ -92,6 +92,18 @@ You get back per-action results with `index`, `type`, `ok`, and `ms`. Remove `dr
 - Coordinates you can trust: every screenshot carries the map that turns image pixels back into screen pixels.
 - A small local footprint: one native binary over stdio; the launcher provisions it on the first serve run (no args) and re-verifies the cache each time.
 - Input that never asks first: `do` drives the real desktop, so preview a risky burst with `dry_run`; input aimed at an elevated window is refused with a typed error instead of failing silently.
+- A clipboard: `do` `clipboard_set` writes CF_UNICODETEXT (max 1_048_576 chars; over-cap sets fail typed before touching the clipboard) and `clipboard_get` reads it back truncated to 1_048_576 chars; treat `get` results as sensitive (they may be secrets) and never log them beyond the caller.
+- Memory caps: `wait_for` `stable` regions refuse edges over 4096px; screenshot grabs refuse edges over 8192px; at most 8 tool calls in flight (`-32603 Server busy` past that).
+- Element listing with pages: `elements` accepts `max_depth` (1..32, default 8) and `offset` (default 0); when the 200-entry cap is hit and more controls remain, `next_offset` names the next page, else null.
+- Element waits: `do` `wait_for` `kind:"element"` polls for a control (`window` selector optional, `element` name:|auto_id:|path:, `state` appear|disappear|enabled|disabled) with the same timeout semantics as the pixel and window waits.
+- Expand/collapse: `do` `invoke` accepts optional `state` `"expand"|"collapse"` driving only the UIA ExpandCollapse pattern (typed error without it; never Invoke), reporting `expand_state` after the action.
+- Numeric set: `do` `set_value` falls back to UIA RangeValue for sliders (numeric text, range-checked, read-only honored), reporting the live value in `value`.
+- Element text: `elements` with `detail:true` adds TextPattern `text` (capped at 4000 chars, `text_truncated` flag); text never participates in `fp`.
+- Relative mouse: `do` `move` accepts `dx`/`dy` (signed deltas, |d|<=32767, no desktop gate) as an alternative to absolute `x`/`y`; never both.
+- Held keys: `do` `key` accepts `hold_ms` (0..60000) and `repeat` (1..100, `gap_ms` between repeats) with cancellable sleeps; dry_run assembles every event without sleeping.
+- Element scroll: `do` `scroll` accepts `element` (name:|auto_id:|path:) driving UIA ScrollPattern with `axis` v|h instead of the wheel (typed error without the pattern); without it, the plain wheel.
+- Provenance: `puppet.py` names in `src` comments are the retired Python prototype this Rust server keeps wire- and behavior-parity with.
+- A headless mode: `do` with `desktop:"hidden"` launches one program on a private hidden desktop, drives it with best-effort posted input, captures it, and proves the teardown — see [docs/HEADLESS.md](docs/HEADLESS.md).
 
 ## Configure it
 
@@ -110,11 +122,12 @@ You override two paths with env vars:
 Pin an exact version with:
 
 ```powershell
-npx -y puppet-mcp@4.4.1 --doctor
+npx -y puppet-mcp@4.5.0 --doctor
 ```
 
 ## Requirements
 
+- Rust 1.85.0 (`rust-toolchain.toml` pins channel 1.85.0 with rustfmt + clippy; `Cargo.toml` rust-version 1.85).
 - Node 22.14 or newer (package engines, checked with `node --version`).
 - Windows x64. Other platforms are refused unless you set the diagnostics override named in `--help`.
 - The first serve run (no args) downloads the pinned server binary from the tagged GitHub Release, sha256-verified before and after extraction (docs/PUBLISHING.md).
@@ -125,7 +138,7 @@ npx -y puppet-mcp@4.4.1 --doctor
 - Package: https://www.npmjs.com/package/puppet-mcp
 - Releases: https://github.com/nathwn12/puppet/releases
 - Issues: https://github.com/nathwn12/puppet/issues
-- Docs: [publishing](docs/PUBLISHING.md)
+- Docs: [publishing](docs/PUBLISHING.md), [headless desktop](docs/HEADLESS.md)
 - License: MIT, see [LICENSE](LICENSE)
 
 <!-- nathwn12 house footer: identical in every repo. Do not edit. -->

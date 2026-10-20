@@ -19,9 +19,11 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
-use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, HDC, HMONITOR};
+use windows_sys::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+};
 use windows_sys::Win32::Security::{
-    GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+    GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
@@ -35,16 +37,21 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 // ---------------------------------------------------------------- constants
 
-const MODE_B_NOTE: &str = "Mode B (Windows.Graphics.Capture) deferred: needs a WinRT + D3D11 frame pool in this Python stack and is untestable on a single-monitor box here; Mode A covers the verifiable cases.";
+const MODE_B_NOTE: &str = "Mode B (Windows.Graphics.Capture) deferred: needs a WinRT + D3D11 frame pool in this Rust stack and is untestable on a single-monitor box here; Mode A covers the verifiable cases.";
 const FORMULA: &str = "screen_x = source.x + round((img_x + 0.5) * source.w / image.w); screen_y = source.y + round((img_y + 0.5) * source.h / image.h)";
-const SUPPORTED_VERSIONS: [&str; 4] = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
+const SUPPORTED_VERSIONS: [&str; 2] = ["2025-06-18", "2025-11-25"];
 const LATEST_VERSION: &str = "2025-11-25";
+const MODERN_VERSION: &str = "2026-07-28";
+// Batching is not implemented, so 2024-11-05 and 2025-03-26 are not advertised: do not serve what we do not support.
+const ALL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-11-25", "2026-07-28"];
 const ELEMENT_CAP: usize = 200;
 const UIA_DEPTH_LIMIT: i64 = 8;
 const WDA_EXCLUDEFROMCAPTURE: u32 = 0x11;
 
-static STALE: LazyLock<Mutex<HashMap<i64, (String, (i32, i32, i32, i32), u64)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Dedupe map for stale-window reports: window handle -> (tag, rect, seen).
+type StaleMap = HashMap<i64, (String, (i32, i32, i32, i32), u64)>;
+
+static STALE: LazyLock<Mutex<StaleMap>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 // ---------------------------------------------------------------- python numerics
 
@@ -170,7 +177,7 @@ pub(crate) fn is_int_overflow(v: &Value) -> bool {
                 } else {
                     const MAX_F: f64 = 9223372036854775808.0; // 2^63
                     const MIN_F: f64 = -9223372036854775808.0; // -2^63
-                    f < MIN_F || f >= MAX_F
+                    !(MIN_F..MAX_F).contains(&f)
                 }
             } else {
                 false
@@ -208,6 +215,49 @@ pub(crate) fn is_int_overflow(v: &Value) -> bool {
     }
 }
 
+/// Checked region rejection reason — shared by the screenshot region
+/// path and the `wait_for` stable path so both fail identically.
+#[derive(Debug)]
+pub(crate) enum RegionReject {
+    Order,
+    Extreme,
+    OverCap(i128, i128),
+}
+
+/// Checked `[left,top,right,bottom]` validator. Never subtracts in `i64`
+/// before validating, so `i64::MIN`/`MAX` inputs are typed errors in both
+/// debug and release (no panic, no wraparound bypass). Checks, in order:
+/// 1. `right>left` and `bottom>top` (inverted/empty rejected — comparison
+///    only, no subtraction);
+/// 2. every coordinate fits in `i32` (the BitBlt/GDI path casts to `i32` —
+///    anything outside would truncate, so extremes are rejected);
+/// 3. width/height computed in `i128`, rejected when over `max_edge`.
+///
+/// Returns `(w, h)` on success; the caller formats the cap message with
+/// its own prefix so screenshot vs stable keep their typed shapes.
+pub(crate) fn validate_region(
+    l: i64,
+    t: i64,
+    r: i64,
+    b: i64,
+    max_edge: i64,
+) -> Result<(i64, i64), RegionReject> {
+    if r <= l || b <= t {
+        return Err(RegionReject::Order);
+    }
+    for c in [l, t, r, b] {
+        if c < i32::MIN as i64 || c > i32::MAX as i64 {
+            return Err(RegionReject::Extreme);
+        }
+    }
+    let w = (r as i128) - (l as i128);
+    let h = (b as i128) - (t as i128);
+    if w > max_edge as i128 || h > max_edge as i128 {
+        return Err(RegionReject::OverCap(w, h));
+    }
+    Ok((w as i64, h as i64))
+}
+
 fn coerce_int(v: &Value) -> Result<i64, (String, String)> {
     if is_int_overflow(v) {
         return Err((int_overflow_err(v), "int_parsing".to_string()));
@@ -228,8 +278,7 @@ fn coerce_int(v: &Value) -> Result<i64, (String, String)> {
             } else if let Some(f) = n.as_f64() {
                 if f.is_finite()
                     && f.fract() == 0.0
-                    && f >= -9223372036854775808.0
-                    && f < 9223372036854775808.0
+                    && (-9223372036854775808.0..9223372036854775808.0).contains(&f)
                 {
                     Ok(f.trunc() as i64)
                 } else {
@@ -659,11 +708,44 @@ fn image_block(b64: &str, mime: &str) -> String {
     )
 }
 
+/// P2a envelope: `structuredContent` carries the real machine-readable value
+/// parsed from the tool's JSON text (never a double-encoded string), while
+/// the text block stays byte-identical for legacy clients. A top-level
+/// array (only `list_windows`) is namespaced as `{"windows": [...]}`; any
+/// other value passes through unchanged. `_meta.fastmcp` noise is gone.
+///
+/// No-fallback rule: only a JSON object or array payload yields a success
+/// envelope. Anything else (unparseable text, a JSON string/number/bool)
+/// is an internal error, never a `{"result": "<text>"}` string wrapper.
+fn structured_of_text(s: &str) -> Option<Value> {
+    match serde_json::from_str::<Value>(s) {
+        Ok(Value::Array(a)) => {
+            let mut m = Map::new();
+            m.insert("windows".to_string(), Value::Array(a));
+            Some(Value::Object(m))
+        }
+        Ok(v @ Value::Object(_)) => Some(v),
+        _ => None,
+    }
+}
+
 fn wrapped_text(s: &str) -> String {
+    let Some(sc) = structured_of_text(s) else {
+        return tool_err_blocks(&[text_block(
+            "error: internal: tool payload is not a JSON object or array",
+        )]);
+    };
+    // Tool-level failure is signalled by the payload itself: any object
+    // with top-level `"ok": false` (window resolve/action errors, elements
+    // resolve errors, cursor read errors) is `isError: true`. The `do`
+    // burst payload has no top-level `ok` (per-action `ok` only), so its
+    // continue-always contract stays `isError: false`.
+    let is_err = sc.get("ok") == Some(&Value::Bool(false));
     format!(
-        "{{\"_meta\":{{\"fastmcp\":{{\"wrap_result\":true}}}},\"content\":[{}],\"isError\":false,\"structuredContent\":{{\"result\":{}}}}}",
+        "{{\"content\":[{}],\"isError\":{},\"structuredContent\":{}}}",
         text_block(s),
-        jstr(s)
+        if is_err { "true" } else { "false" },
+        serde_json::to_string(&sc).unwrap()
     )
 }
 
@@ -671,8 +753,44 @@ fn err_result_text(s: &str) -> String {
     format!("{{\"content\":[{}],\"isError\":true}}", text_block(s))
 }
 
-fn ok_blocks(blocks: &[String]) -> String {
-    format!("{{\"content\":[{}],\"isError\":false}}", blocks.join(","))
+/// P3a hidden-desktop capture: the `do` text envelope plus the hidden
+/// PrintWindow PNG as a real MCP `image` content block alongside the JSON
+/// text (not only base64 inside it). `structuredContent` and `isError`
+/// follow the same rule as `wrapped_text`; the `do` payload has no
+/// top-level `ok`, so `isError` stays false. Only the hidden path with a
+/// successful capture uses this; every other `do` call keeps the exact
+/// P2a text-only envelope.
+pub(crate) fn wrapped_text_with_image(s: &str, png_b64: &str, mime: &str) -> String {
+    let Some(sc) = structured_of_text(s) else {
+        return tool_err_blocks(&[text_block(
+            "error: internal: tool payload is not a JSON object or array",
+        )]);
+    };
+    let is_err = sc.get("ok") == Some(&Value::Bool(false));
+    format!(
+        "{{\"content\":[{},{}],\"isError\":{},\"structuredContent\":{}}}",
+        text_block(s),
+        image_block(png_b64, mime),
+        if is_err { "true" } else { "false" },
+        serde_json::to_string(&sc).unwrap()
+    )
+}
+
+/// P2a screenshot success: text/image blocks byte-identical, plus the
+/// coordinate-map object as `structuredContent` (no base64 duplication;
+/// the optional third elements block stays text-only).
+pub fn screenshot_ok(blocks: &[String], cmap: &Value) -> String {
+    format!(
+        "{{\"content\":[{}],\"isError\":false,\"structuredContent\":{}}}",
+        blocks.join(","),
+        serde_json::to_string(cmap).unwrap()
+    )
+}
+
+/// P2a tool-level failure with pre-rendered content blocks (screenshot
+/// domain errors): text blocks byte-identical, `isError: true`.
+pub fn tool_err_blocks(blocks: &[String]) -> String {
+    format!("{{\"content\":[{}],\"isError\":true}}", blocks.join(","))
 }
 
 // ---------------------------------------------------------------- Win32 helpers
@@ -767,6 +885,13 @@ unsafe extern "system" fn mon_cb(_hm: HMONITOR, _hdc: HDC, rc: *mut RECT, lp: LP
     1
 }
 
+unsafe extern "system" fn mon_cb_h(hm: HMONITOR, _hdc: HDC, rc: *mut RECT, lp: LPARAM) -> BOOL {
+    let v = &mut *(lp as *mut Vec<([i32; 4], HMONITOR)>);
+    let r = &*rc;
+    v.push(([r.left, r.top, r.right, r.bottom], hm));
+    1
+}
+
 fn display_monitors() -> Vec<[i32; 4]> {
     let mut v: Vec<[i32; 4]> = Vec::new();
     unsafe {
@@ -778,6 +903,37 @@ fn display_monitors() -> Vec<[i32; 4]> {
         );
     }
     v
+}
+
+/// Same enumeration as `display_monitors`, paired with each monitor's
+/// `HMONITOR` handle. The existing signature stays (callers index rects);
+/// DXGI output matching uses this sibling.
+fn display_monitor_handles() -> Vec<([i32; 4], HMONITOR)> {
+    let mut v: Vec<([i32; 4], HMONITOR)> = Vec::new();
+    unsafe {
+        EnumDisplayMonitors(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            Some(mon_cb_h),
+            &mut v as *mut Vec<([i32; 4], HMONITOR)> as LPARAM,
+        );
+    }
+    v
+}
+
+/// `\\.\DISPLAYn` device name for a monitor handle, via `GetMonitorInfoW`.
+/// Empty when unreadable; callers treat that as "no device match".
+fn monitor_device(hmon: HMONITOR) -> String {
+    unsafe {
+        let mut info: MONITORINFOEXW = std::mem::zeroed();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if GetMonitorInfoW(hmon, &mut info as *mut _ as *mut MONITORINFO) == 0 {
+            return String::new();
+        }
+        let raw = info.szDevice;
+        let n = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+        String::from_utf16_lossy(&raw[..n])
+    }
 }
 
 fn virtual_rect() -> (i32, i32, i32, i32) {
@@ -1187,6 +1343,7 @@ fn parse_selector(sel: &str) -> (String, String) {
 }
 
 pub mod burst;
+pub mod cancel;
 pub mod cap;
 pub mod dxgi;
 #[cfg(test)]
@@ -1234,6 +1391,54 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn region_validator_table() {
+        // Order: inverted or empty edges reject without any subtraction.
+        assert!(matches!(
+            validate_region(5000, 0, 0, 100, 8192),
+            Err(RegionReject::Order)
+        ));
+        assert!(matches!(
+            validate_region(0, 100, 100, 0, 8192),
+            Err(RegionReject::Order)
+        ));
+        assert!(matches!(
+            validate_region(0, 0, 0, 100, 8192),
+            Err(RegionReject::Order)
+        ));
+        // Extremes: MIN/MAX (and any out-of-i32 coord) reject before cast.
+        assert!(matches!(
+            validate_region(i64::MIN, 0, i64::MAX, 100, 8192),
+            Err(RegionReject::Extreme)
+        ));
+        assert!(matches!(
+            validate_region(i64::MIN, 0, 5000, 1, 4096),
+            Err(RegionReject::Extreme)
+        ));
+        assert!(matches!(
+            validate_region(0, 0, i64::MAX, 100, 8192),
+            Err(RegionReject::Extreme)
+        ));
+        // Over-cap: width and height each reject with their sizes.
+        match validate_region(0, 0, 9000, 100, 8192) {
+            Err(RegionReject::OverCap(w, h)) => assert_eq!((w, h), (9000, 100)),
+            other => panic!("width>cap must reject OverCap, got: {other:?}"),
+        }
+        match validate_region(0, 0, 100, 5000, 4096) {
+            Err(RegionReject::OverCap(w, h)) => assert_eq!((w, h), (100, 5000)),
+            other => panic!("height>cap must reject OverCap, got: {other:?}"),
+        }
+        // Valid edge: exactly the cap passes.
+        assert_eq!(
+            validate_region(0, 0, 8192, 100, 8192).expect("edge==cap"),
+            (8192, 100)
+        );
+        assert_eq!(
+            validate_region(0, 0, 4096, 4096, 4096).expect("edge==cap"),
+            (4096, 4096)
+        );
+    }
+
+    #[test]
     fn overflow_string_rejected_with_shared_error() {
         let v = json!("9223372036854775808"); // i64::MAX + 1
         assert!(is_int_overflow(&v));
@@ -1267,5 +1472,21 @@ mod tests {
         assert_eq!(coerce_int(&json!(42)).unwrap(), 42);
         assert!(!is_int_overflow(&json!(42)));
         assert!(!is_int_overflow(&json!("-9223372036854775808")));
+    }
+
+    /// No-fallback rule: a non-JSON payload yields no structured value, and
+    /// the wrapped path is an `isError: true` envelope — never a success
+    /// envelope with a `{"result": "<text>"}` string payload.
+    #[test]
+    fn non_json_payload_is_error_never_string_result() {
+        assert!(structured_of_text("not json").is_none());
+        assert!(structured_of_text("\"just a string\"").is_none());
+        let out = wrapped_text("not json");
+        let v: Value = serde_json::from_str(&out).expect("outer frame");
+        assert_eq!(v.get("isError"), Some(&Value::from(true)));
+        assert!(
+            v.get("structuredContent").is_none(),
+            "error envelope carries no string-result structuredContent, got: {v}"
+        );
     }
 }

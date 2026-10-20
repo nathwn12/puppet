@@ -599,7 +599,7 @@ fn precompute(in_size: i32, out_size: i32, f: ResF) -> (Vec<(i32, i32)>, Vec<i32
 }
 
 fn clip8(ss: i64) -> u8 {
-    ((ss >> PREC_BITS).max(0).min(255)) as u8
+    (ss >> PREC_BITS).clamp(0, 255) as u8
 }
 
 /// Row-parallel driver for the resample passes below. Rows are independent
@@ -658,8 +658,7 @@ pub fn pillow_resample(src: &Img, dw: i32, dh: i32, f: ResF) -> Img {
                 let dc = chunk.as_mut_ptr();
                 for ry in 0..chunk.len() / stride {
                     let y = y0 + ry;
-                    for xx in 0..dwu {
-                        let (xmin, xmax) = b[xx];
+                    for (xx, &(xmin, xmax)) in b.iter().enumerate() {
                         let mut s0: i64 = 1 << (PREC_BITS - 1);
                         let mut s1: i64 = 1 << (PREC_BITS - 1);
                         let mut s2: i64 = 1 << (PREC_BITS - 1);
@@ -764,8 +763,7 @@ pub fn pillow_resample(src: &Img, dw: i32, dh: i32, f: ResF) -> Img {
                 let dc = chunk.as_mut_ptr();
                 for ry in 0..chunk.len() / stride {
                     let y = y0 + ry;
-                    for xx in 0..dwu {
-                        let (xmin, xmax) = b[xx];
+                    for (xx, &(xmin, xmax)) in b.iter().enumerate() {
                         let mut s0: i64 = 1 << (PREC_BITS - 1);
                         let mut s1: i64 = 1 << (PREC_BITS - 1);
                         let mut s2: i64 = 1 << (PREC_BITS - 1);
@@ -860,6 +858,10 @@ pub fn encode_jpeg(img: &Img, q: u8) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
+/// Finalize output: encoded bytes, image w/h, applied scale, resolved
+/// format, clamped quality.
+type Finalized = (Vec<u8>, i64, i64, f64, String, i64);
+
 /// Shared long-edge clamp + grid + encode. Returns (data, iw, ih, scale, f, q).
 pub fn finalize(
     mut img: Img,
@@ -867,7 +869,7 @@ pub fn finalize(
     fmt: &str,
     quality: Option<i64>,
     grid: bool,
-) -> Result<(Vec<u8>, i64, i64, f64, String, i64), String> {
+) -> Result<Finalized, String> {
     let mp = match max_px {
         None => None,
         Some(m) => {
@@ -890,10 +892,7 @@ pub fn finalize(
     if f != "png" && f != "jpeg" {
         return Err("error: bad_fmt: fmt must be \"png\" or \"jpeg\"".to_string());
     }
-    let mut q: i64 = match quality {
-        None => 80,
-        Some(qq) => qq,
-    };
+    let mut q: i64 = quality.unwrap_or(80);
     q = q.clamp(1, 100);
     let (sw, sh) = (img.w, img.h);
     let (mut iw, mut ih) = (sw as i64, sh as i64);

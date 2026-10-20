@@ -1,7 +1,8 @@
 //! Build-time provenance stamp: the exact commit this binary was built from.
 //!
-//! The repo has no CI, so a deployed `puppet.exe` has no other way to say where
-//! it came from; `puppet --version` prints these values, which makes binary
+//! The repo has CI (.github/workflows/ci.yml: fmt, clippy, gitleaks,
+//! build, test), so a deployed `puppet.exe` still carries where it came
+//! from; `puppet --version` prints these values, which makes binary
 //! currency and dirty-tree builds re-measurable against `git rev-parse HEAD`.
 //!
 //! The rerun set below is explicit rather than left to cargo's "any file in the
