@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 use windows::core::Interface;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::{
-    D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0,
+    D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0,
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
@@ -46,8 +46,8 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Dxgi::{
-    IDXGIDevice, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST,
-    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+    CreateDXGIFactory1, IDXGIAdapter, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
+    DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
 };
 
 struct Session {
@@ -71,7 +71,7 @@ enum Slot {
 const DEAD_COOLDOWN: Duration = Duration::from_secs(5);
 
 thread_local! {
-    static SLOTS: RefCell<HashMap<u32, Slot>> = RefCell::new(HashMap::new());
+    static SLOTS: RefCell<HashMap<(u32, u32), Slot>> = RefCell::new(HashMap::new());
 }
 
 enum GrabFail {
@@ -80,38 +80,55 @@ enum GrabFail {
     Other(String),
 }
 
-fn create_device() -> windows::core::Result<(ID3D11Device, ID3D11DeviceContext)> {
+/// Driver type for device creation: an explicit adapter requires UNKNOWN
+/// (HARDWARE with an adapter fails the probe with 0x80070057); the legacy
+/// default path keeps HARDWARE.
+fn driver_type_for(explicit_adapter: bool) -> D3D_DRIVER_TYPE {
+    if explicit_adapter {
+        D3D_DRIVER_TYPE_UNKNOWN
+    } else {
+        D3D_DRIVER_TYPE_HARDWARE
+    }
+}
+
+/// Device creation, bound to one enumerated adapter. Failure is Err (the
+/// caller falls back to GDI).
+fn create_device_on(
+    adapter: Option<&IDXGIAdapter>,
+) -> windows::core::Result<(ID3D11Device, ID3D11DeviceContext)> {
     let levels = [D3D_FEATURE_LEVEL_11_0];
-    for driver in [D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP] {
-        let mut dev: Option<ID3D11Device> = None;
-        let mut ctx: Option<ID3D11DeviceContext> = None;
-        let r = unsafe {
-            D3D11CreateDevice(
-                None,
-                driver,
-                HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                Some(&levels),
-                D3D11_SDK_VERSION,
-                Some(&mut dev),
-                None,
-                Some(&mut ctx),
-            )
-        };
-        if r.is_ok() {
-            if let (Some(d), Some(c)) = (dev, ctx) {
-                return Ok((d, c));
-            }
+    let mut dev: Option<ID3D11Device> = None;
+    let mut ctx: Option<ID3D11DeviceContext> = None;
+    let r = unsafe {
+        D3D11CreateDevice(
+            adapter,
+            driver_type_for(adapter.is_some()),
+            HMODULE::default(),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            Some(&levels),
+            D3D11_SDK_VERSION,
+            Some(&mut dev),
+            None,
+            Some(&mut ctx),
+        )
+    };
+    if r.is_ok() {
+        if let (Some(d), Some(c)) = (dev, ctx) {
+            return Ok((d, c));
         }
     }
     Err(windows::core::Error::from_win32())
 }
 
-fn open_session(output: u32) -> windows::core::Result<Session> {
-    let (dev, ctx) = create_device()?;
-    let dxgi_dev: IDXGIDevice = dev.cast()?;
-    let adapter = unsafe { dxgi_dev.GetAdapter()? };
-    let output = unsafe { adapter.EnumOutputs(output)? };
+fn open_session(adapter_idx: u32, output_idx: u32) -> windows::core::Result<Session> {
+    // Enumerate to the MATCHED adapter and create the device on it — never
+    // the default adapter by flattened index (a matched monitor could
+    // otherwise fail or address another adapter's output).
+    let factory: windows::Win32::Graphics::Dxgi::IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
+    let adapter1 = unsafe { factory.EnumAdapters1(adapter_idx)? };
+    let adapter: IDXGIAdapter = adapter1.cast()?;
+    let (dev, ctx) = create_device_on(Some(&adapter))?;
+    let output = unsafe { adapter.EnumOutputs(output_idx)? };
     let out1: IDXGIOutput1 = output.cast()?;
     let dup = unsafe { out1.DuplicateOutput(&dev)? };
     Ok(Session {
@@ -219,25 +236,151 @@ fn check_size(img: &Img, w: i32, h: i32) -> Result<(), String> {
     Ok(())
 }
 
-/// Grab the full `output` desktop (expected size `w`x`h`). Err means
+/// One enumerated DXGI output: desktop rect, owning monitor handle, and
+/// device name, plus the (adapter, output) pair for adapter-aware session
+/// creation and cache lookup — never a flattened index.
+#[derive(Debug, Clone)]
+pub struct DxgiOutput {
+    pub adapter: u32,
+    pub output: u32,
+    pub rect: [i32; 4],
+    pub hmon: i64,
+    pub device: String,
+}
+
+/// Enumerate every DXGI output across adapters. Err means "no DXGI
+/// enumeration" (caller falls back to GDI, never surfaced to the wire).
+pub fn dxgi_outputs() -> Result<Vec<DxgiOutput>, String> {
+    let factory: windows::Win32::Graphics::Dxgi::IDXGIFactory1 =
+        unsafe { CreateDXGIFactory1().map_err(|e| format!("dxgi factory: {e}"))? };
+    let mut out = Vec::new();
+    let mut ai = 0u32;
+    loop {
+        let adapter = match unsafe { factory.EnumAdapters1(ai) } {
+            Ok(a) => a,
+            Err(_) => break,
+        };
+        let mut oi = 0u32;
+        loop {
+            let output = match unsafe { adapter.EnumOutputs(oi) } {
+                Ok(o) => o,
+                Err(_) => break,
+            };
+            let desc = unsafe {
+                output
+                    .GetDesc()
+                    .map_err(|e| format!("dxgi output desc: {e}"))?
+            };
+            let r = desc.DesktopCoordinates;
+            let raw = desc.DeviceName;
+            let n = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+            out.push(DxgiOutput {
+                adapter: ai,
+                output: oi,
+                rect: [r.left, r.top, r.right, r.bottom],
+                hmon: desc.Monitor.0 as i64,
+                device: String::from_utf16_lossy(&raw[..n]),
+            });
+            oi += 1;
+        }
+        ai += 1;
+    }
+    if out.is_empty() {
+        return Err("dxgi: no outputs enumerated".to_string());
+    }
+    Ok(out)
+}
+
+/// Match a requested monitor to a DXGI output (adapter, output) pair.
+/// Rules, in order:
+/// (a) desktop-rect equality, (b) owning-monitor handle equality,
+/// (c) device-name equality (case-insensitive), (d) unique size match
+/// (either orientation — a 90/270-rotated output swaps w/h).
+/// Every tier must match EXACTLY one output: clones sharing a rect, a
+/// Monitor handle, or a device name are Err, as are duplicate sizes and
+/// total misses. The caller falls back to GDI with a "dxgi output
+/// unmatched" note rather than serve a wrong monitor (a stale cache hit
+/// would poison the session).
+pub fn pick_output(
+    rect: [i32; 4],
+    hmon: i64,
+    device: &str,
+    outputs: &[DxgiOutput],
+) -> Result<(u32, u32), String> {
+    let pair = |o: &DxgiOutput| (o.adapter, o.output);
+    let rect_hits: Vec<&DxgiOutput> = outputs.iter().filter(|o| o.rect == rect).collect();
+    match rect_hits.len() {
+        1 => return Ok(pair(rect_hits[0])),
+        n if n > 1 => {
+            return Err(format!("dxgi rect {rect:?} matches {n} outputs (clone?)"));
+        }
+        _ => {}
+    }
+    if hmon != 0 {
+        let hmon_hits: Vec<&DxgiOutput> = outputs
+            .iter()
+            .filter(|o| o.hmon != 0 && o.hmon == hmon)
+            .collect();
+        match hmon_hits.len() {
+            1 => return Ok(pair(hmon_hits[0])),
+            n if n > 1 => return Err(format!("dxgi monitor handle matches {n} outputs")),
+            _ => {}
+        }
+    }
+    if !device.is_empty() {
+        let dev_hits: Vec<&DxgiOutput> = outputs
+            .iter()
+            .filter(|o| o.device.eq_ignore_ascii_case(device))
+            .collect();
+        match dev_hits.len() {
+            1 => return Ok(pair(dev_hits[0])),
+            n if n > 1 => {
+                return Err(format!("dxgi device {device} matches {n} outputs"));
+            }
+            _ => {}
+        }
+    }
+    let (gw, gh) = (rect[2] - rect[0], rect[3] - rect[1]);
+    let mut sized: Vec<&DxgiOutput> = outputs
+        .iter()
+        .filter(|o| {
+            let (w, h) = (o.rect[2] - o.rect[0], o.rect[3] - o.rect[1]);
+            (w == gw && h == gh) || (w == gh && h == gw)
+        })
+        .collect();
+    sized.dedup_by_key(|o| (o.adapter, o.output));
+    match sized.len() {
+        0 => Err(format!("no dxgi output matches rect {rect:?}")),
+        1 => Ok((sized[0].adapter, sized[0].output)),
+        _ => Err(format!(
+            "dxgi outputs ambiguous for {gw}x{gh} ({} same-size outputs)",
+            sized.len()
+        )),
+    }
+}
+
+/// Grab the full desktop of the matched `(adapter, output)` pair (expected
+/// size `w`x`h`). The session is opened on the matched adapter and cached
+/// per pair — never the default adapter by flattened index. Err means
 /// "fall back to GDI" (never surfaced to the wire).
-pub fn dxgi_grab(output: u32, w: i32, h: i32) -> Result<Img, String> {
+pub fn dxgi_grab(adapter: u32, output: u32, w: i32, h: i32) -> Result<Img, String> {
+    let key = (adapter, output);
     SLOTS.with(|cell| {
         let mut slots = cell.borrow_mut();
-        if let Some(Slot::Dead(t)) = slots.get(&output) {
+        if let Some(Slot::Dead(t)) = slots.get(&key) {
             if t.elapsed() < DEAD_COOLDOWN {
                 return Err("dxgi unavailable (cooldown)".to_string());
             }
-            slots.remove(&output);
+            slots.remove(&key);
         }
-        if !slots.contains_key(&output) {
-            match open_session(output) {
+        if let std::collections::hash_map::Entry::Vacant(e) = slots.entry(key) {
+            match open_session(adapter, output) {
                 Ok(s) => {
-                    slots.insert(output, Slot::Live(s));
+                    e.insert(Slot::Live(s));
                 }
-                Err(e) => {
-                    slots.insert(output, Slot::Dead(Instant::now()));
-                    return Err(format!("dxgi session unavailable: {e}"));
+                Err(err) => {
+                    e.insert(Slot::Dead(Instant::now()));
+                    return Err(format!("dxgi session unavailable: {err}"));
                 }
             }
         }
@@ -245,7 +388,7 @@ pub fn dxgi_grab(output: u32, w: i32, h: i32) -> Result<Img, String> {
         // find no new frame, so allow one settle + retry before GDI fallback.
         for attempt in 0..2 {
             let r = {
-                let slot = slots.get_mut(&output).unwrap();
+                let slot = slots.get_mut(&key).unwrap();
                 let Slot::Live(ses) = slot else {
                     return Err("dxgi unavailable (cooldown)".to_string());
                 };
@@ -254,7 +397,7 @@ pub fn dxgi_grab(output: u32, w: i32, h: i32) -> Result<Img, String> {
             match r {
                 Ok(img) => {
                     check_size(&img, w, h)?;
-                    let slot = slots.get_mut(&output).unwrap();
+                    let slot = slots.get_mut(&key).unwrap();
                     let Slot::Live(ses) = slot else {
                         return Err("dxgi unavailable (cooldown)".to_string());
                     };
@@ -266,11 +409,11 @@ pub fn dxgi_grab(output: u32, w: i32, h: i32) -> Result<Img, String> {
                     return Ok(img);
                 }
                 Err(GrabFail::AccessLost) => {
-                    slots.remove(&output);
+                    slots.remove(&key);
                     return Err("dxgi access lost".to_string());
                 }
                 Err(GrabFail::Timeout) => {
-                    let slot = slots.get_mut(&output).unwrap();
+                    let slot = slots.get_mut(&key).unwrap();
                     let Slot::Live(ses) = slot else {
                         return Err("dxgi unavailable (cooldown)".to_string());
                     };
@@ -315,6 +458,233 @@ mod tests {
     #[test]
     fn matching_size_passes() {
         assert!(check_size(&img(1920, 1080), 1920, 1080).is_ok());
+    }
+
+    #[test]
+    fn driver_type_for_explicit_adapter_is_unknown() {
+        // Probe result: HARDWARE with an explicit adapter fails device
+        // creation (0x80070057); UNKNOWN succeeds (0x0).
+        assert_eq!(driver_type_for(true), D3D_DRIVER_TYPE_UNKNOWN);
+        assert_eq!(driver_type_for(false), D3D_DRIVER_TYPE_HARDWARE);
+    }
+
+    fn two_outputs() -> Vec<DxgiOutput> {
+        vec![
+            DxgiOutput {
+                adapter: 0,
+                output: 0,
+                rect: [0, 0, 1920, 1080],
+                hmon: 11,
+                device: "\\\\.\\DISPLAY1".to_string(),
+            },
+            DxgiOutput {
+                adapter: 0,
+                output: 1,
+                rect: [1920, 0, 3840, 1080],
+                hmon: 22,
+                device: "\\\\.\\DISPLAY2".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn pick_output_exact_rect_wins() {
+        let outs = two_outputs();
+        assert_eq!(
+            pick_output([1920, 0, 3840, 1080], 0, "", &outs),
+            Ok((0, 1)),
+            "exact desktop-rect match must select that output"
+        );
+    }
+
+    #[test]
+    fn pick_output_hmon_wins_without_rect() {
+        // Stale rect (moved monitor): the handle still identifies it.
+        let outs = two_outputs();
+        assert_eq!(
+            pick_output([0, 0, 1, 1], 22, "", &outs),
+            Ok((0, 1)),
+            "HMONITOR match must select that output"
+        );
+    }
+
+    #[test]
+    fn pick_output_device_name_wins_without_rect_or_hmon() {
+        let outs = two_outputs();
+        assert_eq!(
+            pick_output([0, 0, 1, 1], 0, "\\\\.\\DISPLAY2", &outs),
+            Ok((0, 1)),
+            "device-name match (case-insensitive) must select that output"
+        );
+        assert_eq!(
+            pick_output([0, 0, 1, 1], 0, "\\\\.\\display1", &outs),
+            Ok((0, 0)),
+            "device-name match must ignore case"
+        );
+    }
+
+    #[test]
+    fn pick_output_unique_size_matches() {
+        let outs = vec![
+            DxgiOutput {
+                adapter: 0,
+                output: 0,
+                rect: [0, 0, 1920, 1080],
+                hmon: 0,
+                device: String::new(),
+            },
+            DxgiOutput {
+                adapter: 0,
+                output: 1,
+                rect: [0, 0, 2560, 1440],
+                hmon: 0,
+                device: String::new(),
+            },
+        ];
+        assert_eq!(
+            pick_output([9, 9, 9 + 2560, 9 + 1440], 0, "", &outs),
+            Ok((0, 1)),
+            "a unique size must identify the output without identity data"
+        );
+    }
+
+    #[test]
+    fn pick_output_rotated_swap_matches() {
+        // 90/270-degree rotation swaps w/h: a portrait request matches the
+        // landscape output when it is the only size candidate.
+        let outs = vec![DxgiOutput {
+            adapter: 0,
+            output: 0,
+            rect: [0, 0, 1920, 1080],
+            hmon: 0,
+            device: String::new(),
+        }];
+        assert_eq!(
+            pick_output([0, 0, 1080, 1920], 0, "", &outs),
+            Ok((0, 0)),
+            "swapped w/h must match a lone rotated output"
+        );
+    }
+
+    #[test]
+    fn pick_output_duplicate_size_is_err() {
+        // The old display-index assumption would serve output 0 here and a
+        // same-size wrong monitor would pass check_size: never do that.
+        let outs = two_outputs();
+        let r = pick_output([7, 7, 7 + 1920, 7 + 1080], 0, "", &outs);
+        assert!(
+            r.is_err(),
+            "duplicate same-size outputs with no identity match must Err, got: {r:?}"
+        );
+    }
+
+    #[test]
+    fn pick_output_no_match_is_err() {
+        let outs = two_outputs();
+        let r = pick_output([0, 0, 800, 600], 0, "", &outs);
+        assert!(r.is_err(), "nothing matching must Err, got: {r:?}");
+    }
+
+    fn two_adapters() -> Vec<DxgiOutput> {
+        vec![
+            DxgiOutput {
+                adapter: 0,
+                output: 0,
+                rect: [0, 0, 1920, 1080],
+                hmon: 11,
+                device: "\\\\.\\DISPLAY1".to_string(),
+            },
+            // Same per-adapter output index on a second adapter: a
+            // flattened index would address output 1 on adapter 0 instead.
+            DxgiOutput {
+                adapter: 1,
+                output: 0,
+                rect: [1920, 0, 3840, 1080],
+                hmon: 22,
+                device: "\\\\.\\DISPLAY2".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn pick_output_preserves_adapter_pair() {
+        let outs = two_adapters();
+        assert_eq!(
+            pick_output([1920, 0, 3840, 1080], 0, "", &outs),
+            Ok((1, 0)),
+            "rect match on adapter 1 output 0 must keep the pair, not a flattened index"
+        );
+        assert_eq!(
+            pick_output([0, 0, 1, 1], 22, "", &outs),
+            Ok((1, 0)),
+            "hmon match must keep the adapter pair"
+        );
+        assert_eq!(
+            pick_output([0, 0, 1, 1], 0, "\\\\.\\DISPLAY2", &outs),
+            Ok((1, 0)),
+            "device match must keep the adapter pair"
+        );
+    }
+
+    #[test]
+    fn pick_output_clone_rect_handle_device_is_err() {
+        // Cloned outputs share rect, Monitor handle, and device name: every
+        // identity tier is ambiguous, so the matcher must refuse (GDI
+        // fallback) instead of serving the first pair.
+        let outs = vec![
+            DxgiOutput {
+                adapter: 0,
+                output: 0,
+                rect: [0, 0, 1920, 1080],
+                hmon: 11,
+                device: "\\\\.\\DISPLAY1".to_string(),
+            },
+            DxgiOutput {
+                adapter: 0,
+                output: 1,
+                rect: [0, 0, 1920, 1080],
+                hmon: 11,
+                device: "\\\\.\\DISPLAY1".to_string(),
+            },
+        ];
+        for (r, h, d) in [
+            ([0, 0, 1920, 1080], 0, ""),
+            ([7, 7, 8, 8], 11, ""),
+            ([7, 7, 8, 8], 0, "\\\\.\\DISPLAY1"),
+        ] {
+            let out = pick_output(r, h, d, &outs);
+            assert!(
+                out.is_err(),
+                "clone tier {r:?}/{h}/{d} must Err, got: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pick_output_identity_beats_size_match() {
+        // Two same-size outputs: a rect hit on one of them wins outright;
+        // the size tier is never reached.
+        let outs = vec![
+            DxgiOutput {
+                adapter: 0,
+                output: 0,
+                rect: [0, 0, 1920, 1080],
+                hmon: 11,
+                device: "\\\\.\\DISPLAY1".to_string(),
+            },
+            DxgiOutput {
+                adapter: 1,
+                output: 0,
+                rect: [1920, 0, 3840, 1080],
+                hmon: 22,
+                device: "\\\\.\\DISPLAY2".to_string(),
+            },
+        ];
+        assert_eq!(
+            pick_output([0, 0, 1920, 1080], 0, "", &outs),
+            Ok((0, 0)),
+            "exact rect must beat the same-size rival without ambiguity"
+        );
     }
 
     #[test]

@@ -41,6 +41,12 @@ pub struct Fixture {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+impl Default for Fixture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Fixture {
     pub fn hwnd(&self) -> HWND {
         self.hwnd
@@ -103,13 +109,13 @@ impl Fixture {
                 0,
                 edit_cls.as_ptr(),
                 std::ptr::null(),
-                (WS_CHILD | WS_VISIBLE | WS_BORDER) as u32 | 0x0080,
+                WS_CHILD | WS_VISIBLE | WS_BORDER | 0x0080,
                 10,
                 10,
                 260,
                 24,
                 hwnd,
-                100 as isize as *mut _,
+                100isize as *mut _,
                 std::ptr::null_mut(),
                 std::ptr::null(),
             );
@@ -118,13 +124,13 @@ impl Fixture {
                 0,
                 edit_cls.as_ptr(),
                 std::ptr::null(),
-                (WS_CHILD | WS_VISIBLE | WS_BORDER) as u32 | 0x0080 | 0x0800,
+                WS_CHILD | WS_VISIBLE | WS_BORDER | 0x0080 | 0x0800,
                 10,
                 44,
                 260,
                 24,
                 hwnd,
-                102 as isize as *mut _,
+                102isize as *mut _,
                 std::ptr::null_mut(),
                 std::ptr::null(),
             );
@@ -134,13 +140,13 @@ impl Fixture {
                 0,
                 btn_cls.as_ptr(),
                 btn_text.as_ptr(),
-                (WS_CHILD | WS_VISIBLE) as u32,
+                WS_CHILD | WS_VISIBLE,
                 10,
                 80,
                 80,
                 24,
                 hwnd,
-                101 as isize as *mut _,
+                101isize as *mut _,
                 std::ptr::null_mut(),
                 std::ptr::null(),
             );
@@ -289,9 +295,7 @@ pub fn pid_of_window(hwnd: i64) -> Option<u32> {
 /// must use a different gate that can fail; they must not call this helper.
 pub fn check_foreground_left_clean(fixture_top: i64, before: i64, what: &str) {
     if before == 0 {
-        println!(
-            "FG_SKIP: {what}: no foreground session (before=0); foreground assertion skipped"
-        );
+        println!("FG_SKIP: {what}: no foreground session (before=0); foreground assertion skipped");
         return;
     }
     if pid_of_window(before) == Some(std::process::id()) {
@@ -302,9 +306,7 @@ pub fn check_foreground_left_clean(fixture_top: i64, before: i64, what: &str) {
     }
     let t0 = std::time::Instant::now();
     let mut cur = foreground_now();
-    while is_owned_window(fixture_top, cur)
-        && t0.elapsed() < std::time::Duration::from_secs(5)
-    {
+    while is_owned_window(fixture_top, cur) && t0.elapsed() < std::time::Duration::from_secs(5) {
         std::thread::sleep(std::time::Duration::from_millis(20));
         cur = foreground_now();
     }
@@ -324,7 +326,6 @@ pub fn check_foreground_left_clean(fixture_top: i64, before: i64, what: &str) {
 }
 
 /// Settle-based enforcement lives in `check_foreground_left_clean` above.
-
 impl Drop for Fixture {
     fn drop(&mut self) {
         unsafe {

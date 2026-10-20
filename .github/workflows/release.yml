@@ -12,11 +12,9 @@
 # GitHub Releases API on 2026-10-17 there):
 # checkout v7 (v7.0.1), setup-node v7 (v7.1.0), upload-artifact v7 (v7.0.2),
 # download-artifact v8 (v8.0.2), softprops/action-gh-release v3 (v3.0.3).
-# The toolchain is pinned to the lockfile floor (1.85: hashbrown 0.17.1 and
-# indexmap 2.14.2 in Cargo.lock declare rust-version 1.85), not to the
-# action's floating tag. NOTE: Cargo.toml still declares rust-version 1.80,
-# which understates that floor — see the report finding; the pin here is
-# what the locked tree actually builds with.
+# The toolchain is pinned to the MSRV floor (1.85: rust-toolchain.toml,
+# Cargo.toml rust-version, and hashbrown 0.17.1 / indexmap 2.14.2 in
+# Cargo.lock all agree on 1.85), not to the action's floating tag.
 name: release
 on:
   push:

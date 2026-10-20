@@ -1,11 +1,11 @@
 {
   "_comment": "Pinned server manifest for the puppet-mcp launcher. The published package holds ONLY this launcher plus this manifest (no server bytes). On first run the launcher downloads ONLY runtime.archive from the tagged GitHub Release, verifying its sha256 before and after extraction. The release workflow fills the runtime.* hashes it computes from the real build artifacts; the committed manifest carries placeholders the launcher refuses to run with.",
   "package": "puppet-mcp",
-  "serverVersion": "4.4.1",
+  "serverVersion": "4.5.0",
   "runtime": {
-    "source": "https://github.com/nathwn12/puppet/releases/download/v4.4.1",
+    "source": "https://github.com/nathwn12/puppet/releases/download/v4.5.0",
     "archive": {
-      "name": "puppet-v4.4.1-windows-x86_64.zip",
+      "name": "puppet-v4.5.0-windows-x86_64.zip",
       "sha256": "RELEASE_WORKFLOW_FILLS_THIS",
       "size": 0
     },

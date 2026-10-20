@@ -1,13 +1,35 @@
-# nathwn12 house CI — stack: rust (copy to .github/workflows/ci.yml)
+# nathwn12 house CI — fast gate (<3 min): fmt, clippy, gitleaks, build+test.
 name: ci
 on:
   pull_request:
   workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
-  build:
+  gate:
     runs-on: windows-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --locked
-      - run: cargo test --locked
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          toolchain: 1.85.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-1.85.0
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          config-path: .gitleaks.toml
+      - name: build
+        run: cargo build --locked
+      - name: test (live tests self-skip without PUPPET_LIVE_DESKTOP)
+        run: cargo test --locked

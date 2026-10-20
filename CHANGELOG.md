@@ -35,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `src/fixture.rs`), so the suite passes the same on a bare runner as on
   the owner's desktop.
 
-## [Unreleased]
+## [4.5.0] - 2026-10-20
 
 ### Added
 
@@ -49,6 +49,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CloseDesktop` and proves it gone with a NULL `OpenDesktopW`. The owner's
   desktop, cursor, foreground window, and focus are never touched; omitting
   the parameter leaves plain `do` byte-identical.
+- Clipboard: `do` `clipboard_set` writes CF_UNICODETEXT (max 1_048_576
+  chars; over-cap sets fail typed before touching the clipboard) and
+  `clipboard_get` reads it back truncated to 1_048_576 chars, NUL-checked
+  against the GlobalSize bound.
+- Elements paging: `elements` accepts `max_depth` (1..32, default 8) and
+  `offset` (default 0); when the 200-entry cap is hit and more controls
+  remain, `next_offset` names the next page, else null.
+- `wait_for` `kind:"element"`: polls for a control (`window` selector
+  optional, `element` name:|auto_id:|path:, `state`
+  appear|disappear|enabled|disabled) with the same timeout semantics as
+  the pixel and window waits; a timeout reports `satisfied:false`, never
+  an error.
+- UIA actuation: `do` `invoke` accepts `state` `"expand"|"collapse"`
+  driving only the UIA ExpandCollapse pattern (typed error without it);
+  `do` `set_value` falls back to UIA RangeValue for sliders (numeric
+  text, range-checked, read-only honored); `elements` with `detail:true`
+  adds TextPattern `text` (capped at 4000 chars, `text_truncated` flag).
+- Structured output: tool results carry typed JSON content blocks
+  (coordinate map, element lists, per-action results); dual-era MCP
+  protocol versions negotiated at `initialize`.
+- Input: `do` `key` holds Shift when the layout requires it; DXGI
+  desktop-capture fast path with GDI fallback; `scroll` supports the
+  horizontal wheel; `move` accepts relative `dx`/`dy`; `key` accepts
+  `hold_ms`/`repeat`/`gap_ms`; `scroll` accepts `element` driving UIA
+  ScrollPattern instead of the wheel.
+- Gates and caps: toolchain pinned to 1.85.0 (rustfmt + clippy), CI with
+  fmt/clippy/gitleaks/build/test; memory caps (`stable` regions 4096px,
+  grabs 8192px, shared overflow-safe region validator); `initialize`
+  `instructions` now enumerate all 16 `do` action types.
 
 ## [4.3.0] - 2026-10-12
 

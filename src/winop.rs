@@ -21,15 +21,11 @@ pub(crate) fn focus_hwmd(hwnd: HWND) -> Map<String, Value> {
         GetWindowThreadProcessId(fg, &mut fg_tid);
         GetWindowThreadProcessId(hwnd, &mut tgt_tid);
         let mut attached: Vec<u32> = Vec::new();
-        if fg_tid != 0 && fg_tid != cur_tid {
-            if AttachThreadInput(cur_tid, fg_tid, 1) != 0 {
-                attached.push(fg_tid);
-            }
+        if fg_tid != 0 && fg_tid != cur_tid && AttachThreadInput(cur_tid, fg_tid, 1) != 0 {
+            attached.push(fg_tid);
         }
-        if tgt_tid != 0 && tgt_tid != cur_tid {
-            if AttachThreadInput(cur_tid, tgt_tid, 1) != 0 {
-                attached.push(tgt_tid);
-            }
+        if tgt_tid != 0 && tgt_tid != cur_tid && AttachThreadInput(cur_tid, tgt_tid, 1) != 0 {
+            attached.push(tgt_tid);
         }
         BringWindowToTop(hwnd);
         SetForegroundWindow(hwnd);
@@ -317,13 +313,15 @@ mod tests {
     fn list_windows_entries_carry_elevated_flag() {
         let out = do_list_windows();
         let outer: Value = serde_json::from_str(&out).expect("outer frame");
-        let inner = outer
-            .get("structuredContent")
-            .and_then(|s| s.get("result"))
-            .and_then(|r| r.as_str())
-            .expect("structured result");
-        let arr: Value = serde_json::from_str(inner).expect("window list");
-        let wins = arr.as_array().expect("window list array");
+        let sc = outer.get("structuredContent").expect("structuredContent");
+        assert!(
+            sc.get("result").is_none(),
+            "structuredContent must be the real object, never a wrapped string, got: {sc}"
+        );
+        let wins = sc
+            .get("windows")
+            .and_then(|w| w.as_array())
+            .expect("windows array");
         for w in wins {
             let o = w.as_object().expect("window object");
             assert!(

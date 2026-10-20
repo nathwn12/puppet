@@ -10,29 +10,96 @@ use crate::shot::{compact_entry, element_model, elements_object};
 use crate::winop::{do_cursor, do_list_windows, do_window, WinArgs};
 use crate::{
     check_no_extra, coerce_int, coerce_str, display_monitors, err_result_text, missing_arg,
-    opt_int, opt_str, py_dumps, req_bool, req_int, req_str, verr_text, wrapped_text,
-    LATEST_VERSION, SUPPORTED_VERSIONS,
+    opt_int, opt_str, py_dumps, req_bool, req_int, req_str, verr_text, wrapped_text, ALL_VERSIONS,
+    LATEST_VERSION, MODERN_VERSION, SUPPORTED_VERSIONS,
 };
 use serde_json::{Map, Value};
 use std::io::{BufRead, Write};
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    mpsc, Arc, LazyLock, Mutex,
+};
+use std::time::{Duration, Instant};
 
-fn write_result(out: &mut impl Write, id: &Value, result: &str) -> std::io::Result<()> {
-    let ids = serde_json::to_string(id).unwrap();
-    writeln!(
-        out,
-        "{{\"jsonrpc\":\"2.0\",\"id\":{ids},\"result\":{result}}}"
-    )?;
-    out.flush()
+/// P1b worker pool: four workers drain `tools/call` jobs so one long call
+/// (a 60s `wait`, a 300s `wait_for`, a 60s settle) never blocks `ping`,
+/// `initialize`, `tools/list`, or a `notifications/cancelled`.
+const WORKER_COUNT: usize = 4;
+/// P1b queue cap: more than 8 tool calls in flight gets -32603
+/// ("Server busy") instead of unbounded thread growth.
+const MAX_IN_FLIGHT: usize = 8;
+
+/// P1b input serialization: only mutating desktop tools (`do`, `window`)
+/// hold this. Read-only `screenshot`, `list_windows`, `cursor`, `elements`
+/// never take it, so a screenshot can run while a `do wait` sleeps. A waiter
+/// polls with `try_lock` + 20ms sleeps so a cancel wakes it instead of
+/// wedging on a hung holder.
+static INPUT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// Acquire the shared input lock, polling so a cancelled call wakes instead
+/// of blocking forever on a hung holder. `None` = cancelled while waiting.
+/// A poisoned lock is recovered (`into_inner`): a panicked holder must not
+/// read as "held forever" to every future waiter.
+fn lock_input_cancellable() -> Option<std::sync::MutexGuard<'static, ()>> {
+    loop {
+        match INPUT_LOCK.try_lock() {
+            Ok(g) => return Some(g),
+            Err(std::sync::TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if crate::cancel::cancelled() {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
 }
 
-fn write_error(out: &mut impl Write, id: &Value, code: i64, msg: &str) -> std::io::Result<()> {
+/// One `writeln!` + flush under the sink lock: frames never interleave.
+/// Poison is recovered: a panicked writer must not silence the server.
+fn emit_line<W: Write>(sink: &Mutex<W>, line: String) -> std::io::Result<()> {
+    let mut g = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    writeln!(g, "{line}")?;
+    g.flush()
+}
+
+/// Frame builders, shared by the inline path and the worker's locked
+/// check+write emission (DEFECT 3: the last cancel check and the write
+/// happen under the same sink lock).
+fn result_line(id: &Value, result: &str) -> String {
+    let ids = serde_json::to_string(id).unwrap();
+    format!("{{\"jsonrpc\":\"2.0\",\"id\":{ids},\"result\":{result}}}")
+}
+
+fn error_line(id: &Value, code: i64, msg: &str) -> String {
     let ids = serde_json::to_string(id).unwrap();
     let ms = serde_json::to_string(msg).unwrap();
-    writeln!(
-        out,
-        "{{\"jsonrpc\":\"2.0\",\"id\":{ids},\"error\":{{\"code\":{code},\"message\":{ms}}}}}"
-    )?;
-    out.flush()
+    format!("{{\"jsonrpc\":\"2.0\",\"id\":{ids},\"error\":{{\"code\":{code},\"message\":{ms}}}}}")
+}
+
+fn error_data_line(id: &Value, code: i64, msg: &str, data: &Value) -> String {
+    let ids = serde_json::to_string(id).unwrap();
+    let ms = serde_json::to_string(msg).unwrap();
+    let ds = serde_json::to_string(data).unwrap();
+    format!("{{\"jsonrpc\":\"2.0\",\"id\":{ids},\"error\":{{\"code\":{code},\"message\":{ms},\"data\":{ds}}}}}")
+}
+
+fn write_result<W: Write>(out: &Mutex<W>, id: &Value, result: &str) -> std::io::Result<()> {
+    emit_line(out, result_line(id, result))
+}
+
+fn write_error<W: Write>(out: &Mutex<W>, id: &Value, code: i64, msg: &str) -> std::io::Result<()> {
+    emit_line(out, error_line(id, code, msg))
+}
+
+fn write_error_with_data<W: Write>(
+    out: &Mutex<W>,
+    id: &Value,
+    code: i64,
+    msg: &str,
+    data: &Value,
+) -> std::io::Result<()> {
+    emit_line(out, error_data_line(id, code, msg, data))
 }
 
 fn init_result(params: &Value) -> String {
@@ -46,8 +113,9 @@ fn init_result(params: &Value) -> String {
         LATEST_VERSION
     };
     format!(
-        "{{\"protocolVersion\":{},\"capabilities\":{{\"logging\":{{}},\"prompts\":{{\"listChanged\":true}},\"resources\":{{\"subscribe\":false,\"listChanged\":true}},\"tools\":{{\"listChanged\":true}}}},\"serverInfo\":{{\"name\":\"puppet\",\"version\":\"4.3.0\"}},\"instructions\":{}}}",
+        "{{\"protocolVersion\":{},\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}},\"serverInfo\":{{\"name\":\"puppet\",\"version\":{}}},\"instructions\":{}}}",
         serde_json::to_string(echo).unwrap(),
+        serde_json::to_string(env!("CARGO_PKG_VERSION")).unwrap(),
         serde_json::to_string(INIT_INSTRUCTIONS).unwrap()
     )
 }
@@ -56,10 +124,48 @@ fn init_result(params: &Value) -> String {
 /// 3): the six tools in one line each, the coordinate rule with the
 /// image-to-screen formula, batch + dry_run, and read-only-first on the
 /// owner's real desktop.
-const INIT_INSTRUCTIONS: &str = "puppet desktop-control MCP (Windows). Input hits the owner's real desktop: start every task with read-only calls (screenshot, elements, list_windows, cursor), batch work into one do burst per turn, then screenshot to verify.\nTools (one line each):\n- screenshot: capture the whole virtual desktop (display=-1), one monitor, a window, or a region; returns the image plus source{x,y,w,h}, scale, the monitor list, the cursor, and the image-to-screen formula. Coordinates are screen/virtual-desktop pixels: screen_x = source.x + round((img_x + 0.5) * source.w / image.w) (same for y).\n- list_windows: read-only visible top-level windows (hwnd/pid/exe/title/rects/elevated); never changes focus.\n- window: focus|move|resize|minimize|maximize|restore|close|topmost by selector or hwnd.\n- do: BURST tool: one call runs an ordered actions[] batch (move|click|down|up|drag|scroll|type|key|hotkey|wait|wait_for|focus_window|invoke|set_value); per-action ok, never aborts the rest. dry_run=true validates and reports without injecting anything. Coordinate actions take virtual-desktop pixels.\n- cursor: read-only cursor position plus monitor rects.\n- elements: read-only structured UI elements for a window (zero pixels, no focus change); each entry carries ref plus fp, a stable identity fingerprint. Prefer elements over pixel guessing; pass expect_fp to invoke/set_value to refuse stale refs instead of acting on the wrong control. When text is illegible, re-request the same window with a tight region plus max_px:null (full-resolution zoom).";
+const INIT_INSTRUCTIONS: &str = "puppet desktop-control MCP (Windows). Input hits the owner's real desktop: start every task with read-only calls (screenshot, elements, list_windows, cursor), batch work into one do burst per turn, then screenshot to verify.\nTools (one line each):\n- screenshot: capture the whole virtual desktop (display=-1), one monitor, a window, or a region; returns the image plus source{x,y,w,h}, scale, the monitor list, the cursor, and the image-to-screen formula. Coordinates are screen/virtual-desktop pixels: screen_x = source.x + round((img_x + 0.5) * source.w / image.w) (same for y).\n- list_windows: read-only visible top-level windows (hwnd/pid/exe/title/rects/elevated); never changes focus.\n- window: focus|move|resize|minimize|maximize|restore|close|topmost by selector or hwnd.\n- do: BURST tool: one call runs an ordered actions[] batch (move|click|down|up|drag|scroll|type|key|hotkey|wait|wait_for|focus_window|invoke|set_value|clipboard_set|clipboard_get); per-action ok, never aborts the rest. dry_run=true validates and reports without injecting anything. Coordinate actions take virtual-desktop pixels.\n- cursor: read-only cursor position plus monitor rects.\n- elements: read-only structured UI elements for a window (zero pixels, no focus change); each entry carries ref plus fp, a stable identity fingerprint. Prefer elements over pixel guessing; pass expect_fp to invoke/set_value to refuse stale refs instead of acting on the wrong control. When text is illegible, re-request the same window with a tight region plus max_px:null (full-resolution zoom).";
 
 fn tools_list_result() -> String {
     format!("{{\"tools\":[{TOOL_SCREENSHOT},{TOOL_LIST_WINDOWS},{TOOL_WINDOW},{TOOL_DO},{TOOL_CURSOR},{TOOL_ELEMENTS}]}}")
+}
+
+/// `server/discover` (2026-07-28 discovery path): the full known-version
+/// list, the tools-only capabilities, this crate's version, and the same
+/// usage contract `initialize` carries. Discovery itself is a modern
+/// surface, so its result always carries `resultType: complete`.
+fn discover_result() -> String {
+    let supported: Vec<Value> = ALL_VERSIONS.iter().map(|v| Value::from(*v)).collect();
+    format!(
+        "{{\"supportedVersions\":{},\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}},\"serverInfo\":{{\"name\":\"puppet\",\"version\":{}}},\"instructions\":{},\"resultType\":\"complete\"}}",
+        serde_json::to_string(&Value::Array(supported)).unwrap(),
+        serde_json::to_string(env!("CARGO_PKG_VERSION")).unwrap(),
+        serde_json::to_string(INIT_INSTRUCTIONS).unwrap()
+    )
+}
+
+/// Per-request modern version from
+/// `params._meta["io.modelcontextprotocol/protocolVersion"]` (2026-07-28
+/// discovery path). `None` when params is not an object or carries no such
+/// key (legacy peer); otherwise the raw value so unsupported versions can
+/// be echoed back in the -32022 data.
+fn meta_version(v: &Value) -> Option<Value> {
+    v.get("params")?
+        .as_object()?
+        .get("_meta")?
+        .as_object()?
+        .get("io.modelcontextprotocol/protocolVersion")
+        .cloned()
+}
+
+/// Additive modern marker for 2026-07-28 peers: `result` is already a JSON
+/// object string, so splice one more top-level key before the final `}`.
+fn with_result_type(result: &str) -> String {
+    let t = result.trim_end();
+    match t.strip_suffix('}') {
+        Some(body) => format!("{body},\"resultType\":\"complete\"}}"),
+        None => result.to_string(),
+    }
 }
 
 fn call_window(args: &Map<String, Value>) -> String {
@@ -123,14 +229,44 @@ fn call_window(args: &Map<String, Value>) -> String {
 /// `shot::elements_block`) and return it as structured JSON.
 fn call_elements(args: &Map<String, Value>) -> String {
     let mut errs = Vec::new();
-    check_no_extra(args, &mut errs, &["title", "hwnd", "detail"]);
+    check_no_extra(
+        args,
+        &mut errs,
+        &["title", "hwnd", "detail", "max_depth", "offset"],
+    );
     let title = opt_str(args, &mut errs, "title");
     let hwnd = opt_int(args, &mut errs, "hwnd");
     let detail = req_bool(args, &mut errs, "detail");
+    let max_depth = req_int(args, &mut errs, "max_depth", 8);
+    let offset = req_int(args, &mut errs, "offset", 0);
     if !errs.is_empty() {
         return err_result_text(&verr_text("elements", &errs));
     }
-    let (t, h, d) = (title.unwrap(), hwnd.unwrap(), detail.unwrap());
+    let (t, h, d, md, off) = (
+        title.unwrap(),
+        hwnd.unwrap(),
+        detail.unwrap(),
+        max_depth.unwrap(),
+        offset.unwrap(),
+    );
+    if !(1..=32).contains(&md) {
+        let mut payload = Map::new();
+        payload.insert("ok".to_string(), Value::from(false));
+        payload.insert(
+            "error".to_string(),
+            Value::from(format!("max_depth must be an integer 1..32 (got {md})")),
+        );
+        return wrapped_text(&py_dumps(&Value::Object(payload)));
+    }
+    if off < 0 {
+        let mut payload = Map::new();
+        payload.insert("ok".to_string(), Value::from(false));
+        payload.insert(
+            "error".to_string(),
+            Value::from(format!("offset must be an integer >= 0 (got {off})")),
+        );
+        return wrapped_text(&py_dumps(&Value::Object(payload)));
+    }
     // Same branches as `cap::resolve_window`, spelled through
     // `resolve_selector` directly: explicit hwnd wins, else title text.
     let (hwnd_r, err, cands) = match (h, t) {
@@ -154,9 +290,30 @@ fn call_elements(args: &Map<String, Value>) -> String {
         }
         return wrapped_text(&py_dumps(&Value::Object(payload)));
     }
-    let model = element_model(hwnd_r.unwrap());
+    let model = element_model(hwnd_r.unwrap(), md, off as usize);
+    // P4c text read: detail listings on the UIA backend carry each entry's
+    // TextPattern text (capped at ELEMENT_TEXT_CAP chars with a
+    // `text_truncated` flag). Best-effort per entry: a missing pattern or
+    // failed read omits the keys instead of failing the listing. Identity
+    // (`fp`) never covers text, so extraction cannot invalidate refs.
     let entries: Vec<Value> = if d {
-        model.entries.into_iter().map(Value::Object).collect()
+        model
+            .entries
+            .into_iter()
+            .map(|mut e| {
+                if model.backend == "uia" {
+                    if let Some(path) = e.get("path").and_then(|v| v.as_str()) {
+                        if let Ok(full) = crate::uia::uia_element_text(hwnd_r.unwrap() as i64, path)
+                        {
+                            let (text, truncated) = crate::shot::cap_text(&full);
+                            e.insert("text".to_string(), Value::from(text));
+                            e.insert("text_truncated".to_string(), Value::from(truncated));
+                        }
+                    }
+                }
+                Value::Object(e)
+            })
+            .collect()
     } else {
         model
             .entries
@@ -169,7 +326,13 @@ fn call_elements(args: &Map<String, Value>) -> String {
     // (both assemble through `shot::elements_object`; only the entries
     // slice differs: full walk entries under detail=true, compact
     // projections by default).
-    let o = elements_object(&model.backend, model.truncated, entries, &model.detail);
+    let o = elements_object(
+        &model.backend,
+        model.truncated,
+        entries,
+        &model.detail,
+        model.next_offset,
+    );
     wrapped_text(&py_dumps(&Value::Object(o)))
 }
 
@@ -252,6 +415,7 @@ fn call_do(args: &Map<String, Value>) -> String {
         &[
             "actions",
             "background",
+            "background_args",
             "focus_guard",
             "settle_ms",
             "dry_run",
@@ -294,6 +458,48 @@ fn call_do(args: &Map<String, Value>) -> String {
     let focus_guard = do_bool(args, &mut errs, "focus_guard");
     let settle_ms = req_int(args, &mut errs, "settle_ms", 0);
     let dry_run = do_bool(args, &mut errs, "dry_run");
+    // background_args is `list[str] | None`, hidden-launch only: strict
+    // strings, no coercion (mirrors background's strict string_type).
+    // Ignored without desktop:"hidden"; validated whenever present.
+    let background_args: Option<Option<Vec<String>>> = match args.get("background_args") {
+        None | Some(Value::Null) => Some(None),
+        Some(Value::Array(a)) => {
+            let mut out: Vec<String> = Vec::with_capacity(a.len());
+            let mut bad: Option<&Value> = None;
+            for v in a {
+                match v.as_str() {
+                    Some(s) => out.push(s.to_string()),
+                    None => {
+                        bad = Some(v);
+                        break;
+                    }
+                }
+            }
+            match bad {
+                Some(v) => {
+                    errs.push(crate::VErr {
+                        loc: "background_args".to_string(),
+                        msg: "Input should be a valid string".to_string(),
+                        typ: "string_type".to_string(),
+                        iv: crate::render_iv(v),
+                        it: crate::input_type_of(v).to_string(),
+                    });
+                    None
+                }
+                None => Some(Some(out)),
+            }
+        }
+        Some(v) => {
+            errs.push(crate::VErr {
+                loc: "background_args".to_string(),
+                msg: "Input should be a valid list".to_string(),
+                typ: "list_type".to_string(),
+                iv: crate::render_iv(v),
+                it: crate::input_type_of(v).to_string(),
+            });
+            None
+        }
+    };
     // desktop is `str | None`, opt-in only: the sole accepted value is
     // "hidden" (case-insensitive). Plain `do` omits it and keeps its exact
     // behaviour.
@@ -315,6 +521,7 @@ fn call_do(args: &Map<String, Value>) -> String {
     do_burst(
         &actions.unwrap(),
         background.unwrap(),
+        background_args.unwrap(),
         focus_guard.unwrap(),
         settle_ms.unwrap(),
         dry_run.unwrap(),
@@ -429,56 +636,363 @@ fn tools_call(params: &Value) -> String {
     }
 }
 
-fn handle(v: &Value, out: &mut impl Write) -> std::io::Result<()> {
-    let method = v.get("method").and_then(|m| m.as_str());
-    let id = v.get("id").cloned();
-    match (method, id) {
-        (None, _) => Ok(()),
-        (Some(_), None) => Ok(()),
-        (Some(m), Some(id)) => match m {
-            "initialize" => {
-                let p = v.get("params").cloned().unwrap_or(Value::Null);
-                write_result(out, &id, &init_result(&p))
+/// A dispatched `tools/call` job. `id_key` is the canonical registry key
+/// (`serde_json::to_string(&id)`); `modern` marks 2026-07-28 peers whose
+/// result carries `resultType: complete`.
+struct ToolJob {
+    id: Value,
+    id_key: String,
+    params: Value,
+    modern: bool,
+}
+
+/// Admission guard: releases `in_flight` and clears the worker's
+/// thread-local token on drop, including panic unwind. It deliberately does
+/// NOT touch the cancel registry: the token stays registered until the
+/// outer `run_tool_job` removes it AFTER the emit decision, so a cancel
+/// racing a panic is still observed — no -32603 after a processed cancel.
+///
+/// Lifetime (DEFECT 1 fix): the guard is created in `run_tool_job` BEFORE
+/// `catch_unwind` and dropped AFTER the emit decision + token removal, so
+/// admission covers the whole job — body, unwind, sink-locked emit, and
+/// cleanup. The EOF drain (which waits on `in_flight`) therefore cannot
+/// finish before the final response is written and the token removed. The
+/// inner never owns or drops the guard.
+struct AdmissionGuard {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl AdmissionGuard {
+    fn new(in_flight: &Arc<AtomicUsize>) -> Self {
+        Self {
+            in_flight: in_flight.clone(),
+        }
+    }
+}
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        crate::cancel::clear_current();
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// What a job's execution produced. The inner builds it but never writes;
+/// the outer emits (or drops) under the sink lock, then removes the token.
+enum Action {
+    Result(String),
+    InvalidParams,
+}
+
+/// Outcome of the fallible job body: either a response line is ready or
+/// there is nothing to send.
+enum JobOutcome {
+    Emit(String),
+    Drop,
+}
+
+/// The production executor: validates arguments and runs the tool.
+/// Passed as a closure so tests can substitute panicking bodies while
+/// exercising the real containment, ordering, and cleanup paths.
+fn production_execute(job: &ToolJob) -> Action {
+    match job.params.get("arguments") {
+        None | Some(Value::Null) | Some(Value::Object(_)) => {
+            let r = tools_call(&job.params);
+            Action::Result(if job.modern { with_result_type(&r) } else { r })
+        }
+        Some(_) => Action::InvalidParams,
+    }
+}
+
+/// Worker entry: panic containment boundary. The admission guard is
+/// created BEFORE `catch_unwind` and dropped AFTER the emit decision +
+/// token removal, so `in_flight` covers the whole job and the EOF drain
+/// cannot overtake the final response. The fallible body runs inside
+/// `catch_unwind`; on unwind the guard stays alive while the outer emits
+/// -32603, and this worker stays alive for the next job. A panic never
+/// aborts the process. Token removal happens here, AFTER the emit decision,
+/// never in the guard or the inner: either the cancel is ordered before the
+/// check under the sink lock (token set → silence) or the frame is written
+/// first (valid race). A cancelled call — including a panic after a
+/// processed cancel — stays silent.
+fn run_tool_job<W, F>(
+    job: ToolJob,
+    sink: &Mutex<W>,
+    in_flight: Arc<AtomicUsize>,
+    client_dead: &AtomicBool,
+    execute: F,
+) where
+    W: Write,
+    F: FnOnce(&ToolJob) -> Action,
+{
+    let id = job.id.clone();
+    let id_key = job.id_key.clone();
+    // Snapshot the token outside the unwind boundary so the panic branch
+    // can still tell "cancelled, stay silent" from "died, report".
+    let token = crate::cancel::get(&id_key);
+    // Admission covers body + unwind + sink-locked emit + token removal.
+    let _admission = AdmissionGuard::new(&in_flight);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_tool_job_inner(&job, token.clone(), execute)
+    }));
+    match outcome {
+        Ok(JobOutcome::Emit(line)) => {
+            // Ordered with `notifications/cancelled` under the sink lock:
+            // the cancel handler takes this lock before setting the token,
+            // so either the cancel lands first (silent drop) or this frame
+            // is fully written first (client may ignore the racy late
+            // response). The lock is held only across check+write, never
+            // across tool execution.
+            let mut g = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let cancelled = token.as_ref().is_some_and(|t| t.load(Ordering::SeqCst));
+            if !cancelled && writeln!(g, "{line}").and_then(|_| g.flush()).is_err() {
+                client_dead.store(true, Ordering::SeqCst);
             }
-            "tools/list" => write_result(out, &id, &tools_list_result()),
-            "tools/call" => {
-                let p = v.get("params").cloned().unwrap_or(Value::Null);
-                match p.get("arguments") {
-                    None | Some(Value::Null) | Some(Value::Object(_)) => {
-                        write_result(out, &id, &tools_call(&p))
-                    }
-                    Some(_) => write_error(
-                        out,
-                        &id,
-                        -32602,
-                        "Invalid params: arguments must be an object",
-                    ),
+            crate::cancel::remove(&id_key);
+        }
+        Ok(JobOutcome::Drop) => {
+            crate::cancel::remove(&id_key);
+        }
+        Err(_) => {
+            // Contained panic: the guard is still alive (admission held,
+            // thread-local intact for the check below); the token stayed
+            // registered, so this check observes any cancel ordered first.
+            // The guard drops at fn end, after the emit + removal.
+            let mut g = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let cancelled = token.as_ref().is_some_and(|t| t.load(Ordering::SeqCst));
+            if !cancelled && token.is_some() {
+                let line = error_line(&id, -32603, "Internal error");
+                if writeln!(g, "{line}").and_then(|_| g.flush()).is_err() {
+                    client_dead.store(true, Ordering::SeqCst);
                 }
             }
-            "ping" => write_result(out, &id, "{}"),
-            "prompts/list" => write_result(out, &id, "{\"prompts\":[]}"),
-            "resources/list" => write_result(out, &id, "{\"resources\":[]}"),
-            "resources/templates/list" => write_result(out, &id, "{\"resourceTemplates\":[]}"),
-            _ if m.starts_with("notifications/") => Ok(()),
-            _ => write_error(out, &id, -32601, &format!("Method not found: {m}")),
-        },
+            // `token: None` means the registry never held this id; nothing
+            // to emit or remove.
+            if token.is_some() {
+                crate::cancel::remove(&id_key);
+            }
+        }
+    }
+}
+
+fn run_tool_job_inner<F>(job: &ToolJob, token: Option<Arc<AtomicBool>>, execute: F) -> JobOutcome
+where
+    F: FnOnce(&ToolJob) -> Action,
+{
+    // No admission handling here: the outer's guard covers the whole job.
+    // A `None` token means the registry never held this id; drop silently.
+    let Some(token) = token else {
+        return JobOutcome::Drop;
+    };
+    crate::cancel::set_current(token.clone());
+    if token.load(Ordering::SeqCst) {
+        return JobOutcome::Drop;
+    }
+    let name = job
+        .params
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("");
+    // Only mutating desktop tools serialize; read-only tools run free.
+    let _input = if matches!(name, "do" | "window") {
+        match lock_input_cancellable() {
+            Some(g) => Some(g),
+            None => {
+                return JobOutcome::Drop;
+            }
+        }
+    } else {
+        None
+    };
+    if token.load(Ordering::SeqCst) {
+        return JobOutcome::Drop;
+    }
+    let action = execute(job);
+    // Advisory only: the outer re-checks under the sink lock.
+    if token.load(Ordering::SeqCst) {
+        return JobOutcome::Drop;
+    }
+    let line = match action {
+        Action::Result(r) => result_line(&job.id, &r),
+        Action::InvalidParams => error_line(
+            &job.id,
+            -32602,
+            "Invalid params: arguments must be an object",
+        ),
+    };
+    JobOutcome::Emit(line)
+}
+
+/// Inline fast frame: everything except `tools/call`. Returns true when the
+/// caller should stop the pump with code 1 (dead client).
+fn handle_fast<W: Write>(
+    v: &Value,
+    sink: &Mutex<W>,
+    tx: &mpsc::Sender<ToolJob>,
+    in_flight: &AtomicUsize,
+) -> bool {
+    let id = v.get("id").cloned();
+    let method_ok = v.get("method").and_then(|m| m.as_str()).is_some();
+    let jsonrpc_ok = v.get("jsonrpc").and_then(|j| j.as_str()) == Some("2.0");
+    if !method_ok || !jsonrpc_ok {
+        // Strict JSON-RPC: a frame with an id but no valid method/jsonrpc
+        // is Invalid Request (-32600); a notification (no id) stays silent.
+        return match id {
+            None => false,
+            Some(id) => write_error(sink, &id, -32600, "Invalid Request").is_err(),
+        };
+    }
+    let m = v.get("method").and_then(|m| m.as_str()).unwrap();
+    let Some(id) = id else {
+        // Notification: valid method but no id gets no response.
+        // `notifications/cancelled` flips the matching token; unknown or
+        // already-completed ids are ignored. The sink lock is taken before
+        // setting the token — the same lock the worker holds across its
+        // last cancel check + write — so a cancel is either ordered before
+        // the response (silent drop) or processed after it was fully
+        // written (client may ignore the racy late response).
+        if m == "notifications/cancelled" {
+            if let Some(rid) = v.get("params").and_then(|p| p.get("requestId")) {
+                let key = serde_json::to_string(rid).unwrap();
+                let _g = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                crate::cancel::cancel(&key);
+            }
+        }
+        return false;
+    };
+    // Modern per-request negotiation (2026-07-28 discovery path): an
+    // explicit per-request version outside the known set is rejected with
+    // -32022 before dispatch.
+    if let Some(req) = meta_version(v) {
+        let known = req.as_str().is_some_and(|s| ALL_VERSIONS.contains(&s));
+        if !known {
+            let data = serde_json::json!({
+                "supported": ALL_VERSIONS,
+                "requested": req,
+            });
+            return write_error_with_data(sink, &id, -32022, "Unsupported protocol version", &data)
+                .is_err();
+        }
+    }
+    let modern = meta_version(v).and_then(|r| r.as_str().map(|s| s.to_string()))
+        == Some(MODERN_VERSION.to_string());
+    match m {
+        "initialize" => {
+            let p = v.get("params").cloned().unwrap_or(Value::Null);
+            write_result(sink, &id, &init_result(&p)).is_err()
+        }
+        "server/discover" => write_result(sink, &id, &discover_result()).is_err(),
+        "tools/list" => {
+            let r = tools_list_result();
+            if modern {
+                write_result(sink, &id, &with_result_type(&r)).is_err()
+            } else {
+                write_result(sink, &id, &r).is_err()
+            }
+        }
+        "tools/call" => {
+            if in_flight.load(Ordering::SeqCst) >= MAX_IN_FLIGHT {
+                return write_error(sink, &id, -32603, "Server busy").is_err();
+            }
+            let id_key = serde_json::to_string(&id).unwrap();
+            crate::cancel::register(&id_key);
+            in_flight.fetch_add(1, Ordering::SeqCst);
+            let job = ToolJob {
+                id,
+                id_key: id_key.clone(),
+                params: v.get("params").cloned().unwrap_or(Value::Null),
+                modern,
+            };
+            if tx.send(job).is_err() {
+                // Workers are gone; unwind the registration so the id does
+                // not leak a token and the admission slot is released.
+                // (Unreachable in practice: workers outlive the reader.)
+                crate::cancel::remove(&id_key);
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+            }
+            false
+        }
+        "ping" => write_result(sink, &id, "{}").is_err(),
+        _ if m.starts_with("notifications/") => false,
+        _ => write_error(sink, &id, -32601, &format!("Method not found: {m}")).is_err(),
     }
 }
 
 pub fn run() {
     let stdin = std::io::stdin();
-    let mut out = std::io::stdout();
-    let code = pump(stdin.lock(), &mut out);
+    let sink = Arc::new(Mutex::new(std::io::stdout()));
+    let code = pump(std::io::BufReader::new(stdin), sink);
     if code != 0 {
         std::process::exit(code);
     }
 }
 
-/// Stdio pump, split from `run` for testability. Returns the process exit
-/// code: 0 on clean stdin EOF, 1 when a response could not be written
-/// (dead client: stop consuming stdin instead of spinning forever).
-fn pump(reader: impl BufRead, out: &mut impl Write) -> i32 {
-    for line in reader.lines() {
+/// Stdio pump, split from `run` for testability. The reader loop stays
+/// free: fast frames are answered inline, `tools/call` jobs go to a
+/// 4-worker pool, and responses are written atomically through the shared
+/// sink. A dedicated reader thread owns `reader` so a blocking stdin can
+/// never wedge the dead-client check: frames are forwarded over a channel
+/// (sender drop = EOF) while this thread polls it with a 20ms timeout and
+/// observes `client_dead` between polls. Returns the process exit code: 0
+/// on clean stdin EOF (after waiting up to 2s for in-flight calls) or when
+/// a worker observed a dead client; 1 when a reader-thread (inline)
+/// response could not be written (dead client: stop consuming stdin
+/// instead of spinning forever).
+fn pump<R: BufRead + Send + 'static, W: Write + Send + 'static>(
+    reader: R,
+    sink: Arc<Mutex<W>>,
+) -> i32 {
+    let (tx, rx) = mpsc::channel::<ToolJob>();
+    let rx = Arc::new(Mutex::new(rx));
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let client_dead = Arc::new(AtomicBool::new(false));
+    for _ in 0..WORKER_COUNT {
+        let rx = rx.clone();
+        let sink = sink.clone();
+        let in_flight = in_flight.clone();
+        let client_dead = client_dead.clone();
+        // The loop survives a contained worker panic (run_tool_job catches
+        // it); the receiver lock is poison-recovered so capacity persists.
+        std::thread::spawn(move || loop {
+            let job = {
+                rx.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .recv()
+            };
+            match job {
+                Ok(j) => run_tool_job(
+                    j,
+                    &sink,
+                    in_flight.clone(),
+                    &client_dead,
+                    production_execute,
+                ),
+                Err(_) => break,
+            }
+        });
+    }
+    let (line_tx, line_rx) = mpsc::channel::<std::io::Result<String>>();
+    std::thread::spawn(move || {
+        let reader = reader;
+        for line in reader.lines() {
+            if line_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let sink_ref: &Mutex<W> = &sink;
+    loop {
+        // A worker that could not write its tool response raises this flag;
+        // exit even while the reader is still open (blocked, no EOF).
+        if client_dead.load(Ordering::SeqCst) {
+            return 0;
+        }
+        let line = match line_rx.recv_timeout(Duration::from_millis(20)) {
+            Ok(line) => line,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            // Reader thread ended (EOF) or the read failed: drain and exit.
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         let line = match line {
             Ok(l) => l,
             Err(_) => break,
@@ -487,38 +1001,41 @@ fn pump(reader: impl BufRead, out: &mut impl Write) -> i32 {
         if t.is_empty() {
             continue;
         }
-        if !t.starts_with('{') && !t.starts_with('[') {
-            if write_error(out, &Value::Null, -32700, "Parse error").is_err() {
-                return 1;
-            }
-            continue;
-        }
         let v: Value = match serde_json::from_str(t) {
             Ok(v) => v,
             Err(_) => {
-                if write_error(out, &Value::Null, -32700, "Parse error").is_err() {
+                if write_error(sink_ref, &Value::Null, -32700, "Parse error").is_err() {
                     return 1;
                 }
                 continue;
             }
         };
         if v.is_array() {
-            if write_error(
-                out,
-                &Value::Null,
-                -32600,
-                "Batch requests are not supported",
-            )
-            .is_err()
-            {
+            if write_error(sink_ref, &Value::Null, -32600, "Invalid Request").is_err() {
                 return 1;
             }
             continue;
         }
-        if handle(&v, out).is_err() {
+        if !v.is_object() {
+            // A valid JSON scalar is well-formed but never a request frame.
+            if write_error(sink_ref, &Value::Null, -32600, "Invalid Request").is_err() {
+                return 1;
+            }
+            continue;
+        }
+        if handle_fast(&v, sink_ref, &tx, &in_flight) {
             return 1;
         }
     }
+    // Stdin EOF: stop accepting, wait up to 2s for in-flight calls, then
+    // exit 0. Never hang forever on a wedged worker.
+    drop(tx);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while in_flight.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // A hung PrintWindow/UIA call occupies one worker at most; the reader
+    // and ping stayed alive throughout, so EOF still exits here.
     0
 }
 
@@ -532,9 +1049,10 @@ mod tests {
     use std::io::Write;
 
     fn run_pump(input: &[u8]) -> (i32, String) {
-        let mut out: Vec<u8> = Vec::new();
-        let code = pump(input, &mut out);
-        (code, String::from_utf8(out).expect("utf8"))
+        let sink: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let code = pump(std::io::Cursor::new(input.to_vec()), sink.clone());
+        let s = String::from_utf8(sink.lock().unwrap().clone()).expect("utf8");
+        (code, s)
     }
 
     #[test]
@@ -596,9 +1114,352 @@ mod tests {
         let frame = br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
         let mut framed = frame.to_vec();
         framed.push(b'\n');
-        let mut out = FailWriter;
-        let code = pump(&framed[..], &mut out);
+        let sink: Arc<Mutex<FailWriter>> = Arc::new(Mutex::new(FailWriter));
+        let code = pump(std::io::Cursor::new(framed), sink);
         assert_eq!(code, 1, "broken stdout must stop the pump with code 1");
+    }
+
+    /// Mirrors production dispatch (register + admission increment) so test
+    /// accounting is exact: every dispatched test job starts at the same
+    /// counter state a worker would see.
+    fn dispatch_test_job(in_flight: &Arc<AtomicUsize>, id: i64, tool: &str) -> ToolJob {
+        in_flight.fetch_add(1, Ordering::SeqCst);
+        let idv = Value::from(id);
+        let id_key = serde_json::to_string(&idv).unwrap();
+        crate::cancel::register(&id_key);
+        ToolJob {
+            id: idv,
+            id_key,
+            params: serde_json::json!({"name": tool, "arguments": {}}),
+            modern: false,
+        }
+    }
+
+    /// DEFECT 1 (pivot) proof: the token stays registered across a panic so
+    /// the outer — not the guard — decides emit vs silence after the unwind.
+    /// Fails if token removal is reverted into the guard/inner (registry
+    /// lookup finds nothing).
+    #[test]
+    fn panic_keeps_token_releases_admission() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let job = dispatch_test_job(&in_flight, 5001, "cursor");
+        let id_key = job.id_key.clone();
+        let token = crate::cancel::get(&id_key);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_tool_job_inner(&job, token, |_| panic!("probe panic"))
+        }));
+        assert!(r.is_err(), "probe closure must unwind");
+        assert!(
+            crate::cancel::get(&id_key).is_some(),
+            "token must survive the panic for the outer emit decision"
+        );
+        // The inner never touches admission: the outer guard owns it.
+        assert_eq!(in_flight.load(Ordering::SeqCst), 1);
+        crate::cancel::remove(&id_key);
+        in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Production containment through the real `run_tool_job` path with a
+    /// panicking executor: -32603 for the id, admission released, token
+    /// removed — and the same worker (thread) processes a subsequent normal
+    /// job, proving survival.
+    #[test]
+    fn panic_emits_internal_error_and_worker_survives() {
+        let sink: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let client_dead = AtomicBool::new(false);
+        let job = dispatch_test_job(&in_flight, 5002, "cursor");
+        let id_key = job.id_key.clone();
+        run_tool_job(job, &sink, in_flight.clone(), &client_dead, |_| {
+            panic!("probe tool panic")
+        });
+        let out = String::from_utf8(sink.lock().unwrap().clone()).expect("utf8");
+        assert!(
+            out.contains("-32603") && out.contains("5002"),
+            "panic must emit -32603 Internal error for the id, got: {out}"
+        );
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "admission must be released after a contained panic"
+        );
+        assert!(
+            crate::cancel::get(&id_key).is_none(),
+            "token must be removed after the panic emit decision"
+        );
+        // Same thread processes a subsequent normal job: the worker lives.
+        // Exact accounting: every dispatched job increments first.
+        let job2 = dispatch_test_job(&in_flight, 5003, "cursor");
+        let id_key2 = job2.id_key.clone();
+        run_tool_job(job2, &sink, in_flight.clone(), &client_dead, |_| {
+            Action::Result("{}".to_string())
+        });
+        let out2 = String::from_utf8(sink.lock().unwrap().clone()).expect("utf8");
+        assert!(
+            out2.contains("5003") && out2.contains("\"result\":{}"),
+            "worker must process the next job after a panic, got: {out2}"
+        );
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "admission must be 0 after each dispatched job"
+        );
+        assert!(
+            crate::cancel::get(&id_key2).is_none(),
+            "second token must be removed after normal completion"
+        );
+    }
+
+    /// A cancel processed before the panic emit suppresses the -32603:
+    /// the executor cancels through the registry, then panics; the outer
+    /// observes the set token under the sink lock and stays silent.
+    #[test]
+    fn panic_after_processed_cancel_sends_no_response() {
+        let sink: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let client_dead = AtomicBool::new(false);
+        let job = dispatch_test_job(&in_flight, 5004, "cursor");
+        let id_key = job.id_key.clone();
+        run_tool_job(job, &sink, in_flight.clone(), &client_dead, |j| {
+            crate::cancel::cancel(&serde_json::to_string(&j.id).unwrap());
+            panic!("panic after a processed cancel")
+        });
+        let out = String::from_utf8(sink.lock().unwrap().clone()).expect("utf8");
+        assert!(
+            out.is_empty(),
+            "no -32603 may follow a processed cancel, got: {out}"
+        );
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "admission must be released on the cancelled-panic path"
+        );
+        assert!(
+            crate::cancel::get(&id_key).is_none(),
+            "token must be removed on the cancelled-panic path"
+        );
+    }
+
+    /// DEFECT 2 (pivot) proof through production dispatch: the input lock is
+    /// held here, so the `do` job must wait on it; it is cancelled while
+    /// waiting. The observing executor must never run, no frame is emitted,
+    /// and admission + token are cleaned up. This exercises the real
+    /// `run_tool_job` path, not the lock helper in isolation.
+    #[test]
+    fn cancelled_waiter_never_executes_through_dispatch() {
+        let _held = INPUT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let executed = Arc::new(AtomicBool::new(false));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let job = dispatch_test_job(&in_flight, 5005, "do");
+        let id_key = job.id_key.clone();
+        let sink: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let ex = executed.clone();
+        let s2 = sink.clone();
+        let f2 = in_flight.clone();
+        let h = std::thread::spawn(move || {
+            let client_dead = AtomicBool::new(false);
+            run_tool_job(job, &s2, f2, &client_dead, |_| {
+                ex.store(true, Ordering::SeqCst);
+                Action::Result("{}".to_string())
+            });
+        });
+        // The worker is either at an entry check or in the lock wait; the
+        // lock is held here, so the body cannot run before the cancel below.
+        std::thread::sleep(Duration::from_millis(300));
+        crate::cancel::cancel(&id_key);
+        h.join().expect("worker thread survives");
+        assert!(
+            !executed.load(Ordering::SeqCst),
+            "cancelled waiter must never execute the body"
+        );
+        assert!(
+            sink.lock().unwrap().is_empty(),
+            "cancelled waiter must emit nothing"
+        );
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "admission must be released on the waiter-cancel path"
+        );
+        assert!(
+            crate::cancel::get(&id_key).is_none(),
+            "token must be removed on the waiter-cancel path"
+        );
+    }
+
+    /// DEFECT 1 proof: admission covers the whole job including the
+    /// sink-locked emit. The sink blocks mid-write; while it is blocked,
+    /// `in_flight` must still be >0 (the EOF-drain condition: EOF must not
+    /// overtake the response), and only after the response lands is it 0.
+    /// Fails if the guard is dropped before the emit decision.
+    struct GateWriter {
+        entered: Arc<AtomicBool>,
+        open: Arc<AtomicBool>,
+        buf: Vec<u8>,
+    }
+
+    impl Write for GateWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.entered.store(true, Ordering::SeqCst);
+            while !self.open.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            self.buf.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn admission_covers_emit_eof_cannot_overtake_response() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let open = Arc::new(AtomicBool::new(false));
+        let sink: Arc<Mutex<GateWriter>> = Arc::new(Mutex::new(GateWriter {
+            entered: entered.clone(),
+            open: open.clone(),
+            buf: Vec::new(),
+        }));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let job = dispatch_test_job(&in_flight, 5006, "cursor");
+        let id_key = job.id_key.clone();
+        let s2 = sink.clone();
+        let f2 = in_flight.clone();
+        let h = std::thread::spawn(move || {
+            let client_dead = AtomicBool::new(false);
+            run_tool_job(job, &s2, f2, &client_dead, |_| {
+                Action::Result("{}".to_string())
+            });
+        });
+        // Wait until the worker is blocked inside the emit write.
+        let t0 = Instant::now();
+        while !entered.load(Ordering::SeqCst) {
+            assert!(
+                t0.elapsed() < Duration::from_secs(5),
+                "worker must reach the emit"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // EOF-drain condition: admission still held while emitting.
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            1,
+            "in_flight must cover the emit; EOF must not overtake the response"
+        );
+        open.store(true, Ordering::SeqCst);
+        h.join().expect("worker finishes after the gate opens");
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "admission must be released after the emit"
+        );
+        let out = String::from_utf8(sink.lock().unwrap().buf.clone()).expect("utf8");
+        assert!(
+            out.contains("5006") && out.contains("\"result\":{}"),
+            "response must land after the gate opens, got: {out}"
+        );
+        assert!(
+            crate::cancel::get(&id_key).is_none(),
+            "token must be removed after the emit"
+        );
+    }
+
+    /// DEFECT 4 proof: when the worker queue is gone, dispatch unwinds the
+    /// registration (token removed) as well as the admission slot.
+    #[test]
+    fn dispatch_send_failure_releases_token_and_admission() {
+        let (tx, rx) = mpsc::channel::<ToolJob>();
+        drop(rx);
+        let in_flight = AtomicUsize::new(0);
+        let sink: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+        let v = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 6001,
+            "method": "tools/call",
+            "params": {"name": "cursor", "arguments": {}},
+        });
+        let stopped = handle_fast(&v, &sink, &tx, &in_flight);
+        assert!(!stopped, "send failure is not an inline write failure");
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "admission must be released on send failure"
+        );
+        let key = serde_json::to_string(&Value::from(6001)).unwrap();
+        assert!(
+            crate::cancel::get(&key).is_none(),
+            "token must be removed on send failure"
+        );
+    }
+
+    /// DEFECT 2 proof: a tool-response write failure is surfaced through the
+    /// shared dead-client flag (not discarded), and cleanup still runs.
+    #[test]
+    fn failing_tool_writer_sets_client_dead_with_cleanup() {
+        // Read-only `cursor`: no desktop mutation, exercises the emit path.
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let job = dispatch_test_job(&in_flight, 4242, "cursor");
+        let id_key = job.id_key.clone();
+        let client_dead = AtomicBool::new(false);
+        let sink: Mutex<FailWriter> = Mutex::new(FailWriter);
+        run_tool_job(
+            job,
+            &sink,
+            in_flight.clone(),
+            &client_dead,
+            production_execute,
+        );
+        assert!(
+            client_dead.load(Ordering::SeqCst),
+            "failed tool write must raise the dead-client flag"
+        );
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "admission must be released even when the write fails"
+        );
+        assert!(
+            crate::cancel::get(&id_key).is_none(),
+            "token must be removed even when the write fails"
+        );
+    }
+
+    /// DEFECT 2 exit behavior: the reader is still open (blocked, no EOF)
+    /// when the worker observes the dead client, so exit 0 can only come
+    /// from the `client_dead` flag — the EOF path is unreachable here.
+    struct OneFrameThenBlock {
+        sent: bool,
+    }
+
+    impl std::io::Read for OneFrameThenBlock {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.sent {
+                self.sent = true;
+                let mut full = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cursor","arguments":{}}}"#.to_vec();
+                full.push(b'\n');
+                let n = full.len().min(buf.len());
+                buf[..n].copy_from_slice(&full[..n]);
+                return Ok(n);
+            }
+            // Block forever without EOF: the pump must not wait for us.
+            loop {
+                std::thread::park();
+            }
+        }
+    }
+
+    #[test]
+    fn pump_blocked_reader_exits_zero_on_dead_client() {
+        let reader = std::io::BufReader::new(OneFrameThenBlock { sent: false });
+        let sink: Arc<Mutex<FailWriter>> = Arc::new(Mutex::new(FailWriter));
+        let t0 = Instant::now();
+        let code = pump(reader, sink);
+        assert_eq!(code, 0, "dead client must exit 0 while reader still open");
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "exit must come from client_dead, not a hang"
+        );
     }
 
     /// Gap-3 proof (fails before the fix, passes after): the initialize
@@ -622,10 +1483,7 @@ mod tests {
             "cursor",
             "elements",
         ] {
-            assert!(
-                ins.contains(tool),
-                "instructions must name the {tool} tool"
-            );
+            assert!(ins.contains(tool), "instructions must name the {tool} tool");
         }
         assert!(
             ins.contains("dry_run"),
@@ -647,6 +1505,88 @@ mod tests {
             m.insert((*k).to_string(), v.clone());
         }
         m
+    }
+
+    #[test]
+    fn screenshot_absurd_region_edge_refused() {
+        let mut m = Map::new();
+        m.insert("display".to_string(), Value::from(0));
+        m.insert(
+            "region".to_string(),
+            Value::from(vec![
+                Value::from(0),
+                Value::from(0),
+                Value::from(9000),
+                Value::from(100),
+            ]),
+        );
+        let s = call_screenshot(&m);
+        assert!(
+            s.contains("8192"),
+            "9000px region edge must name the 8192 bound, got: {s}"
+        );
+    }
+
+    #[test]
+    fn screenshot_region_i64_extremes_typed_error() {
+        // Verifier repro: MIN/MAX coords must be a typed error, never a
+        // debug panic (subtraction overflow) or release bypass.
+        let mut m = Map::new();
+        m.insert("display".to_string(), Value::from(0));
+        m.insert(
+            "region".to_string(),
+            Value::from(vec![
+                Value::from(i64::MIN),
+                Value::from(0),
+                Value::from(i64::MAX),
+                Value::from(100),
+            ]),
+        );
+        let s = call_screenshot(&m);
+        assert!(
+            s.contains("bad_region"),
+            "MIN/MAX region must be a typed bad_region error, got: {s}"
+        );
+    }
+
+    #[test]
+    fn screenshot_region_grabbed_directly() {
+        // Direct-rect grab: the image matches the region exactly and the
+        // capture note says no full-frame grab happened.
+        let mut m = Map::new();
+        m.insert("display".to_string(), Value::from(0));
+        m.insert(
+            "region".to_string(),
+            Value::from(vec![
+                Value::from(0),
+                Value::from(0),
+                Value::from(200),
+                Value::from(100),
+            ]),
+        );
+        let s = call_screenshot(&m);
+        let outer: Value = serde_json::from_str(&s).expect("screenshot result is JSON");
+        let sc = outer
+            .get("structuredContent")
+            .expect("screenshot carries structuredContent");
+        let (w, h) = (
+            sc.get("image")
+                .and_then(|i| i.get("w"))
+                .and_then(|v| v.as_i64()),
+            sc.get("image")
+                .and_then(|i| i.get("h"))
+                .and_then(|v| v.as_i64()),
+        );
+        assert_eq!((w, h), (Some(200), Some(100)));
+        let note = sc
+            .get("capture")
+            .and_then(|c| c.get("note"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            note.contains("directly"),
+            "region grabs must note the direct GDI rect path, got: {note}"
+        );
     }
 
     #[test]
@@ -701,12 +1641,10 @@ mod tests {
     fn elements_payload(args: &Map<String, Value>) -> Value {
         let out = call_elements(args);
         let outer: Value = serde_json::from_str(&out).expect("outer frame");
-        let inner = outer
+        outer
             .get("structuredContent")
-            .and_then(|s| s.get("result"))
-            .and_then(|r| r.as_str())
-            .expect("structured result");
-        serde_json::from_str(inner).expect("elements payload")
+            .cloned()
+            .expect("structuredContent is the elements object")
     }
 
     #[test]
@@ -744,9 +1682,7 @@ mod tests {
                     e.get("name").and_then(|v| v.as_str()) == Some("OK")
                         && e.get("role").and_then(|v| v.as_str()) == Some("Button")
                 });
-                if (has_edit && has_ok)
-                    || t0.elapsed() > std::time::Duration::from_secs(10)
-                {
+                if (has_edit && has_ok) || t0.elapsed() > std::time::Duration::from_secs(10) {
                     break p;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -794,7 +1730,10 @@ mod tests {
             }
             assert!(!o.contains_key("win"), "compact default must omit win");
         }
-        let backend = payload.get("backend").and_then(|v| v.as_str()).unwrap_or("");
+        let backend = payload
+            .get("backend")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         assert!(
             backend == "uia" || backend == "win32",
             "backend must be uia or the deterministic win32 fallback, got: {backend} in {payload}"
