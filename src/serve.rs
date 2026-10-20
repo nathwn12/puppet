@@ -799,9 +799,10 @@ mod tests {
             backend == "uia" || backend == "win32",
             "backend must be uia or the deterministic win32 fallback, got: {backend} in {payload}"
         );
-        // Foreground untouched by a zero-pixel read: fail only if a fixture
-        // window is LEFT activated (skips with FG_SKIP when the environment
-        // provides no foreground session, e.g. headless CI).
+        // Foreground untouched by a zero-pixel read: owned-foreground after
+        // settle is reported (FG_OWN_CHURN), never failed — a read cannot
+        // activate (skips with FG_SKIP when the environment provides no
+        // foreground session, e.g. headless CI).
         crate::fixture::check_foreground_left_clean(hwnd, fg_before, "elements");
         // Evidence for the report (captured with -- --nocapture).
         println!("ELEMENTS_COMPACT_FIXTURE_JSON={payload}");
