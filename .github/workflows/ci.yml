@@ -9,7 +9,7 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  gate:
+  build:
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
