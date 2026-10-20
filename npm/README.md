@@ -39,6 +39,17 @@ no fetch. `--print-manifest` is an alias.
 - Node.js >= 22.14.0 (global `fetch` plus `crypto`/`zlib` builtins only;
   zero dependencies).
 
+## Overrides
+
+Use `npx puppet-mcp@latest`; a pinned version is only installable while its
+GitHub release exists; the one-release policy deletes older releases.
+
+Redirect the cache with `PUPPET_ENGINE_CACHE`, or inspect the pin with no
+network access (`--print-manifest` is an alias for `--doctor` above).
+There is no fully offline fresh install: the first serve run still downloads
+the pinned binary, so treat these as pins and overrides, not as a no-network
+setup.
+
 ## License
 
 MIT — see LICENSE.
