@@ -73,9 +73,10 @@ names (the workflow asserts all equal the tag and fills the hashes), and a
 - `repository.url` in `npm/package.json` must match the GitHub repo
   (`https://github.com/nathwn12/puppet`) exactly — trusted
   publishing/provenance requires it.
-- `npm/package.json` has NO `scripts` field at all (the workflow asserts
-  this): a postinstall download would silently never run under npx, so
-  the server is acquired on first RUN by the launcher instead.
+- `npm/package.json` holds ONLY the `preinstall`/`postinstall`
+  global-refusal guards (the workflow asserts exactly these two and
+  nothing else): an install-time download would silently never run
+  under npx, so the server is acquired on first RUN by the launcher instead.
 - Publish runs on a GitHub-hosted runner with `id-token: write`
   (OIDC requirement). Self-hosted runners are not trusted publishers.
 

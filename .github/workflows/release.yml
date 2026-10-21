@@ -69,7 +69,16 @@ jobs:
           if ($Matches[1] -ne $ver) { throw "crate version $($Matches[1]) != tag version $ver" }
           $pkg = Get-Content npm/package.json -Raw | ConvertFrom-Json
           if ($pkg.version -ne $ver) { throw "npm package version $($pkg.version) != tag version $ver" }
-          if ($null -ne $pkg.scripts) { throw 'npm/package.json must not contain a scripts field (postinstall would never run under npx)' }
+          # Sole scripts-field exception: the global-install-refusal
+          # preinstall/postinstall guards (no install-time download; they
+          # only refuse `npm i -g`). Anything beyond those two guards
+          # still fails closed.
+          if ($null -ne $pkg.scripts) {
+            $names = @($pkg.scripts.PSObject.Properties.Name | Sort-Object)
+            if (($names -join ',') -ne 'postinstall,preinstall' -or $pkg.scripts.preinstall -notmatch 'npm_config_global' -or $pkg.scripts.postinstall -notmatch 'npm_config_global') {
+              throw 'npm/package.json scripts field must hold only the global-install-refusal preinstall/postinstall guards'
+            }
+          }
           $man = Get-Content npm/engine-manifest.json -Raw | ConvertFrom-Json
           if ($man.serverVersion -ne $ver) { throw "manifest serverVersion $($man.serverVersion) != tag version $ver" }
           if ($man.package -ne 'puppet-mcp') { throw "manifest package $($man.package) != puppet-mcp" }
@@ -163,7 +172,7 @@ jobs:
           node -e "const v=process.versions.node.split('.').map(Number); if (!(v[0]>22||(v[0]===22&&v[1]>=14))) { console.error('need node >= 22.14.0'); process.exit(1) }"
           node -e "const v=require('child_process').execSync('npm --version').toString().trim().split('.').map(Number); if (!(v[0]>11||(v[0]===11&&(v[1]>5||(v[1]===5&&v[2]>=1))))) { console.error('need npm >= 11.5.1'); process.exit(1) }"
           test "$(node -p "require('./npm-pkg/package.json').version")" = "${GITHUB_REF_NAME#v}" || { echo "npm package version != tag version"; exit 1; }
-          node -e "for (const f of ['./npm-pkg/package.json','./npm-pkg/engine-manifest.json','./npm-pkg/bin/puppet-mcp.js']) require('fs').accessSync(f); const p=require('./npm-pkg/package.json'); if (p.scripts!==undefined) { console.error('scripts field present'); process.exit(1) }; const m=require('./npm-pkg/engine-manifest.json'); if (m.package!=='puppet-mcp') { console.error('manifest names the wrong package'); process.exit(1) }; if (m.serverVersion!==p.version) { console.error('serverVersion != package version'); process.exit(1) }; for (const s of [m.runtime.archive.sha256, m.runtime.server.sha256]) if (!/^[0-9a-f]{64}$/.test(s)) { console.error('manifest still has placeholder hashes'); process.exit(1) }; console.log('npm package OK: no scripts field, serverVersion matches, all release hashes filled')"
+          node -e "for (const f of ['./npm-pkg/package.json','./npm-pkg/engine-manifest.json','./npm-pkg/bin/puppet-mcp.js']) require('fs').accessSync(f); const p=require('./npm-pkg/package.json'); if (p.scripts!==undefined && (Object.keys(p.scripts).sort().join(',')!=='postinstall,preinstall' || !/npm_config_global/.test(p.scripts.preinstall) || !/npm_config_global/.test(p.scripts.postinstall))) { console.error('scripts field holds more than the preinstall/postinstall global-refusal guards'); process.exit(1) }; const m=require('./npm-pkg/engine-manifest.json'); if (m.package!=='puppet-mcp') { console.error('manifest names the wrong package'); process.exit(1) }; if (m.serverVersion!==p.version) { console.error('serverVersion != package version'); process.exit(1) }; for (const s of [m.runtime.archive.sha256, m.runtime.server.sha256]) if (!/^[0-9a-f]{64}$/.test(s)) { console.error('manifest still has placeholder hashes'); process.exit(1) }; console.log('npm package OK: only guard scripts, serverVersion matches, all release hashes filled')"
       - name: publish to npm (OIDC trusted publishing)
         id: publish_npm
         if: steps.release_mode.outputs.current == 'true'

@@ -5,7 +5,10 @@
 //
 // Published package model (see docs/PUBLISHING.md): this tarball holds ONLY
 // this launcher plus the pinned server manifest (engine-manifest.json).
-// It holds NO server bytes, NO `os` field, NO `scripts`/postinstall field.
+// It holds NO server bytes and NO `os` field. Its only `scripts` are the
+// global-install guards (preinstall/postinstall refuse `npm i -g` so a
+// global copy can never shadow a pinned `npx` run); no download happens
+// at install time.
 // npm 12 blocks dependency install scripts by default (measured
 // `allow-scripts=false`), and npx has no project package.json for
 // `allowScripts` to consult, so a postinstall download would silently never
@@ -42,6 +45,7 @@ const { spawn } = require('node:child_process');
 
 const PKG_DIR = path.dirname(path.dirname(__filename));
 const MANIFEST_PATH = path.join(PKG_DIR, 'engine-manifest.json');
+const PKG_PATH = path.join(PKG_DIR, 'package.json');
 const PLATFORM_OVERRIDE_ENV = 'PUPPET_MCP_ALLOW_NON_WINDOWS';
 const RUNTIME_CACHE_OVERRIDE_ENV = 'PUPPET_ENGINE_CACHE';
 const DOWNLOAD_TIMEOUT_MS = 15 * 60 * 1000;
@@ -74,6 +78,57 @@ function loadManifest() {
   }
 }
 
+function loadPackageVersion() {
+  let raw;
+  try {
+    raw = fs.readFileSync(PKG_PATH, 'utf8');
+  } catch (err) {
+    fail(`cannot read package.json at ${PKG_PATH}: ${err.message}`);
+  }
+  let pkg;
+  try {
+    pkg = JSON.parse(raw);
+  } catch (err) {
+    fail(`package.json is not valid JSON: ${err.message}`);
+  }
+  if (pkg.name !== 'puppet-mcp' || typeof pkg.version !== 'string' || pkg.version.length === 0) {
+    fail('package.json does not name a versioned puppet-mcp package.');
+  }
+  return pkg.version;
+}
+
+// Engine cache leaf dirs are `<semver>-<bundleSha8>` (or `<semver>-unpublished`
+// before the release workflow fills the manifest hashes).
+function isEngineLeafName(base) {
+  return /^\d+\.\d+\.\d+-(?:[0-9a-fA-F]{8}|unpublished)$/.test(base);
+}
+
+// The semver embedded in an engine cache path, or null when the path names
+// no engine leaf.
+function parseEngineVersionFromDir(dir) {
+  const m = /^(\d+\.\d+\.\d+)-(?:[0-9a-fA-F]{8}|unpublished)$/.exec(path.basename(dir));
+  return m ? m[1] : null;
+}
+
+// Fail closed on version skew: never spawn an engine older (or newer) than
+// this launcher. Prints one actionable line and exits non-zero.
+function assertVersionMatch(pkgVersion, manifest, cacheDir) {
+  const reprovision = `npx -y puppet-mcp@${pkgVersion}`;
+  if (manifest.serverVersion !== pkgVersion) {
+    fail(
+      `version mismatch: launcher ${pkgVersion} but manifest pins server ${manifest.serverVersion}; ` +
+      `re-provision with \`${reprovision}\` from a clean cache.`
+    );
+  }
+  const engineVersion = parseEngineVersionFromDir(cacheDir);
+  if (engineVersion !== null && engineVersion !== pkgVersion) {
+    fail(
+      `version mismatch: launcher ${pkgVersion} but engine ${engineVersion} at ${cacheDir}; ` +
+      `re-provision with \`${reprovision}\` (unset ${RUNTIME_CACHE_OVERRIDE_ENV} if it names the stale engine).`
+    );
+  }
+}
+
 // A sha256 slot the release workflow has not filled yet. The committed
 // manifest carries the sentinel for every hash computed at release time;
 // the workflow replaces each with the real 64-hex digest. Anything else
@@ -91,6 +146,12 @@ function shortHash(sha) {
 function resolveRuntimeDir(manifest) {
   const notes = [];
   let root = process.env[RUNTIME_CACHE_OVERRIDE_ENV];
+  // An override that already names an engine leaf dir (<semver>-<sha8>)
+  // is used as-is, so a stale pin resolves to the stale engine and the
+  // version gate below can refuse it instead of silently provisioning past.
+  if (root && isEngineLeafName(path.basename(path.resolve(root)))) {
+    return { dir: path.resolve(root), overridden: true, notes };
+  }
   let overridden = Boolean(root);
   if (!root) {
     root = process.env.LOCALAPPDATA;
@@ -101,11 +162,16 @@ function resolveRuntimeDir(manifest) {
   return { dir: path.join(root, 'puppet', 'engine', leaf), overridden, notes };
 }
 
-function printDoctor(manifest) {
+function printDoctor(manifest, pkgVersion) {
   const runtime = resolveRuntimeDir(manifest);
+  const engineVersion = parseEngineVersionFromDir(runtime.dir);
   const report = {
     package: manifest.package,
+    launcherVersion: pkgVersion,
     serverVersion: manifest.serverVersion,
+    engineVersion,
+    enginePath: path.join(runtime.dir, manifest.runtime.server.name),
+    versionsMatch: engineVersion === pkgVersion && manifest.serverVersion === pkgVersion,
     platform: process.platform,
     node: process.version,
     runtimeCacheDir: runtime.dir,
@@ -120,9 +186,10 @@ function printDoctor(manifest) {
 
 function usage(exitCode, stream) {
   const text = [
-    'usage: puppet-mcp [--doctor | --print-manifest | --help]',
+    'usage: puppet-mcp [--version | --doctor | --print-manifest | --help]',
     '',
     '  (no args)            provision the pinned server on first run, then serve MCP over stdio',
+    '  --version            print `puppet-mcp <launcherVersion>`, exit 0',
     '  --doctor,            print the pinned manifest and the resolved cache',
     '  --print-manifest     path, perform no network access, exit 0',
     '  --help, -h           print this usage',
@@ -385,12 +452,20 @@ async function main() {
   const args = process.argv.slice(2);
   const manifest = loadManifest();
   if (manifest.package !== 'puppet-mcp') fail('engine manifest names the wrong package.');
+  const pkgVersion = loadPackageVersion();
   if (args.includes('--help') || args.includes('-h')) usage(0, process.stdout);
+  if (args.includes('--version')) {
+    const known = new Set(['--version']);
+    const unknown = args.filter((a) => !known.has(a));
+    if (unknown.length > 0) usage(2, process.stderr);
+    process.stdout.write(`puppet-mcp ${pkgVersion}\n`);
+    process.exit(0);
+  }
   if (args.includes('--doctor') || args.includes('--print-manifest')) {
     const known = new Set(['--doctor', '--print-manifest']);
     const unknown = args.filter((a) => !known.has(a));
     if (unknown.length > 0) usage(2, process.stderr);
-    printDoctor(manifest); // exits 0; no network on this path by construction
+    printDoctor(manifest, pkgVersion); // exits 0; no network on this path by construction
   }
   // Every known flag returns above; anything left is unknown.
   if (args.length > 0) usage(2, process.stderr);
@@ -406,6 +481,9 @@ async function main() {
   if (runtime.dir.startsWith('<unresolvable>')) {
     fail(`cannot resolve runtime cache dir: ${runtime.notes.join('; ')}. Set ${RUNTIME_CACHE_OVERRIDE_ENV} to an absolute directory.`);
   }
+  // Fail closed BEFORE any download or spawn: a stale cache path (e.g. via
+  // override) or a mispublished manifest refuses here, never runs.
+  assertVersionMatch(pkgVersion, manifest, runtime.dir);
   const readyRuntime = await ensureRuntime(manifest, runtime.dir);
   runServer(readyRuntime, manifest);
 }

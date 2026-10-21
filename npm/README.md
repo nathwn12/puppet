@@ -7,8 +7,12 @@ manifest — it contains no server bytes.
 ## Run
 
 ```sh
-npx puppet-mcp@latest
+npx puppet-mcp@4.5.2
 ```
+
+Global installs are refused by design (`npm i -g` exits non-zero): a
+global copy would shadow the pinned `npx` invocation and run a stale
+engine. Always invoke the pinned version above.
 
 Or pin it in an MCP client as a stdio server with command and args:
 
@@ -26,11 +30,13 @@ stdout belongs to the MCP channel.
 ## Diagnostics (no network)
 
 ```sh
-npx puppet-mcp@latest --doctor
+npx puppet-mcp@4.5.2 --doctor
 ```
 
-Prints the pinned manifest and the resolved cache path, exits 0, performs
-no fetch. `--print-manifest` is an alias.
+Prints the launcher version, the pinned manifest, the resolved engine
+path, the engine version parsed from the cache directory name, and
+whether they match; exits 0, performs no fetch. `--print-manifest` is
+an alias. `npx puppet-mcp@4.5.2 --version` prints `puppet-mcp 4.5.2`.
 
 ## Requirements
 
