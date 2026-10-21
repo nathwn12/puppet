@@ -109,6 +109,20 @@ jobs:
           $b = (Get-FileHash -Algorithm SHA256 -LiteralPath npm-stage/engine-manifest.json).Hash
           if ($a -ne $b) { throw 'staged manifest differs from the filled manifest' }
           Write-Host "npm package staged with filled manifest $a"
+      # Pre-publish clean room: install the staged package like a stranger
+      # (scrubbed profile, empty caches) and prove the engine provisions and
+      # the server boots. Same build job, blocking: any FAIL fails the build,
+      # so publish (needs: build) can never run on a red gate.
+      - name: cleanroom check (tarball install + boot)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pack = Join-Path $env:RUNNER_TEMP 'cleanroom-packed'
+          New-Item -ItemType Directory -Path $pack -Force | Out-Null
+          $info = npm pack --json --pack-destination $pack ./npm-stage | Out-String
+          $name = node -p "Object.values(JSON.parse(process.argv[1]))[0].filename" "$info"
+          $tgz = Join-Path $pack $name
+          node scripts/cleanroom-check.mjs --tarball "$tgz"
       # Artifacts hand files to the publish job only; retention-days: 1 keeps
       # them out of the plan allowance (no public-repo exemption).
       - uses: actions/upload-artifact@v7
@@ -274,3 +288,30 @@ jobs:
               if [ "$tag" = "$GITHUB_REF_NAME" ]; then continue; fi
               gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag=false
             done
+  # Post-publish clean room: install the package the way a stranger does —
+  # straight from the public registry onto a fresh Windows runner with empty
+  # caches — and prove the engine provisions and the server boots. Blocking:
+  # no continue-on-error, so a warmed-machine-only package turns the release red.
+  cleanroom-public:
+    name: cleanroom check (public registry)
+    needs: [publish]
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: resolve version from tag
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver = $env:GITHUB_REF_NAME -replace '^v', ''
+          if ($ver -notmatch '^\d+\.\d+\.\d+$') { throw "cannot parse version from tag '$env:GITHUB_REF_NAME'" }
+          "CLEANROOM_VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: cleanroom check (registry install + boot)
+        shell: pwsh
+        run: node scripts/cleanroom-check.mjs --registry --version "$env:CLEANROOM_VERSION"
