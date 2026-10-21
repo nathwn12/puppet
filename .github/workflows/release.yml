@@ -180,11 +180,26 @@ jobs:
           set -euo pipefail
           pkg=$(node -p "require('./npm-pkg/package.json').name")
           version="${GITHUB_REF_NAME#v}"
+          tag="$GITHUB_REF_NAME"
+          if grep -q "RELEASE_WORKFLOW_FILLS_THIS" ./npm-pkg/engine-manifest.json; then
+            echo "::error::engine-manifest.json still contains placeholder RELEASE_WORKFLOW_FILLS_THIS"
+            exit 1
+          fi
+          man_ver=$(node -p "require('./npm-pkg/engine-manifest.json').serverVersion")
+          if [ "$man_ver" != "$version" ]; then
+            echo "::error::manifest serverVersion $man_ver != tag version $version"
+            exit 1
+          fi
+          node -e "const m=require('./npm-pkg/engine-manifest.json'); const tag=process.env.GITHUB_REF_NAME; const src=(m.runtime&&m.runtime.source)||''; const arc=(m.runtime&&m.runtime.archive&&m.runtime.archive.name)||''; if(!src.includes(tag)||!arc.includes(tag)){ console.error('::error::manifest runtime.source/archive do not name tag '+tag+': '+src+' / '+arc); process.exit(1); } console.log('manifest OK: serverVersion '+m.serverVersion+', runtime '+src+' / '+arc)"
           if npm view "$pkg@$version" version >/dev/null 2>&1; then
-            echo "$pkg@$version is already published; skipping npm publish"
+            published="$(npm view "$pkg@$version" version)"
+            tarball="$(npm view "$pkg@$version" dist.tarball)"
+            echo "$pkg@$version already published (registry reports $published): $tarball; skipping npm publish"
             exit 0
           fi
           npm publish ./npm-pkg
+          npm view "$pkg@$version" version >/dev/null 2>&1 || { echo "::error::npm publish did not land $pkg@$version"; exit 1; }
+          echo "published $pkg@$version: $(npm view "$pkg@$version" dist.tarball) integrity $(npm view "$pkg@$version" dist.integrity)"
       - name: delete outgoing releases
         if: always() && steps.release_mode.outputs.current == 'true'
         shell: bash
