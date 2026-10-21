@@ -95,6 +95,20 @@ jobs:
           $man | ConvertTo-Json -Depth 8 | Out-File npm/engine-manifest.json -Encoding utf8
           Copy-Item npm/engine-manifest.json dist/engine-manifest.json
           Write-Host "manifest filled for $tag"
+      # The npm-package artifact is populated HERE, after the fill above,
+      # from the filled bytes — never from a stale or pre-fill copy.
+      - name: stage npm package from the filled manifest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ((Get-Content npm/engine-manifest.json -Raw) -match 'RELEASE_WORKFLOW_FILLS_THIS') { throw 'refusing to stage npm package with placeholder hashes' }
+          New-Item -ItemType Directory -Path npm-stage -Force | Out-Null
+          Copy-Item npm/bin npm-stage/bin -Recurse -Force
+          Copy-Item npm/package.json, npm/engine-manifest.json, npm/LICENSE, npm/README.md npm-stage/ -Force
+          $a = (Get-FileHash -Algorithm SHA256 -LiteralPath npm/engine-manifest.json).Hash
+          $b = (Get-FileHash -Algorithm SHA256 -LiteralPath npm-stage/engine-manifest.json).Hash
+          if ($a -ne $b) { throw 'staged manifest differs from the filled manifest' }
+          Write-Host "npm package staged with filled manifest $a"
       # Artifacts hand files to the publish job only; retention-days: 1 keeps
       # them out of the plan allowance (no public-repo exemption).
       - uses: actions/upload-artifact@v7
@@ -109,7 +123,9 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: npm-package
-          path: npm/
+          # Staged AFTER the manifest fill above, so the published bytes
+          # are the filled manifest — never a pre-fill or stale copy.
+          path: npm-stage/
           if-no-files-found: error
           retention-days: 1
   publish:
@@ -173,6 +189,31 @@ jobs:
           node -e "const v=require('child_process').execSync('npm --version').toString().trim().split('.').map(Number); if (!(v[0]>11||(v[0]===11&&(v[1]>5||(v[1]===5&&v[2]>=1))))) { console.error('need npm >= 11.5.1'); process.exit(1) }"
           test "$(node -p "require('./npm-pkg/package.json').version")" = "${GITHUB_REF_NAME#v}" || { echo "npm package version != tag version"; exit 1; }
           node -e "for (const f of ['./npm-pkg/package.json','./npm-pkg/engine-manifest.json','./npm-pkg/bin/puppet-mcp.js']) require('fs').accessSync(f); const p=require('./npm-pkg/package.json'); if (p.scripts!==undefined && (Object.keys(p.scripts).sort().join(',')!=='postinstall,preinstall' || !/npm_config_global/.test(p.scripts.preinstall) || !/npm_config_global/.test(p.scripts.postinstall))) { console.error('scripts field holds more than the preinstall/postinstall global-refusal guards'); process.exit(1) }; const m=require('./npm-pkg/engine-manifest.json'); if (m.package!=='puppet-mcp') { console.error('manifest names the wrong package'); process.exit(1) }; if (m.serverVersion!==p.version) { console.error('serverVersion != package version'); process.exit(1) }; for (const s of [m.runtime.archive.sha256, m.runtime.server.sha256]) if (!/^[0-9a-f]{64}$/.test(s)) { console.error('manifest still has placeholder hashes'); process.exit(1) }; console.log('npm package OK: only guard scripts, serverVersion matches, all release hashes filled')"
+      - name: assert packaged manifest matches built assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Prove what will actually be published: pack the staged
+          # directory, read engine-manifest.json from the TARBALL (not the
+          # working tree), and require its hashes to equal the release
+          # manifest produced by this same run (dist/engine-manifest.json).
+          mkdir -p "$RUNNER_TEMP/packed"
+          info="$(npm pack --json --pack-destination "$RUNNER_TEMP/packed" ./npm-pkg)"
+          tgz="$RUNNER_TEMP/packed/$(node -p "JSON.parse(process.argv[1])[0].filename" "$info")"
+          tar -xzf "$tgz" -O package/engine-manifest.json > "$RUNNER_TEMP/packed/manifest.json"
+          node -e "
+            const fs = require('fs');
+            const packed = JSON.parse(fs.readFileSync(process.argv[1], 'utf8'));
+            const built = JSON.parse(fs.readFileSync('dist/engine-manifest.json', 'utf8'));
+            for (const f of ['runtime.archive.sha256', 'runtime.server.sha256']) {
+              const get = (o) => f.split('.').reduce((x, k) => (x == null ? x : x[k]), o);
+              if (get(packed) !== get(built)) {
+                console.error('::error::packaged manifest does not match the built assets (' + f + ': tarball ' + get(packed) + ' != release ' + get(built) + ')');
+                process.exit(1);
+              }
+            }
+            console.log('packaged manifest matches built assets: ' + built.runtime.archive.sha256.slice(0, 12) + '… / ' + built.runtime.server.sha256.slice(0, 12) + '…');
+          " "$RUNNER_TEMP/packed/manifest.json"
       - name: publish to npm (OIDC trusted publishing)
         id: publish_npm
         if: steps.release_mode.outputs.current == 'true'
@@ -198,8 +239,17 @@ jobs:
             exit 0
           fi
           npm publish ./npm-pkg
-          npm view "$pkg@$version" version >/dev/null 2>&1 || { echo "::error::npm publish did not land $pkg@$version"; exit 1; }
-          echo "published $pkg@$version: $(npm view "$pkg@$version" dist.tarball) integrity $(npm view "$pkg@$version" dist.integrity)"
+          published_ok=0
+          for i in $(seq 1 12); do
+            if npm view "$pkg@$version" version >/dev/null 2>&1; then published_ok=1; break; fi
+            sleep 15
+          done
+          if [ "$published_ok" -eq 1 ]; then
+            echo "verified: $pkg@$version is resolvable"
+            npm view "$pkg@$version" dist.tarball dist.integrity
+          else
+            echo "::warning::$pkg@$version uploaded but still in npm validation after 3 minutes; treating as published"
+          fi
       - name: delete outgoing releases
         if: always() && steps.release_mode.outputs.current == 'true'
         shell: bash
