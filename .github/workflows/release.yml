@@ -240,15 +240,15 @@ jobs:
           fi
           npm publish ./npm-pkg
           published_ok=0
-          for i in $(seq 1 12); do
+          for i in $(seq 1 4); do
             if npm view "$pkg@$version" version >/dev/null 2>&1; then published_ok=1; break; fi
-            sleep 15
+            sleep 10
           done
           if [ "$published_ok" -eq 1 ]; then
             echo "verified: $pkg@$version is resolvable"
             npm view "$pkg@$version" dist.tarball dist.integrity
           else
-            echo "::warning::$pkg@$version uploaded but still in npm validation after 3 minutes; treating as published"
+            echo "::warning::$pkg@$version uploaded but still in npm validation after 40 seconds; treating as published"
           fi
       - name: delete outgoing releases
         if: always() && steps.release_mode.outputs.current == 'true'

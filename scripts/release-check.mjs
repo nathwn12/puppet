@@ -5,35 +5,36 @@
 // runtime.server.sha256 equal the given release manifest's (the class of
 // bug where a stale manifest ships inside a good-looking tarball).
 // No dependencies beyond Node stdlib.
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { gunzipSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const npmDir = join(root, "npm");
 const allowPlaceholders = process.argv.includes("--allow-placeholders");
 
-function parseTar(buf) {
-  const entries = [];
-  let off = 0;
-  while (off + 512 <= buf.length) {
-    const head = buf.subarray(off, off + 512);
-    let allZero = true;
-    for (let i = 0; i < 512; i++) {
-      if (head[i] !== 0) { allZero = false; break; }
-    }
-    if (allZero) break;
-    const name = head.subarray(0, 100).toString("utf8").replace(/\0.*$/s, "");
-    const sizeOct = head.subarray(124, 136).toString("utf8").replace(/\0.*$/s, "").trim();
-    const size = sizeOct === "" ? 0 : parseInt(sizeOct, 8);
-    if (!Number.isFinite(size) || size < 0) throw new Error(`bad tar size for ${name}: ${sizeOct}`);
-    entries.push({ name, size, data: Buffer.from(buf.subarray(off + 512, off + 512 + size)) });
-    off += 512 + Math.ceil(size / 512) * 512;
+// Fail closed: tar missing or non-zero exit is a hard FAIL, never "nothing found".
+// Uses the system `tar` so PAX/GNU extended-name headers resolve to the real
+// (long) path; a hand-rolled header parser sees only the truncated prefix.
+function tarList(tarball) {
+  try {
+    const out = execFileSync("tar", ["-tzf", tarball], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    return out.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  } catch (err) {
+    const msg = String(err?.message ?? err).split("\n")[0];
+    fail("tarball-extract", `tar -tzf failed: ${msg}`);
+    printAndExit(1);
   }
-  return entries;
+}
+
+function tarExtract(tarball, member) {
+  try {
+    return execFileSync("tar", ["-xzf", tarball, "-O", member], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  } catch {
+    return null;
+  }
 }
 
 const rows = [];
@@ -42,6 +43,15 @@ const pass = (check, detail) => rows.push([check, "PASS", detail]);
 
 let tarballPath = null;
 const tmp = mkdtempSync(join(tmpdir(), "release-check-"));
+// Test hook: positional <tarball> (or RELEASE_CHECK_TARBALL) validates a fixture
+// tarball instead of npm-packing the tree.
+const compareAt = process.argv.indexOf("--compare");
+const compareVal = compareAt !== -1 ? process.argv[compareAt + 1] : null;
+const positional = process.argv.slice(2).filter((a) => a !== "--allow-placeholders" && a !== "--compare" && a !== compareVal && !a.startsWith("--"))[0] ?? null;
+const envTarball = process.env.RELEASE_CHECK_TARBALL ?? null;
+if (positional ?? envTarball) {
+  tarballPath = resolve(positional ?? envTarball);
+} else {
 try {
   const out = execSync(`npm pack --json --pack-destination "${tmp}"`, {
     cwd: npmDir, encoding: "utf8",
@@ -55,16 +65,20 @@ try {
   fail("npm-pack", String(err?.message ?? err).split("\n")[0]);
   printAndExit(1);
 }
+}
 
 let names;
 let manifestText = null;
 try {
-  const gz = readFileSync(tarballPath);
-  const tar = gunzipSync(gz);
-  const entries = parseTar(tar);
-  names = entries.map((e) => e.name.replace(/^package\//, "")).filter(Boolean);
-  const man = entries.find((e) => e.name === "package/engine-manifest.json");
-  if (man) manifestText = man.data.toString("utf8");
+  const rawNames = tarList(tarballPath);
+  names = rawNames.map((n) => n.replace(/^\.\//, "").replace(/^package\//, "")).filter(Boolean);
+  if (rawNames.some((n) => n.replace(/^\.\//, "") === "package/engine-manifest.json")) {
+    manifestText = tarExtract(tarballPath, "package/engine-manifest.json");
+    if (manifestText === null) {
+      fail("tarball-extract", "tar -xzf package/engine-manifest.json failed");
+      printAndExit(1);
+    }
+  }
 } catch (err) {
   fail("tarball-extract", String(err?.message ?? err).split("\n")[0]);
   printAndExit(1);
