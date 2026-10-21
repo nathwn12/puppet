@@ -86,3 +86,14 @@ The sibling's `browser-update` workflow exists only because gladius pins an
 external Chromium build that drifts monthly. puppet pins no external
 runtime — the only versioned artifact is this repo's own binary — so there
 is no sibling to mirror and nothing scheduled to bump.
+
+## Local release preflight (no publish)
+
+Run `node scripts/release-check.mjs` from the repo root before tagging:
+it packs `npm/` exactly as npm would, extracts `engine-manifest.json`
+from the tarball with Node's `zlib` plus a minimal tar reader (no new
+dependency), and asserts `serverVersion` equals `npm/package.json`,
+zero `RELEASE_WORKFLOW_FILLS_THIS` placeholders (pass
+`--allow-placeholders` on a dev tree where the workflow has not filled
+hashes yet), and no `.exe`, `.env`, `*secret*`, or `node_modules` in the
+tarball. It prints a PASS/FAIL table and exits non-zero on any failure.
