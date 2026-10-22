@@ -2,8 +2,15 @@
 // Clean-room gate: install the package the way a stranger does — scrubbed
 // profile, empty caches — then prove the engine provisions and the server boots.
 //
-//   node scripts/cleanroom-check.mjs --tarball <path.tgz> [--keep]
+//   node scripts/cleanroom-check.mjs --tarball <path.tgz> [--bundle <path.zip>] [--keep]
 //   node scripts/cleanroom-check.mjs --registry --version <semver> [--keep]
+//
+// --bundle points the launcher (PUPPET_ENGINE_BUNDLE) at a locally built
+// runtime archive instead of the Release download, so the gate can run BEFORE
+// that Release exists. It applies to --tarball mode only; the launcher still
+// checks the archive's size and sha256 against the installed manifest, so a
+// wrong zip fails this gate exactly like a bad download would. --registry mode
+// scrubs the override, so the public gate can never be bypassed.
 //
 // Windows-only; Node stdlib only. Prints a PASS/FAIL table, exits 1 on any
 // FAIL. Cleans its temp dir in a finally unless --keep is passed. Never
@@ -11,10 +18,10 @@
 // under <tmp> in the scrubbed child env.
 import { spawn, spawnSync } from "node:child_process";
 import {
-  existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync,
+  copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const BOOT_TIMEOUT_MS = 300_000;
@@ -41,7 +48,9 @@ const registry = argv.includes("--registry");
 const vi = argv.indexOf("--version");
 const tarballArg = ti !== -1 ? argv[ti + 1] : null;
 const versionArg = vi !== -1 ? argv[vi + 1] : null;
-const usage = "usage: node scripts/cleanroom-check.mjs --tarball <path.tgz> [--keep] | --registry --version <semver> [--keep]";
+const bi = argv.indexOf("--bundle");
+const bundleArg = bi !== -1 ? argv[bi + 1] : null;
+const usage = "usage: node scripts/cleanroom-check.mjs --tarball <path.tgz> [--bundle <path.zip>] [--keep] | --registry --version <semver> [--keep]";
 function dieUsage(msg) {
   console.error(`cleanroom: ${msg}\n${usage}`);
   process.exit(1);
@@ -53,6 +62,14 @@ if (tarballArg && versionArg) dieUsage("--tarball takes a <path.tgz>, not --vers
 if (tarballArg && tarballArg.startsWith("--")) dieUsage("--tarball needs a <path.tgz> value");
 if (tarballArg && (!existsSync(resolve(tarballArg)) || statSync(resolve(tarballArg)).isDirectory())) {
   dieUsage(`tarball not found: ${tarballArg}`);
+}
+// --bundle is a tarball-mode input only: in --registry mode the launcher must
+// provision from the public Release, so an override there would fake the gate.
+if (bi !== -1 && !bundleArg) dieUsage("--bundle needs a <path.zip> value");
+if (bundleArg && bundleArg.startsWith("--")) dieUsage("--bundle needs a <path.zip> value");
+if (bundleArg && registry) dieUsage("--bundle applies to --tarball mode only; --registry must download from the public Release");
+if (bundleArg && (!existsSync(resolve(bundleArg)) || statSync(resolve(bundleArg)).isDirectory())) {
+  dieUsage(`bundle not found: ${bundleArg}`);
 }
 
 const rows = [];
@@ -97,6 +114,19 @@ childEnv.npm_config_cache = npmCache;
 childEnv.npm_config_prefix = npmPrefix;
 // A stale engine pin in the parent env would bypass the clean room; scrub it.
 delete childEnv.PUPPET_ENGINE_CACHE;
+// A local-bundle override is only ever supplied by this script, and only for
+// the pre-publish tarball gate. Scrubbing it here means --registry can never
+// inherit one and skip the real download.
+delete childEnv.PUPPET_ENGINE_BUNDLE;
+// Tarball mode + --bundle: hand the child a copy inside <tmp> so the gate still
+// touches nothing outside its scratch dir. The launcher verifies the copy's
+// size and sha256 against the installed manifest, so a wrong zip is refused.
+if (tarballArg && bundleArg) {
+  const stagedBundle = join(tmp, "bundle", basename(resolve(bundleArg)));
+  mkdirSync(dirname(stagedBundle), { recursive: true });
+  copyFileSync(resolve(bundleArg), stagedBundle);
+  childEnv.PUPPET_ENGINE_BUNDLE = stagedBundle;
+}
 
 function sh(command, { timeout = STEP_TIMEOUT_MS } = {}) {
   // Single command string + shell:true: Node hands it to cmd.exe verbatim,
@@ -289,6 +319,7 @@ try {
   console.log(`temp engine: ${engineDir ?? "(none)"}`);
   console.log(`exe size: ${exeSize ?? "(missing)"} (manifest ${wantSize ?? "(unknown)"})`);
   console.log(`.ready: ${readyPresent ? "present" : "missing"}`);
+  console.log(`engine source: ${childEnv.PUPPET_ENGINE_BUNDLE ? `local bundle ${childEnv.PUPPET_ENGINE_BUNDLE}` : "Release download"}`);
   console.log(`boot: ${bootMs == null ? "(n/a)" : `${(bootMs / 1000).toFixed(1)}s`} exit ${bootCode}`);
   console.log(`real cache unchanged: ${same ? "yes" : "NO"} (${realBefore.length} -> ${realAfter.length} dirs)`);
   exitCode = rows.some((r) => r[1] === "FAIL") ? 1 : 0;

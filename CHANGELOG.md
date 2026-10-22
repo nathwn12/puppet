@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.5.5] - 2026-10-23
+
+### Fixed
+
+- Release gate: the pre-publish cleanroom installed the tarball and booted
+  it, but the launcher fetches `runtime.archive` from the GitHub Release —
+  an asset the `publish` job creates *after* `needs: [build]`. Any new
+  version therefore 404'd at the gate, which is what turned the 4.5.4 tag
+  red. The launcher gained `PUPPET_ENGINE_BUNDLE`, a diagnostics-only
+  override that reads a local zip instead of downloading, and
+  `scripts/cleanroom-check.mjs` gained `--bundle` to point it at the
+  archive built in the same run. The size and sha256 checks are unchanged
+  and still run on the local bytes, and `--registry` mode scrubs the
+  override, so the gate keeps its teeth. The gate is not weakened: it is
+  fed the real artifact.
+
+### Added
+
+- `release.yml` accepts `workflow_dispatch` with `version` and `dry_run`
+  (default `true`), so the whole build + pre-publish gate can be rehearsed
+  under a `v<version>` tag before one exists. A dry run skips exactly the
+  irreversible steps — release creation, npm publish, outgoing-release
+  deletion — and the public-registry gate that depends on them.
+
+No engine behaviour change.
+
 ## [4.5.4] - 2026-10-23
 
 ### Changed

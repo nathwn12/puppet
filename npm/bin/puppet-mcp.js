@@ -48,6 +48,12 @@ const MANIFEST_PATH = path.join(PKG_DIR, 'engine-manifest.json');
 const PKG_PATH = path.join(PKG_DIR, 'package.json');
 const PLATFORM_OVERRIDE_ENV = 'PUPPET_MCP_ALLOW_NON_WINDOWS';
 const RUNTIME_CACHE_OVERRIDE_ENV = 'PUPPET_ENGINE_CACHE';
+// Local-bundle override, diagnostics only. A normal run leaves it unset and
+// downloads runtime.archive from the Release. The pre-publish cleanroom names
+// the archive it just built, because the Release that would serve it does not
+// exist until AFTER the build job passes. Every size/sha256 assertion still
+// runs on the local bytes: an override can never smuggle in a bad artifact.
+const RUNTIME_BUNDLE_OVERRIDE_ENV = 'PUPPET_ENGINE_BUNDLE';
 const DOWNLOAD_TIMEOUT_MS = 15 * 60 * 1000;
 // Staging/extraction guards: the real runtime bundle is ~2 MB. These caps
 // reject zip bombs, never the real artifact.
@@ -177,6 +183,12 @@ function printDoctor(manifest, pkgVersion) {
     runtimeCacheDir: runtime.dir,
     runtimeCacheOverridden: runtime.overridden,
     runtimeCacheNotes: runtime.notes,
+    runtimeBundleOverride: {
+      env: RUNTIME_BUNDLE_OVERRIDE_ENV,
+      set: Boolean(process.env[RUNTIME_BUNDLE_OVERRIDE_ENV]),
+      path: process.env[RUNTIME_BUNDLE_OVERRIDE_ENV] ?? null,
+      note: 'diagnostics only: the pre-publish cleanroom points this at the archive it just built; a normal run leaves it unset and downloads runtime.archive, whose size and sha256 are checked either way',
+    },
     runtime: manifest.runtime,
     network: 'none: this diagnostic performs no fetch and exits before any download code',
   };
@@ -195,6 +207,8 @@ function usage(exitCode, stream) {
     '  --help, -h           print this usage',
     '',
     'runtime cache: ' + path.join('%LOCALAPPDATA%', 'puppet', 'engine', '<serverVersion>-<bundleSha8>') + ` (override: ${RUNTIME_CACHE_OVERRIDE_ENV})`,
+    `local bundle: unset by default; ${RUNTIME_BUNDLE_OVERRIDE_ENV} names a zip file to verify and extract`,
+    '              instead of downloading (pre-publish diagnostics only; size and sha256 are still checked)',
     `platform: windows-x86_64 only (override: ${PLATFORM_OVERRIDE_ENV}=1, diagnostics only)`,
   ].join('\n') + '\n';
   stream.write(text);
@@ -385,21 +399,38 @@ async function ensureRuntime(manifest, cacheDir) {
     return cacheDir;
   }
 
-  const url = `${rt.source}/${rt.archive.name}`;
-  log(`provisioning runtime cache: ${cacheDir}`);
-  log(`downloading ${url} (${rt.archive.size} bytes)`);
+  // Local bundle override: the pre-publish cleanroom builds the archive in
+  // this same job, before any GitHub Release exists, so it hands the zip over
+  // instead of fetching a URL that cannot exist yet. The size and sha256
+  // checks below stay unconditional: a local zip that disagrees with the
+  // manifest is refused exactly like a corrupt download would be.
+  const localBundle = process.env[RUNTIME_BUNDLE_OVERRIDE_ENV];
+  const origin = localBundle ? 'local bundle' : 'download';
   let data;
-  try {
-    data = await downloadToMemory(url);
-  } catch (err) {
-    fail(err.message);
+  if (localBundle) {
+    log(`provisioning runtime cache: ${cacheDir}`);
+    log(`reading ${localBundle} (${RUNTIME_BUNDLE_OVERRIDE_ENV} set; pre-publish diagnostics only)`);
+    try {
+      data = fs.readFileSync(localBundle);
+    } catch (err) {
+      fail(`cannot read local bundle ${localBundle}: ${err.message}`);
+    }
+  } else {
+    const url = `${rt.source}/${rt.archive.name}`;
+    log(`provisioning runtime cache: ${cacheDir}`);
+    log(`downloading ${url} (${rt.archive.size} bytes)`);
+    try {
+      data = await downloadToMemory(url);
+    } catch (err) {
+      fail(err.message);
+    }
   }
   if (data.length !== rt.archive.size) {
-    fail(`download size ${data.length} != manifest ${rt.archive.size}; wrote nothing.`);
+    fail(`${origin} size ${data.length} != manifest ${rt.archive.size}; wrote nothing.`);
   }
   const digest = crypto.createHash('sha256').update(data).digest('hex');
   if (digest !== rt.archive.sha256.toLowerCase()) {
-    fail('download sha256 mismatch; wrote nothing.');
+    fail(`${origin} sha256 mismatch; wrote nothing.`);
   }
 
   // Extract into a staging dir, verify, then rename: the target dir is
