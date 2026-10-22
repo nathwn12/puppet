@@ -7,12 +7,12 @@ manifest — it contains no server bytes.
 ## Run
 
 ```sh
-npx puppet-mcp@4.5.4
+npx puppet-mcp@latest
 ```
 
 Global installs are refused by design (`npm i -g` exits non-zero): a
-global copy would shadow the pinned `npx` invocation and run a stale
-engine. Always invoke the pinned version above.
+global copy would shadow the `npx` invocation and run a stale engine.
+Always invoke it through `npx` as above.
 
 Or pin it in an MCP client as a stdio server with command and args:
 
@@ -30,13 +30,14 @@ stdout belongs to the MCP channel.
 ## Diagnostics (no network)
 
 ```sh
-npx puppet-mcp@4.5.4 --doctor
+npx puppet-mcp@latest --doctor
 ```
 
 Prints the launcher version, the pinned manifest, the resolved engine
 path, the engine version parsed from the cache directory name, and
 whether they match; exits 0, performs no fetch. `--print-manifest` is
-an alias. `npx puppet-mcp@4.5.4 --version` prints `puppet-mcp 4.5.4`.
+an alias. `npx puppet-mcp@latest --version` prints the package name and
+the version it is running.
 
 ## Requirements
 
@@ -55,6 +56,11 @@ network access (`--print-manifest` is an alias for `--doctor` above).
 There is no fully offline fresh install: the first serve run still downloads
 the pinned binary, so treat these as pins and overrides, not as a no-network
 setup.
+
+## Full documentation
+
+https://github.com/nathwn12/puppet/blob/main/README.md
+https://www.npmjs.com/package/puppet-mcp
 
 ## License
 
