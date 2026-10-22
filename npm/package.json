@@ -1,6 +1,6 @@
 {
   "name": "puppet-mcp",
-  "version": "4.5.3",
+  "version": "4.5.4",
   "description": "Windows desktop-control MCP server (npx launcher): provisions the pinned server binary from the GitHub Release on first run, then serves MCP over stdio",
   "license": "MIT",
   "repository": {
@@ -15,8 +15,8 @@
     "puppet-mcp": "./bin/puppet-mcp.js"
   },
   "scripts": {
-    "preinstall": "node -e \"if(process.env.npm_config_global==='true'){console.error('puppet-mcp: global install refused — use npx puppet-mcp@4.5.3');process.exit(1)}\"",
-    "postinstall": "node -e \"if(process.env.npm_config_global==='true'){console.error('puppet-mcp: global install refused — use npx puppet-mcp@4.5.3');process.exit(1)}\""
+    "preinstall": "node -e \"if(process.env.npm_config_global==='true'){console.error('puppet-mcp: global install refused — use npx puppet-mcp@4.5.4');process.exit(1)}\"",
+    "postinstall": "node -e \"if(process.env.npm_config_global==='true'){console.error('puppet-mcp: global install refused — use npx puppet-mcp@4.5.4');process.exit(1)}\""
   },
   "files": [
     "bin/",

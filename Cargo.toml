@@ -1,6 +1,6 @@
 [package]
 name = "puppet"
-version = "4.5.3"
+version = "4.5.4"
 edition = "2021"
 license = "MIT"
 description = "Native-Rust Windows desktop-control MCP server over stdio: screenshot, windows, input, cursor."
