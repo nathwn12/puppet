@@ -7,7 +7,7 @@ manifest — it contains no server bytes.
 ## Run
 
 ```sh
-npx puppet-mcp@4.5.3
+npx puppet-mcp@4.5.4
 ```
 
 Global installs are refused by design (`npm i -g` exits non-zero): a
@@ -30,13 +30,13 @@ stdout belongs to the MCP channel.
 ## Diagnostics (no network)
 
 ```sh
-npx puppet-mcp@4.5.3 --doctor
+npx puppet-mcp@4.5.4 --doctor
 ```
 
 Prints the launcher version, the pinned manifest, the resolved engine
 path, the engine version parsed from the cache directory name, and
 whether they match; exits 0, performs no fetch. `--print-manifest` is
-an alias. `npx puppet-mcp@4.5.3 --version` prints `puppet-mcp 4.5.3`.
+an alias. `npx puppet-mcp@4.5.4 --version` prints `puppet-mcp 4.5.4`.
 
 ## Requirements
 
