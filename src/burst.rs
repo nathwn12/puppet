@@ -601,7 +601,10 @@ unsafe fn clip_read_u16(ptr: *const u16, max_units: usize) -> Result<String, Str
     Ok(String::from_utf16_lossy(slice))
 }
 
-fn clipboard_set(text: &str) -> Result<(), String> {
+/// `OpenClipboard`/`EmptyClipboard`/`SetClipboardData` behind a clipboard
+/// permit: the token is the `allow_clipboard:true` flag, so a call that never
+/// asked cannot overwrite the owner's clipboard even by mistake.
+fn clipboard_set(_permit: &crate::gate::ClipboardPermit, text: &str) -> Result<(), String> {
     // Bound first: a rejection never touches the clipboard.
     check_clip_len(text.chars().count())?;
     unsafe {
@@ -2494,6 +2497,9 @@ pub struct DoArgs<'a> {
     pub allow_foreground: bool,
     /// Explicit permission to move the owner's pointer.
     pub allow_cursor: bool,
+    /// Explicit permission to overwrite the owner's global clipboard (a side
+    /// effect outside the target window).
+    pub allow_clipboard: bool,
 }
 
 impl<'a> DoArgs<'a> {
@@ -2510,6 +2516,7 @@ impl<'a> DoArgs<'a> {
             target: None,
             allow_foreground: false,
             allow_cursor: false,
+            allow_clipboard: false,
         }
     }
 
@@ -2761,7 +2768,10 @@ pub fn do_burst(args: &DoArgs) -> String {
         )
         // Posted keyboard is allowed ONLY on the server's own hidden
         // desktop (a launched app, no owner session to desync).
-        .private_desktop(private_desktop);
+        .private_desktop(private_desktop)
+        // Writing the owner's clipboard is a side effect outside the target
+        // window: explicit flag only, refused before any clipboard access.
+        .allow_clipboard(args.allow_clipboard);
         if let Err(e) = gate.decide(typ, has_coords, has_element) {
             let mut m = base_entry(i, &typ_v, false, elapsed_ms(&t0));
             m.insert("code".to_string(), Value::from(e.code));
@@ -3650,6 +3660,23 @@ pub fn do_burst(args: &DoArgs) -> String {
                 } else {
                     st.marked.clear();
                 }
+                // The owner's clipboard is shared state outside the target
+                // window: mint the permit FIRST, so a call that did not pass
+                // allow_clipboard:true is a typed per-action refusal and no
+                // clipboard API (not even OpenClipboard) is reached.
+                let permit = match crate::gate::ClipboardPermit::grant(args.allow_clipboard) {
+                    Some(p) => p,
+                    None => {
+                        let e = crate::gate::clipboard_refusal("clipboard_set");
+                        let mut m = base_entry(i, &typ_v, false, elapsed_ms(&t0));
+                        m.insert("code".to_string(), Value::from(e.code));
+                        m.insert("error".to_string(), Value::from(e.text()));
+                        if dry_run {
+                            m.insert("dry_run".to_string(), Value::from(true));
+                        }
+                        return Ok(Some(m));
+                    }
+                };
                 let text = match ad.get("text") {
                     None => String::new(),
                     Some(v) => py_str(v),
@@ -3666,7 +3693,7 @@ pub fn do_burst(args: &DoArgs) -> String {
                     m.insert("dry_run".to_string(), Value::from(true));
                     return Ok(Some(m));
                 }
-                match clipboard_set(&text) {
+                match clipboard_set(&permit, &text) {
                     Ok(_) => return Ok(Some(base_entry(i, &typ_v, true, elapsed_ms(&t0)))),
                     Err(e) => {
                         let mut m = base_entry(i, &typ_v, false, elapsed_ms(&t0));
@@ -5163,7 +5190,11 @@ mod tests {
         // never opened, and dry_run proves it without side effects.
         let big = "x".repeat(1_048_576 + 1);
         let actions = vec![serde_json::json!({"type": "clipboard_set", "text": big})];
-        let out = do_burst(&DoArgs::foreground(&actions));
+        let args = DoArgs {
+            allow_clipboard: true,
+            ..DoArgs::foreground(&actions)
+        };
+        let out = do_burst(&args);
         let outer: Value = serde_json::from_str(&out).expect("outer frame");
         let first = outer
             .get("structuredContent")
@@ -5179,6 +5210,58 @@ mod tests {
                 .unwrap_or("")
                 .contains("1048576"),
             "over-cap set must name the bound, got: {first:?}"
+        );
+    }
+
+    #[test]
+    fn clipboard_set_without_flag_is_a_typed_refusal_and_burst_continues() {
+        // Ungated safety proof: the gate refuses BEFORE any clipboard API, so
+        // this runs on a headless runner and touches no clipboard at all.
+        // The following action proves continue-always.
+        let actions = vec![
+            serde_json::json!({"type": "clipboard_set", "text": "SHOULD-NOT-LAND"}),
+            serde_json::json!({"type": "wait", "ms": 1}),
+        ];
+        let out = do_burst(&DoArgs::new(&actions));
+        let outer: Value = serde_json::from_str(&out).expect("outer frame");
+        let results = outer
+            .get("structuredContent")
+            .and_then(|v| v.get("results"))
+            .and_then(|v| v.as_array())
+            .expect("results");
+        let first = results.first().expect("first result");
+        assert_eq!(first.get("ok"), Some(&Value::from(false)));
+        assert_eq!(
+            first.get("code").and_then(|c| c.as_str()),
+            Some("clipboard_write_required"),
+            "missing flag must be typed, got: {first:?}"
+        );
+        assert!(
+            first
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .contains("allow_clipboard:true"),
+            "refusal must name the flag, got: {first:?}"
+        );
+        assert_eq!(
+            results.get(1).and_then(|r| r.get("ok")),
+            Some(&Value::from(true)),
+            "a refused clipboard_set must not abort the burst: {results:?}"
+        );
+        // clipboard_get is a read and stays free.
+        let reads = vec![serde_json::json!({"type": "clipboard_get"})];
+        let out = do_burst(&DoArgs::new(&reads));
+        let outer: Value = serde_json::from_str(&out).expect("outer frame");
+        let first = outer
+            .get("structuredContent")
+            .and_then(|v| v.get("results"))
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .expect("first result");
+        assert!(
+            first.get("code").is_none(),
+            "clipboard_get needs no flag, got: {first:?}"
         );
     }
 

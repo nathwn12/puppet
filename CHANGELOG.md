@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.0.0] - 2026-10-24
+
+### Changed (breaking)
+
+- **`clipboard_set` is deny-by-default.** Overwriting the owner's global
+  clipboard is a side effect *outside* the target window (every application
+  shares that clipboard), so `do` now requires `allow_clipboard: true` for a
+  `clipboard_set` action. Without it the action fails with the typed refusal
+  `clipboard_write_required`, naming the exact flag, **before any clipboard
+  access**: no `OpenClipboard`, no `EmptyClipboard`, no
+  `SetClipboardData`, so a refused call cannot have altered the clipboard.
+  The refusal is per-action like every other gate refusal - it never aborts
+  the rest of the burst. `clipboard_get` is a read and stays free, and
+  `restore`/`dry_run` semantics are unchanged (`dry_run` still touches
+  nothing; it refuses identically, because a dry run that reports ok while
+  the live call would refuse is a lie).
+- `ClipboardPermit` joins `ForegroundPermit`/`CursorPermit`: the sole mint is
+  the flag, `clipboard_set` demands the token, and `tests/no_steal.rs` pins
+  both the mint audit and the permit-typed signature.
+
 ## [5.0.0] - 2026-10-23
 
 ### Changed (breaking)

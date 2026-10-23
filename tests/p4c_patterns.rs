@@ -257,6 +257,27 @@ fn do_one(s: &mut Session, id: i64, action: Value, bg: &str) -> Value {
         .unwrap_or_else(|| panic!("do must return one result, got: {sc}"))
 }
 
+/// Same, but with the explicit `allow_foreground:true` that 5.0.0's contract
+/// requires for UIA WRITES (`set_value`, and `type` on an element): their
+/// provider may focus the control it writes, so an unflagged call is refused
+/// with `foreground_required` before any provider call. Only the write
+/// actions use this; `invoke`/expand/collapse stay background-safe and keep
+/// going through `do_one` with no flag, which is exactly what those tests
+/// prove.
+fn do_one_fg(s: &mut Session, id: i64, action: Value, bg: &str) -> Value {
+    let r = s.result(
+        id,
+        "do",
+        serde_json::json!({"actions": [action], "background": bg, "allow_foreground": true}),
+    );
+    let sc = sc_of(&r, "do");
+    sc.get("results")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .cloned()
+        .unwrap_or_else(|| panic!("do must return one result, got: {sc}"))
+}
+
 fn do_one_dry(s: &mut Session, id: i64, action: Value, bg: &str) -> Value {
     let r = s.result(
         id,
@@ -433,8 +454,29 @@ fn set_value_range_trackbar() {
     std::thread::sleep(Duration::from_millis(500));
     let mut s = Session::spawn();
     let bg = format!("title:{title}");
+    // Gate proof first: the SAME write without the flag must refuse typed and
+    // write nothing, so the explicit permission below is the contract and not
+    // a way around it.
+    let refused = do_one(
+        &mut s,
+        19,
+        serde_json::json!({"type": "set_value", "element": "auto_id:3001", "text": "77"}),
+        &bg,
+    );
+    assert_eq!(
+        refused.get("ok"),
+        Some(&Value::from(false)),
+        "unflagged set_value must refuse, got: {refused}"
+    );
+    assert_eq!(
+        refused.get("code").and_then(|c| c.as_str()),
+        Some("foreground_required"),
+        "unflagged set_value must be typed foreground_required, got: {refused}"
+    );
     // Numeric write through the RangeValue fallback, with read-back.
-    let first = do_one(
+    // set_value is a UIA write (the provider may focus the control), so the
+    // call carries the explicit allow_foreground:true the 5.0.0 gate demands.
+    let first = do_one_fg(
         &mut s,
         20,
         serde_json::json!({"type": "set_value", "element": "auto_id:3001", "text": "42"}),
@@ -451,7 +493,7 @@ fn set_value_range_trackbar() {
         "range write must read back the live value, got: {first}"
     );
     // Out-of-range is a typed error, not a silent clamp.
-    let first = do_one(
+    let first = do_one_fg(
         &mut s,
         21,
         serde_json::json!({"type": "set_value", "element": "auto_id:3001", "text": "200"}),
@@ -471,7 +513,7 @@ fn set_value_range_trackbar() {
         "out-of-range must name the bound, got: {first}"
     );
     // Non-numeric text is a typed error, never a silent 0.
-    let first = do_one(
+    let first = do_one_fg(
         &mut s,
         22,
         serde_json::json!({"type": "set_value", "element": "auto_id:3001", "text": "loud"}),
@@ -540,8 +582,9 @@ fn elements_detail_text_and_fp_stability() {
         "multiline text must be extracted, got: {text:?}"
     );
     let fp_before = edit.get("fp").cloned().expect("entry carries fp");
-    // Rewrite the content: fp must not move (text is not identity).
-    let first = do_one(
+    // Rewrite the content: fp must not move (text is not identity). A UIA
+    // write, so the explicit allow_foreground:true is part of the contract.
+    let first = do_one_fg(
         &mut s,
         31,
         serde_json::json!({"type": "set_value", "element": "auto_id:3002", "text": "changed"}),
