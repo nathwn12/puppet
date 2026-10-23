@@ -1,0 +1,155 @@
+# Dispatch-only verification of a PUBLISHED npm release.
+#
+# NOT IN THE RELEASE PATH. This workflow is dispatched by hand, after a release
+# has already published, to prove that the bytes a stranger receives from the
+# public registry install and the server boots. A red here never blocks a
+# release and never strands a tag: npm versions are immutable, so a failure in
+# this job cannot be re-run green for the version under test. It is a report, not
+# a gate. The release path is .github/workflows/release.yml and its jobs are
+# exactly `build` and `publish`.
+#
+# Why it lives here: the poll below waits on npm's READ path, which is served by
+# replicas that lag the publish by seconds to minutes. That is a property of
+# npm's CDN, not of the artifact, so a replica that has not caught up must never
+# be able to fail a release that already published successfully. Kept as a
+# manual lane, the same poll keeps all of its value and takes none of the
+# release with it when it is slow.
+#
+# Dispatch: Actions -> verify-published -> Run workflow, usually against the tag
+# you just released, e.g.
+#   package: puppet-mcp
+#   version: 4.5.8
+name: verify-published
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: 'Published npm package to verify'
+        required: true
+        default: 'puppet-mcp'
+        type: string
+      version:
+        description: 'Exactly published version to verify, without the leading v (e.g. 4.5.8)'
+        required: true
+        type: string
+jobs:
+  verify:
+    name: verify published package (registry install + boot)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      # Dispatch inputs are untrusted text: shape-check them once here and
+      # publish them as env for the lifted steps below, so those steps stay
+      # byte-identical to the ones release.yml used to run.
+      - name: resolve dispatch inputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkg = $env:INPUT_PACKAGE.Trim()
+          $ver = $env:INPUT_VERSION.Trim() -replace '^v', ''
+          if ($pkg -notmatch '^(@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*$') { throw "package '$pkg' is not a valid npm package name" }
+          if ($ver -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$') { throw "version '$ver' is not a semver shape (expected X.Y.Z)" }
+          "CLEANROOM_PACKAGE=$pkg" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CLEANROOM_VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "verifying $pkg@$ver dispatched from $env:GITHUB_REF"
+      # Registry readiness poll. npm's READ path (the CDN behind `npm view`)
+      # lags the publish by seconds, and v4.5.7 went red HERE: the retry budget
+      # was 4 x 10 s of FULL cleanroom boots (~40 s) against a replica that had
+      # not caught up, while the publish step itself had already warned that
+      # the version was still in validation after 40 s. Retrying the expensive
+      # thing on a cheap-to-detect condition was the defect, not the number.
+      # So: poll the CHEAP read first — one `npm view`, no install, no boot —
+      # with a budget sized to the observed lag shape: 20 attempts 15 s apart,
+      # at most 19 sleeps (285 s) plus 20 views (~1-2 s each), a bounded worst
+      # case of roughly 5.1-5.4 min, well under the 6 min ceiling. Only the
+      # not-found/propagation shape is retried; auth, a wrong registry, or a
+      # malformed spec fails on the first attempt instead of burning budget.
+      # Once this step passes, the cleanroom below runs exactly ONCE: it no
+      # longer owns propagation at all.
+      - name: wait for npm to serve the published version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # npm's ETARGET arrives on stderr and is data to classify, never a
+          # terminating error to throw on.
+          $PSNativeCommandUseErrorActionPreference = $false
+          $pkg = $env:CLEANROOM_PACKAGE
+          $ver = $env:CLEANROOM_VERSION
+          $attempts = 20
+          $sleepSec = 15
+          $propagation = 'E404|ETARGET|No matching version found|notarget'
+          # A registry that is not the public one would fail every attempt for
+          # a reason that cannot resolve itself: refuse before polling.
+          $registry = (& npm config get registry 2>&1 | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $registry -notmatch '^https://registry\.npmjs\.org/?$') {
+            throw "npm is not pointed at the public registry (got '$registry', exit $LASTEXITCODE); refusing to poll"
+          }
+          Write-Host "waiting for $pkg@$ver on $registry (up to $attempts attempts, $sleepSec s apart)"
+          $logs = [System.Collections.Generic.List[string]]::new()
+          for ($i = 1; $i -le $attempts; $i++) {
+            $out = & npm view "$pkg@$ver" version 2>&1 | Out-String
+            $code = $LASTEXITCODE
+            $logs.Add("--- attempt $i/$attempts (exit $code) ---`n$out")
+
+            if ($code -eq 0) {
+              # Exit 0 with a different version printed is not propagation: the
+              # spec did not resolve to what this tag asked for. Fail at once.
+              if ($out.Trim() -ne $ver) {
+                $logs | ForEach-Object { Write-Host $_ }
+                throw "npm resolved '$($out.Trim())' instead of $ver for $pkg@$ver on attempt $i/$attempts; not a propagation delay"
+              }
+              # npx installs the tarball, so metadata without a served tarball
+              # is the same read-path lag: keep polling rather than boot.
+              $tarball = (& npm view "$pkg@$ver" dist.tarball 2>&1 | Out-String).Trim()
+              $tcode = $LASTEXITCODE
+              $logs.Add("--- attempt $i/$attempts dist.tarball (exit $tcode) ---`n$tarball")
+              if ($tcode -eq 0 -and $tarball -match '^https://') {
+                Write-Host "attempt $i/$attempts : $pkg@$ver resolves ($tarball)"
+                exit 0
+              }
+              if ($i -lt $attempts) {
+                Write-Host "attempt $i/$attempts : $pkg@$ver resolves but its tarball is not served yet; retrying in $sleepSec s"
+                Start-Sleep -Seconds $sleepSec
+              }
+              continue
+            }
+            # Anything that is not the not-found/propagation shape (E401/E403
+            # auth, a network failure to another host, a malformed spec) is a
+            # real defect: print and fail now, never burn the budget on it.
+            if ($out -notmatch $propagation) {
+              $logs | ForEach-Object { Write-Host $_ }
+              throw "npm view $pkg@$ver failed on attempt $i/$attempts for a reason other than npm propagation (auth, registry, or a malformed spec); not retrying (see above)"
+            }
+            if ($i -lt $attempts) {
+              Write-Host "attempt $i/$attempts : $pkg@$ver not resolvable yet (npm read path has not caught up); retrying in $sleepSec s"
+              Start-Sleep -Seconds $sleepSec
+            }
+          }
+          # Exhausted the budget: print every attempt, then separate "the read
+          # path is behind" from "the publish never landed" with one packument
+          # read, so the failure names the thing to fix.
+          $logs | ForEach-Object { Write-Host $_ }
+          $latest = (& npm view $pkg version 2>&1 | Out-String).Trim()
+          Write-Host "dist-tags.latest now: $latest"
+          $listed = (& npm view $pkg versions --json 2>&1 | Out-String)
+          if ($listed -match [regex]::Escape("`"$ver`"")) {
+            throw "npm never served $pkg@$ver to a direct read after $attempts attempts (~5 min), but the version IS in the packument's version list: npm's read path never caught up. The publish is not at fault; re-run this job."
+          }
+          throw "npm never served $pkg@$ver after $attempts attempts (~5 min) and the version is ABSENT from the packument's version list: the publish is genuinely broken (inspect the publish job's npm output and provenance)."
+      # The registry is now CONFIRMED to resolve this exact version and serve
+      # its tarball, so this runs ONCE: one install, one provision, one boot.
+      # Propagation is the poll above; this step only proves the published
+      # bytes install and the server boots on a stranger's machine.
+      - name: cleanroom check (registry install + boot)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node scripts/cleanroom-check.mjs --registry --version "$env:CLEANROOM_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw "cleanroom (public registry) failed with exit $LASTEXITCODE" }
+          Write-Host "cleanroom (public registry) passed for $env:CLEANROOM_VERSION"
