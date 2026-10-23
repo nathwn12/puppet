@@ -151,6 +151,11 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $tag = $env:RELEASE_TAG
+          # Re-entrancy control first: build the scrubbed world twice and
+          # assert it is complete and independent both times. Cheap (~30 ms),
+          # and it goes red before any install if the scratch lifecycle
+          # regresses. The public-registry retry loop is untouched by this.
+          node scripts/cleanroom-check.mjs --self-check
           $pack = Join-Path $env:RUNNER_TEMP 'cleanroom-packed'
           New-Item -ItemType Directory -Path $pack -Force | Out-Null
           $info = npm pack --json --pack-destination $pack ./npm-stage | Out-String
