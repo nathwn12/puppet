@@ -5,6 +5,55 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.0.0] - 2026-10-23
+
+### Changed (breaking)
+
+- **Background text now requires `allow_foreground:true`.** `type` with an
+  element and `set_value` write through UIA `ValuePattern.SetValue`, whose
+  provider may focus the control it writes. They are no longer
+  background-safe: without the flag they return `foreground_required`
+  before any provider call. `invoke`/`toggle`/`expand`/`collapse`/`scroll`
+  patterns stay background-safe.
+- **Visible `maximize` requires `allow_foreground:true`.** A maximized
+  window covers its monitor and Win32 documents no no-activate form, so the
+  default returns `foreground_required` and the window is untouched. This
+  is a gate, not a focus-safety claim: passing the flag makes the verb an
+  explicit opt-in whose activation is measured and reported, never
+  silent.
+- **Posted keyboard removed from the default path.** `WM_CHAR`/`WM_KEYDOWN`
+  bypass the input queue, desync the target and are ignored by many
+  controls, so plain `type`/`key`/`hotkey` are never posted: they need
+  `allow_foreground:true` and escalate to real `SendInput`. Posted keyboard
+  survives only on a desktop the server created *and* that the target
+  window actually lives on — `desktop:"hidden"` is earned by desktop-name
+  comparison, never granted by the argument alone.
+- Typed `foreground_required` / `cursor_move_required` refusals replace
+  silent fallbacks: the foreground family is refused *before* anything is
+  sent, and pointer acts need both `allow_cursor:true` and
+  `allow_foreground:true`.
+
+### Added
+
+- **Target lock.** Every acting verb takes
+  `target={hwnd?,pid?,exe?,appId?,titleContains?,className?}` (or a selector
+  string) that resolves ONE window for the call and is revalidated before
+  every action — `hwnd`, `pid` with process start time, image name and
+  class, plus `appId`. Ambiguous or vanished targets are typed
+  (`ambiguous_target` / `target_gone`); there is no foreground fallback.
+- **No-steal default input path.** Under a lock, clicks/keys go UIA-pattern
+  first, then `PostMessage`/`SendMessage` with exact client coordinates —
+  no `SendInput`, no cursor movement, no activation.
+- **Non-activating capture.** `screenshot` can capture a window by
+  selector without activating it, reporting
+  `foregroundUnchanged`/`cursorUnchanged`.
+- **Posted-click honesty.** Every click reports what it proved: `delivered`
+  (`uia` | `posted`) and `effect`
+  (`verified` | `pattern-returned` | `unchanged` | `unverified`). A posted
+  element click whose readable control state did not change fails with
+  `background_unavailable`; a raw x/y click always reports
+  `delivered:"posted"`, `effect:"unverified"`.
+
 ## [4.5.5] - 2026-10-23
 
 ### Fixed

@@ -42,6 +42,21 @@
       },
       "total_ms": {
         "type": "number"
+      },
+      "foregroundUnchanged": {
+        "type": "boolean"
+      },
+      "cursorUnchanged": {
+        "type": "boolean"
+      },
+      "target_locked": {
+        "type": "integer"
+      },
+      "target_pid": {
+        "type": "integer"
+      },
+      "target_exe": {
+        "type": "string"
       }
     },
     "required": [
@@ -86,7 +101,13 @@
       "uia_available": {
         "type": "boolean"
       },
-      "uia_error": {}
+      "uia_error": {},
+      "foregroundUnchanged": {
+        "type": "boolean"
+      },
+      "cursorUnchanged": {
+        "type": "boolean"
+      }
     },
     "required": [
       "backend",
@@ -141,6 +162,12 @@
       },
       "window": {
         "type": "object"
+      },
+      "foregroundUnchanged": {
+        "type": "boolean"
+      },
+      "cursorUnchanged": {
+        "type": "boolean"
       }
     },
     "required": [
@@ -182,6 +209,18 @@
         "type": "integer"
       },
       "y": {
+        "type": "integer"
+      },
+      "code": {
+        "type": "string"
+      },
+      "foregroundUnchanged": {
+        "type": "boolean"
+      },
+      "cursorUnchanged": {
+        "type": "boolean"
+      },
+      "target_locked": {
         "type": "integer"
       }
     },

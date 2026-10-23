@@ -31,7 +31,27 @@ pub struct ShotArgs {
     pub grid: bool,
     pub allow_crop_fallback: bool,
     pub elements: bool,
+    /// Structured target lock (object or selector string); wins over
+    /// `window` when present. Captured without activation or restore.
+    pub target: Option<Value>,
 }
+
+/// Revalidate a resolved target immediately before acting on its handle.
+/// `Ok(())` when there is no lock (legacy `window=` selector) or when the
+/// identity still matches; the typed `target_gone` text otherwise.
+pub(crate) fn revalidate_locked(locked: &Option<crate::target::TargetLock>) -> Result<(), String> {
+    match locked {
+        Some(l) => l.revalidate().map_err(|e| e.text()),
+        None => Ok(()),
+    }
+}
+
+/// Resolved window, or a typed error, or disambiguation candidates.
+type WindowResolve = (
+    Option<windows_sys::Win32::Foundation::HWND>,
+    Option<String>,
+    Option<Vec<Map<String, Value>>>,
+);
 
 /// Screenshot domain error: the aggregated text block is unchanged for
 /// legacy clients; P2a reports it as a real tool failure (`isError: true`).
@@ -155,8 +175,41 @@ fn cmaps_monitors(n: i64, v: VirtualRect) -> Map<String, Value> {
 }
 
 pub fn screenshot_window(a: &ShotArgs) -> String {
-    let sel = a.window.as_ref().unwrap();
-    let (hwnd, err, cands) = resolve_selector(sel);
+    use windows_sys::Win32::Foundation::HWND;
+    let fg_before = unsafe { GetForegroundWindow() as i64 };
+    let mut cur0 = POINT { x: 0, y: 0 };
+    let cur_before = unsafe {
+        if GetCursorPos(&mut cur0) != 0 {
+            (cur0.x as i64, cur0.y as i64)
+        } else {
+            (-1, -1)
+        }
+    };
+    // Target lock first: one window, resolved once, and KEPT as a lock so the
+    // identity can be revalidated immediately before the capture (the handle
+    // alone would let a recycled hwnd be captured as somebody else's window).
+    let mut locked: Option<crate::target::TargetLock> = None;
+    let (hwnd, err, cands): WindowResolve = match a.target.as_ref() {
+        Some(v) => match crate::target::TargetSpec::parse(v) {
+            Err(e) => (None, Some(e.text()), e.candidates.clone()),
+            Ok(spec) => match crate::target::lock(&spec) {
+                Err(e) => (None, Some(e.text()), e.candidates.clone()),
+                Ok(l) => {
+                    let h = l.hwnd as HWND;
+                    locked = Some(l);
+                    (Some(h), None, None)
+                }
+            },
+        },
+        None => match a.window.as_ref() {
+            Some(sel) => resolve_selector(sel),
+            None => (
+                None,
+                Some("error: bad_window: need window or target".to_string()),
+                None,
+            ),
+        },
+    };
     if hwnd.is_none() {
         let mut items = vec![format!("error: {}", err.unwrap())];
         if let Some(c) = cands {
@@ -174,6 +227,11 @@ pub fn screenshot_window(a: &ShotArgs) -> String {
         Ok(r) => r,
         Err(e) => return shot_err_list(vec![e]),
     };
+    // Revalidate the lock immediately before the capture: the window may
+    // have closed or been recycled between resolution and here.
+    if let Err(e) = revalidate_locked(&locked) {
+        return shot_err_list(vec![format!("error: {}", e)]);
+    }
     let cap = match unsafe { capture_window(hwnd, a.allow_crop_fallback) } {
         Ok(c) => c,
         Err(e) => return shot_err_list(vec![e]),
@@ -304,6 +362,24 @@ pub fn screenshot_window(a: &ShotArgs) -> String {
     }
     cmap.insert("capture".to_string(), Value::from(capt));
     cmap.insert("formula".to_string(), Value::from(FORMULA));
+    // Invariant telemetry: a window capture resolves + PrintWindows the
+    // target and never activates or restores it.
+    let mut cur1 = POINT { x: 0, y: 0 };
+    let cur_after = unsafe {
+        if GetCursorPos(&mut cur1) != 0 {
+            (cur1.x as i64, cur1.y as i64)
+        } else {
+            (-1, -1)
+        }
+    };
+    cmap.insert(
+        "foregroundUnchanged".to_string(),
+        Value::from(unsafe { GetForegroundWindow() as i64 } == fg_before),
+    );
+    cmap.insert(
+        "cursorUnchanged".to_string(),
+        Value::from(cur_after == cur_before),
+    );
     let mime = if f == "png" {
         "image/png"
     } else {
@@ -317,6 +393,11 @@ pub fn screenshot_window(a: &ShotArgs) -> String {
         text_block(&crate::py_dumps(&Value::Object(cmap.clone()))),
     ];
     if a.elements {
+        // The element walk runs after the capture: revalidate again so the
+        // listing cannot describe a different window than the image.
+        if let Err(e) = revalidate_locked(&locked) {
+            return shot_err_list(vec![format!("error: {}", e)]);
+        }
         blocks.push(text_block(&elements_block(hwnd)));
     }
     screenshot_ok(&blocks, &Value::Object(cmap))
@@ -350,6 +431,15 @@ fn dxgi_match_output(display: i64, mons: &[[i32; 4]]) -> Result<(u32, u32), Stri
 }
 
 pub fn screenshot_desktop(a: &ShotArgs) -> String {
+    let fg_before = unsafe { GetForegroundWindow() as i64 };
+    let mut cur0 = POINT { x: 0, y: 0 };
+    let cur_before = unsafe {
+        if GetCursorPos(&mut cur0) != 0 {
+            (cur0.x as i64, cur0.y as i64)
+        } else {
+            (-1, -1)
+        }
+    };
     let (vx, vy, vr, vb) = virtual_rect();
     let mons = display_monitors();
     let n_mon = mons.len() as i64;
@@ -599,6 +689,24 @@ pub fn screenshot_desktop(a: &ShotArgs) -> String {
         capt.insert("note".to_string(), Value::from(n));
     }
     cmap.insert("capture".to_string(), Value::from(capt));
+    // Invariant telemetry: a desktop capture is pixels-only (BitBlt/DXGI),
+    // no activation and no pointer call anywhere on this path.
+    let mut cur1 = POINT { x: 0, y: 0 };
+    let cur_after = unsafe {
+        if GetCursorPos(&mut cur1) != 0 {
+            (cur1.x as i64, cur1.y as i64)
+        } else {
+            (-1, -1)
+        }
+    };
+    cmap.insert(
+        "foregroundUnchanged".to_string(),
+        Value::from(unsafe { GetForegroundWindow() as i64 } == fg_before),
+    );
+    cmap.insert(
+        "cursorUnchanged".to_string(),
+        Value::from(cur_after == cur_before),
+    );
     cmap.insert("formula".to_string(), Value::from(FORMULA));
     let mime = if f == "png" {
         "image/png"
@@ -625,7 +733,7 @@ pub fn screenshot_desktop(a: &ShotArgs) -> String {
 }
 
 pub fn dispatch_screenshot(a: &ShotArgs) -> String {
-    if a.window.is_some() {
+    if a.window.is_some() || a.target.is_some() {
         screenshot_window(a)
     } else {
         screenshot_desktop(a)
@@ -635,6 +743,74 @@ pub fn dispatch_screenshot(a: &ShotArgs) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TOCTOU guard, unit level: a lock whose window died is refused by the
+    /// exact helper the capture and elements paths call immediately before
+    /// acting, with the typed target_gone text.
+    #[test]
+    fn revalidate_locked_refuses_a_dead_lock() {
+        let f = crate::fixture::Fixture::new();
+        let hwnd = f.hwnd_i64();
+        let spec = crate::target::TargetSpec::parse(&serde_json::json!({"hwnd": hwnd})).unwrap();
+        let lock = crate::target::lock(&spec).expect("fresh fixture locks");
+        assert!(revalidate_locked(&Some(lock.clone())).is_ok());
+        drop(f);
+        let e = revalidate_locked(&Some(lock)).expect_err("dead lock must be refused");
+        assert!(
+            e.starts_with("target_gone"),
+            "typed refusal expected, got: {e}"
+        );
+        assert!(
+            revalidate_locked(&None).is_ok(),
+            "no lock = legacy path, no-op"
+        );
+    }
+
+    /// The revalidate calls are ON the acting path: source-pinned so a future
+    /// refactor cannot drop the lock and act on the bare handle again.
+    #[test]
+    fn revalidate_runs_before_capture_and_before_the_element_walk() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/screen.rs"))
+            .expect("screen.rs readable");
+        let call = "if let Err(e) = revalidate_locked(&locked)";
+        let cap = src.find("capture_window(hwnd").expect("capture call");
+        let rev_cap = src.find(call).expect("capture-path revalidate");
+        assert!(
+            rev_cap < cap,
+            "revalidate_locked must precede capture_window on the path"
+        );
+        let walk = src.find("elements_block(hwnd)").expect("element walk");
+        let rev_walk = src[..walk].rfind(call).expect("elements-path revalidate");
+        assert!(
+            rev_walk < walk,
+            "revalidate_locked must precede elements_block on the path"
+        );
+    }
+
+    /// A target that is already gone is a typed screenshot error, not a bare
+    /// hwnd failure.
+    #[test]
+    fn screenshot_target_gone_is_typed() {
+        let f = crate::fixture::Fixture::new();
+        let hwnd = f.hwnd_i64();
+        drop(f);
+        let out = screenshot_window(&ShotArgs {
+            display: -1,
+            region: None,
+            window: None,
+            max_px: Some(320),
+            fmt: "png".to_string(),
+            quality: Some(80),
+            grid: false,
+            allow_crop_fallback: false,
+            elements: false,
+            target: Some(serde_json::json!({"hwnd": hwnd})),
+        });
+        assert!(
+            out.contains("target_gone"),
+            "expected target_gone, got: {out}"
+        );
+    }
 
     fn two_mons() -> Vec<[i32; 4]> {
         vec![[0, 0, 1920, 1080], [1920, 0, 3840, 1080]]

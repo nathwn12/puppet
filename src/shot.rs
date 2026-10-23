@@ -56,7 +56,7 @@ pub unsafe fn capture_window(hwnd: HWND, allow_crop_fallback: bool) -> Result<Ca
     }
     let title = unsafe { win_text(hwnd) };
     if unsafe { IsIconic(hwnd) } != 0 {
-        return Err("error: bad_window: minimized (refusing to restore)".to_string());
+        return Err("error: window_minimized: the target window is minimized; capturing it would need a restore, which puppet refuses. Restore it yourself, or capture another window.".to_string());
     }
     let cloak = cloaked(hwnd);
     if cloak != 0 {
@@ -84,7 +84,7 @@ pub unsafe fn capture_window(hwnd: HWND, allow_crop_fallback: bool) -> Result<Ca
     unsafe {
         let mut aff: u32 = 0;
         if GetWindowDisplayAffinity(hwnd, &mut aff) != 0 && aff == WDA_EXCLUDEFROMCAPTURE {
-            return Err("error: capture_failed: excluded_from_capture".to_string());
+            return Err("error: capture_unavailable: the window is excluded from capture (WDA_EXCLUDEFROMCAPTURE)".to_string());
         }
     }
     let mut img: Option<Img> = None;
@@ -105,14 +105,14 @@ pub unsafe fn capture_window(hwnd: HWND, allow_crop_fallback: bool) -> Result<Ca
     if let Some(im) = img {
         if im.w != ww || im.h != wh {
             return Err(format!(
-                "error: capture_failed: PrintWindow returned {}x{} for a {ww}x{wh} window",
+                "error: capture_unavailable: PrintWindow returned {}x{} for a {ww}x{wh} window",
                 im.w, im.h
             ));
         }
         let verdict = detector_verdict(&im);
         if verdict.rejected {
             return Err(format!(
-                "error: capture_failed: {}: {} frame rejected",
+                "error: capture_unavailable: {}: {} frame rejected (blank/black frame)",
                 detector_tag(&verdict),
                 verdict.reason.clone().unwrap()
             ));
@@ -130,7 +130,7 @@ pub unsafe fn capture_window(hwnd: HWND, allow_crop_fallback: bool) -> Result<Ca
                         let v2 = detector_verdict(&im2);
                         if v2.rejected {
                             return Err(format!(
-                                "error: capture_failed: {}: {} frame rejected",
+                                "error: capture_unavailable: {}: {} frame rejected (blank/black frame)",
                                 detector_tag(&v2),
                                 v2.reason.clone().unwrap()
                             ));
@@ -140,7 +140,9 @@ pub unsafe fn capture_window(hwnd: HWND, allow_crop_fallback: bool) -> Result<Ca
                         stale = sig == p;
                     }
                     Err(e) => {
-                        return Err(format!("error: capture_failed: stale retry failed: {e}"));
+                        return Err(format!(
+                            "error: capture_unavailable: stale retry failed: {e}"
+                        ));
                     }
                 }
             }
@@ -180,7 +182,7 @@ pub unsafe fn capture_window(hwnd: HWND, allow_crop_fallback: bool) -> Result<Ca
                 let verdict = detector_verdict(&crop);
                 if verdict.rejected {
                     return Err(format!(
-                        "error: capture_failed: {}: {} frame rejected",
+                        "error: capture_unavailable: {}: {} frame rejected (blank/black frame)",
                         detector_tag(&verdict),
                         verdict.reason.clone().unwrap()
                     ));
@@ -208,13 +210,15 @@ pub unsafe fn capture_window(hwnd: HWND, allow_crop_fallback: bool) -> Result<Ca
                 });
             }
             Err(e) => {
-                return Err(format!("error: capture_failed: crop fallback failed: {e}"));
+                return Err(format!(
+                    "error: capture_unavailable: crop fallback failed: {e}"
+                ));
             }
         }
     }
     let why = format!("PrintWindow refused ({last_err})");
     Err(format!(
-        "error: capture_failed: window capture refused PrintWindow ({why}); refusing an occlusion-prone crop (pass allow_crop_fallback=true on the foreground window). {MODE_B_NOTE}"
+        "error: capture_unavailable: PrintWindow refused ({why}); refusing an occlusion-prone desktop crop (the window is not foreground, or allow_crop_fallback is false). Capture without activation does not fall back to the foreground. {MODE_B_NOTE}"
     ))
 }
 

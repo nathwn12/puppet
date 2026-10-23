@@ -14,7 +14,7 @@ use std::sync::{LazyLock, Mutex};
 use serde_json::{Map, Value};
 use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, SetLastError, HANDLE, HWND, LPARAM, POINT, RECT,
+    CloseHandle, GetLastError, SetLastError, FILETIME, HANDLE, HWND, LPARAM, POINT, RECT,
 };
 use windows_sys::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
@@ -25,9 +25,13 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::Security::{
     GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
 };
+use windows_sys::Win32::System::StationsAndDesktops::{
+    GetThreadDesktop, GetUserObjectInformationW, UOI_NAME,
+};
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
-    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcess, GetProcessTimes, OpenProcess, OpenProcessToken, OpenThread,
+    QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    THREAD_QUERY_INFORMATION,
 };
 use windows_sys::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwareness, SetProcessDpiAwarenessContext,
@@ -795,7 +799,7 @@ pub fn tool_err_blocks(blocks: &[String]) -> String {
 
 // ---------------------------------------------------------------- Win32 helpers
 
-unsafe fn win_text(hwnd: HWND) -> String {
+pub(crate) unsafe fn win_text(hwnd: HWND) -> String {
     let mut buf = vec![0u16; 512];
     let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
     if n <= 0 {
@@ -804,7 +808,7 @@ unsafe fn win_text(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buf[..n as usize])
 }
 
-unsafe fn win_class(hwnd: HWND) -> String {
+pub(crate) unsafe fn win_class(hwnd: HWND) -> String {
     let mut buf = vec![0u16; 256];
     let n = GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
     if n <= 0 {
@@ -972,6 +976,75 @@ pub(crate) fn exe_of_pid(pid: u32) -> String {
         } else {
             "unknown".to_string()
         }
+    }
+}
+
+/// Process creation time (FILETIME as u64: 100 ns ticks since 1601) for a
+/// PID, or `None` when the process cannot be opened. PIDs are recycled by
+/// Windows, so this is what tells two processes with the same PID apart.
+/// `GetProcessTimes` is the documented source; the two FILETIME halves are
+/// joined into one comparable u64.
+pub(crate) fn process_created(pid: u32) -> Option<u64> {
+    if pid == 0 {
+        return None;
+    }
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let mut creation: FILETIME = std::mem::zeroed();
+        let mut exit: FILETIME = std::mem::zeroed();
+        let mut kernel: FILETIME = std::mem::zeroed();
+        let mut user: FILETIME = std::mem::zeroed();
+        let ok = GetProcessTimes(h, &mut creation, &mut exit, &mut kernel, &mut user);
+        CloseHandle(h);
+        if ok == 0 {
+            return None;
+        }
+        Some(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64)
+    }
+}
+
+/// Desktop name a window lives on, read from the desktop of the window's
+/// thread (`GetThreadDesktop` + `GetUserObjectInformationW(UOI_NAME)`).
+///
+/// Handle values are per-process, so a raw `HDESK` comparison across
+/// processes is meaningless; the NAME is the comparable identity. Used to
+/// decide whether a target really lives on the private desktop this call
+/// created (see `burst::private_desktop_earned`).
+pub(crate) fn window_desktop_name(hwnd: HWND) -> Option<String> {
+    if hwnd.is_null() {
+        return None;
+    }
+    unsafe {
+        let tid = GetWindowThreadProcessId(hwnd, std::ptr::null_mut());
+        if tid == 0 {
+            return None;
+        }
+        let ht = OpenThread(THREAD_QUERY_INFORMATION, 0, tid);
+        if ht.is_null() {
+            return None;
+        }
+        let hdesk = GetThreadDesktop(tid);
+        CloseHandle(ht);
+        if hdesk.is_null() {
+            return None;
+        }
+        let mut buf = vec![0u16; 256];
+        let mut needed: u32 = 0;
+        let ok = GetUserObjectInformationW(
+            hdesk as *mut _,
+            UOI_NAME,
+            buf.as_mut_ptr() as *mut _,
+            (buf.len() * 2) as u32,
+            &mut needed,
+        );
+        if ok == 0 {
+            return None;
+        }
+        let n = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+        Some(String::from_utf16_lossy(&buf[..n]))
     }
 }
 
@@ -1300,7 +1373,7 @@ pub(crate) fn win32_text(code: u32) -> String {
     hr_text(hr)
 }
 
-fn exe_stem(name: &str) -> String {
+pub(crate) fn exe_stem(name: &str) -> String {
     let n = name.to_lowercase();
     if n.ends_with(".exe") {
         n[..n.len() - 4].to_string()
@@ -1309,7 +1382,7 @@ fn exe_stem(name: &str) -> String {
     }
 }
 
-fn parse_int_loose(val: &str) -> Option<i64> {
+pub(crate) fn parse_int_loose(val: &str) -> Option<i64> {
     let t = val.trim().replace('_', "");
     let t = t.as_str();
     let body = t.strip_prefix('+').unwrap_or(t);
@@ -1325,7 +1398,7 @@ fn parse_int_loose(val: &str) -> Option<i64> {
     Some(if neg { -v } else { v })
 }
 
-fn parse_selector(sel: &str) -> (String, String) {
+pub(crate) fn parse_selector(sel: &str) -> (String, String) {
     let s = sel.trim().to_string();
     let low = s.to_lowercase();
     for prefix in ["hwnd:", "pid:", "exe:", "title:", "class:"] {
@@ -1348,10 +1421,12 @@ pub mod cap;
 pub mod dxgi;
 #[cfg(test)]
 pub mod fixture;
+pub mod gate;
 pub mod hidden;
 pub mod screen;
 pub mod serve;
 pub mod shot;
+pub mod target;
 pub mod uia;
 pub mod winop;
 

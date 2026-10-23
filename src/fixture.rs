@@ -10,18 +10,148 @@
 //! Safety: never moves the pointer, never sends input, never focuses,
 //! never captures the screen. Only the fixture HWNDs are touched.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Posted-message counters for the no-steal tests: a background click posts
+/// WM_LBUTTONDOWN/UP to this window, and the test asserts they arrived
+/// (proving delivery) while the owner's foreground window and pointer did
+/// not move (proving nothing was stolen). Counters are process-wide and
+/// monotonic; `reset_msg_counts` zeroes them before a measured action.
+static MSG_MOUSEDOWN: AtomicU64 = AtomicU64::new(0);
+static MSG_MOUSEUP: AtomicU64 = AtomicU64::new(0);
+static MSG_MOUSEMOVE: AtomicU64 = AtomicU64::new(0);
+static MSG_KEYDOWN: AtomicU64 = AtomicU64::new(0);
+static MSG_CHAR: AtomicU64 = AtomicU64::new(0);
+static MSG_WHEEL: AtomicU64 = AtomicU64::new(0);
+
+/// Zero the posted-message counters (test-only).
+pub fn reset_msg_counts() {
+    MSG_MOUSEDOWN.store(0, Ordering::SeqCst);
+    MSG_MOUSEUP.store(0, Ordering::SeqCst);
+    MSG_MOUSEMOVE.store(0, Ordering::SeqCst);
+    MSG_KEYDOWN.store(0, Ordering::SeqCst);
+    MSG_CHAR.store(0, Ordering::SeqCst);
+    MSG_WHEEL.store(0, Ordering::SeqCst);
+}
+
+/// `(mousedown, mouseup, mousemove, keydown, char)` counts since the reset.
+/// Wheel messages are counted separately by `wheel_count`.
+pub fn msg_counts() -> (u64, u64, u64, u64, u64) {
+    (
+        MSG_MOUSEDOWN.load(Ordering::SeqCst),
+        MSG_MOUSEUP.load(Ordering::SeqCst),
+        MSG_MOUSEMOVE.load(Ordering::SeqCst),
+        MSG_KEYDOWN.load(Ordering::SeqCst),
+        MSG_CHAR.load(Ordering::SeqCst),
+    )
+}
+
+/// WM_MOUSEWHEEL / WM_MOUSEHWHEEL messages received since the reset.
+pub fn wheel_count() -> u64 {
+    MSG_WHEEL.load(Ordering::SeqCst)
+}
+
+/// Keys each fixture EDIT refused, keyed by the EDIT's HWND. Per control,
+/// not process-wide: `cargo test` runs these tests in parallel against
+/// separate fixtures, and a process-wide counter would report another
+/// test's injected keys as if they had arrived here.
+static SWALLOWED_KEYS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<isize, u64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn bump_swallowed(hwnd: HWND) {
+    let mut m = SWALLOWED_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+    *m.entry(hwnd as isize).or_insert(0) += 1;
+}
+
+/// Keys this EDIT has swallowed since the last reset. Non-zero means REAL
+/// input arrived at that control while it held focus (the UIA provider
+/// focuses a control to write it), and the guard refused it.
+pub fn swallowed_key_count(hwnd: HWND) -> u64 {
+    let m = SWALLOWED_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+    *m.get(&(hwnd as isize)).unwrap_or(&0)
+}
+
+pub fn reset_swallowed_keys(hwnd: HWND) {
+    let mut m = SWALLOWED_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+    m.insert(hwnd as isize, 0);
+}
+
+/// The editor's class wndproc, captured when the guard is installed. Every
+/// system EDIT shares the class proc, so one slot is enough.
+static OLD_EDIT_PROC: AtomicUsize = AtomicUsize::new(0);
+
+/// Guard installed on the fixture EDIT.
+///
+/// Why: `ValuePattern.SetValue` is performed by the UIA provider, which
+/// FOCUSES the target control first. The fixture window is off-screen and is
+/// never activated by the tool, but while that focus is held, keystrokes the
+/// OWNER types on the machine land in this control and are inserted at the
+/// caret (measured: characters prepend, e.g. "xyz" -> "wwwxyz"). A test that
+/// reads the control after a write then sees the owner's characters and
+/// cannot tell them from a product defect.
+///
+/// The provider writes with WM_SETTEXT / EM_SETTEXTEX, never with key
+/// messages (pinned by `value_pattern_set_value_replaces_without_keystrokes`),
+/// so swallowing the typing path removes the environmental variable without
+/// changing what SetValue does — the strict read-back assertion stays.
+unsafe extern "system" fn guarded_edit_wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> isize {
+    match msg {
+        // 0x0100 WM_KEYDOWN, 0x0101 WM_KEYUP, 0x0102 WM_CHAR, 0x0104/0x0105
+        // WM_SYSKEY*, 0x0109 WM_UNICHAR, 0x0300/0x0302/0x0303 WM_CUT/PASTE/CLEAR.
+        0x0100 | 0x0101 | 0x0102 | 0x0104 | 0x0105 | 0x0109 | 0x0300 | 0x0302 | 0x0303 => {
+            bump_swallowed(hwnd);
+            0
+        }
+        _ => {
+            let old: WNDPROC = std::mem::transmute(OLD_EDIT_PROC.load(Ordering::SeqCst));
+            CallWindowProcW(old, hwnd, msg, w, l)
+        }
+    }
+}
+
+/// Install the typing guard on a fixture EDIT (called on the fixture thread
+/// right after the control is created).
+unsafe fn guard_edit(hwnd: HWND) {
+    // `as usize` first: clippy rejects a direct fn-pointer -> isize cast.
+    let new_proc = guarded_edit_wndproc as usize as isize;
+    let old = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, new_proc);
+    if old != 0 {
+        OLD_EDIT_PROC.store(old as usize, Ordering::SeqCst);
+    }
+}
+
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 unsafe extern "system" fn fixture_wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> isize {
+    match msg {
+        WM_LBUTTONDOWN => {
+            MSG_MOUSEDOWN.fetch_add(1, Ordering::SeqCst);
+        }
+        WM_LBUTTONUP => {
+            MSG_MOUSEUP.fetch_add(1, Ordering::SeqCst);
+        }
+        WM_MOUSEMOVE => {
+            MSG_MOUSEMOVE.fetch_add(1, Ordering::SeqCst);
+        }
+        WM_KEYDOWN => {
+            MSG_KEYDOWN.fetch_add(1, Ordering::SeqCst);
+        }
+        WM_CHAR => {
+            MSG_CHAR.fetch_add(1, Ordering::SeqCst);
+        }
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+            MSG_WHEEL.fetch_add(1, Ordering::SeqCst);
+        }
+        _ => {}
+    }
     if msg == WM_CLOSE {
         DestroyWindow(hwnd);
         return 0;
@@ -150,6 +280,10 @@ impl Fixture {
                 std::ptr::null_mut(),
                 std::ptr::null(),
             );
+            // The EDIT refuses external typing: the UIA provider focuses it
+            // to write, and owner keystrokes would otherwise land in the
+            // document while a test reads it back.
+            guard_edit(edit);
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             let _ = tx.send((
                 hwnd as usize,
@@ -214,6 +348,99 @@ pub fn foreground_now() -> i64 {
     unsafe { GetForegroundWindow() as i64 }
 }
 
+/// A MESSAGE-ONLY fixture window: created with `HWND_MESSAGE` as its parent,
+/// so it is never visible, never on the taskbar, never activatable — the
+/// harshest case for background delivery. It has no children, so a posted
+/// key lands in its own WndProc (the counters above see it). Used by the
+/// no-steal tests to prove PostMessage click AND key delivery without a
+/// single pixel on screen.
+pub struct MessageWindow {
+    hwnd: HWND,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Default for MessageWindow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MessageWindow {
+    pub fn hwnd(&self) -> HWND {
+        self.hwnd
+    }
+    pub fn hwnd_i64(&self) -> i64 {
+        self.hwnd as i64
+    }
+
+    pub fn new() -> Self {
+        let seq = FIXTURE_SEQ.fetch_add(1, Ordering::SeqCst);
+        let pid = std::process::id();
+        let class_name = format!("PuppetMsgOnly-{pid}-{seq}");
+        let (tx, rx) = mpsc::channel::<usize>();
+        let thread = std::thread::spawn(move || unsafe {
+            let cls_w = wide(&class_name);
+            let mut wc: WNDCLASSW = std::mem::zeroed();
+            wc.lpfnWndProc = Some(fixture_wndproc);
+            wc.hInstance = std::ptr::null_mut();
+            wc.lpszClassName = cls_w.as_ptr();
+            if RegisterClassW(&wc) == 0 {
+                let _ = tx.send(0);
+                return;
+            }
+            let title_w = wide(&class_name);
+            let hwnd = CreateWindowExW(
+                0,
+                cls_w.as_ptr(),
+                title_w.as_ptr(),
+                WS_POPUP,
+                0,
+                0,
+                10,
+                10,
+                HWND_MESSAGE,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            if hwnd.is_null() {
+                let _ = tx.send(0);
+                return;
+            }
+            let _ = tx.send(hwnd as usize);
+            let mut msg: MSG = std::mem::zeroed();
+            loop {
+                let r = GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0);
+                if r == 0 || r == -1 {
+                    break;
+                }
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        });
+        let h = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("message-only thread must report its HWND");
+        assert!(h != 0, "message-only CreateWindowExW failed");
+        MessageWindow {
+            hwnd: h as HWND,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for MessageWindow {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.hwnd.is_null() && IsWindow(self.hwnd) != 0 {
+                PostMessageW(self.hwnd, WM_CLOSE, 0, 0);
+            }
+        }
+        if let Some(h) = self.thread.take() {
+            let _ = h.join();
+        }
+    }
+}
 /// Foreground-session verdict for environment-independent tests.
 #[derive(Debug, PartialEq, Eq)]
 pub enum FgVerdict {
