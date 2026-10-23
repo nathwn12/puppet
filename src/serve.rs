@@ -124,7 +124,7 @@ fn init_result(params: &Value) -> String {
 /// 3): the six tools in one line each, the coordinate rule with the
 /// image-to-screen formula, batch + dry_run, and read-only-first on the
 /// owner's real desktop.
-const INIT_INSTRUCTIONS: &str = "puppet desktop-control MCP (Windows). Input hits the owner's real desktop: start every task with read-only calls (screenshot, elements, list_windows, cursor), batch work into one do burst per turn, then screenshot to verify.\nTools (one line each):\n- screenshot: capture the whole virtual desktop (display=-1), one monitor, a window, or a region; returns the image plus source{x,y,w,h}, scale, the monitor list, the cursor, and the image-to-screen formula. Coordinates are screen/virtual-desktop pixels: screen_x = source.x + round((img_x + 0.5) * source.w / image.w) (same for y).\n- list_windows: read-only visible top-level windows (hwnd/pid/exe/title/rects/elevated); never changes focus.\n- window: focus|move|resize|minimize|maximize|restore|close|topmost by selector or hwnd.\n- do: BURST tool: one call runs an ordered actions[] batch (move|click|down|up|drag|scroll|type|key|hotkey|wait|wait_for|focus_window|invoke|set_value|clipboard_set|clipboard_get); per-action ok, never aborts the rest. dry_run=true validates and reports without injecting anything. Coordinate actions take virtual-desktop pixels.\n- cursor: read-only cursor position plus monitor rects.\n- elements: read-only structured UI elements for a window (zero pixels, no focus change); each entry carries ref plus fp, a stable identity fingerprint. Prefer elements over pixel guessing; pass expect_fp to invoke/set_value to refuse stale refs instead of acting on the wrong control. When text is illegible, re-request the same window with a tight region plus max_px:null (full-resolution zoom).";
+const INIT_INSTRUCTIONS: &str = "puppet desktop-control MCP (Windows). Background-safe by default: every acting tool takes a `target` selector {hwnd?,pid?,exe?,appId?,titleContains?,className?} that resolves ONE window for the call and is revalidated before every action - no cursor movement, no keyboard injection into the owner's session, no focus stealing, no raised window, whether the target is foreground or alt-tabbed. There is no fallback to the foreground window: an ambiguous or vanished target is a typed error (ambiguous_target / target_gone). Foreground input (SendInput/SetForegroundWindow) and pointer movement are refused with foreground_required / cursor_move_required unless the call passes allow_foreground:true / allow_cursor:true, before anything is sent. Control is exact and instant: clicks are one down+up at the resolved point, no interpolated pointer journey.\nTools (one line each):\n- screenshot: capture the whole virtual desktop (display=-1), one monitor, a window (window=<selector> or target={...}), or a region, without activating the window; minimized returns window_minimized, a refused frame capture_unavailable; returns the image plus source{x,y,w,h}, scale, the monitor list, the cursor, the image-to-screen formula, and foregroundUnchanged/cursorUnchanged. Coordinates are screen/virtual-desktop pixels: screen_x = source.x + round((img_x + 0.5) * source.w / image.w) (same for y).\n- list_windows: read-only visible top-level windows (hwnd/pid/exe/title/rects/elevated); never changes focus.\n- window: focus|move|resize|minimize|maximize|restore|close|topmost by selector, hwnd or target; only action=focus may touch the foreground window, every other verb is no-steal (SWP_NOACTIVATE / SW_SHOWMINNOACTIVE).\n- do: BURST tool: one call runs an ordered actions[] batch (move|click|down|up|drag|scroll|type|key|hotkey|wait|wait_for|focus_window|invoke|set_value|clipboard_set|clipboard_get) against one `target` window through UIA patterns first, then PostMessage/SendMessage with exact client coordinates; per-action ok, never aborts the rest. Under target, x/y are CLIENT-area physical pixels; without a target they are virtual-desktop pixels on the gated foreground path. dry_run=true validates and reports without injecting anything.\n- cursor: read-only cursor position plus monitor rects.\n- elements: read-only structured UI elements for a window (target/title/hwnd; zero pixels, no focus change); each entry carries ref plus fp, a stable identity fingerprint. Prefer elements over pixel guessing; pass expect_fp to invoke/set_value to refuse stale refs instead of acting on the wrong control. When text is illegible, re-request the same window with a tight region plus max_px:null (full-resolution zoom).";
 
 fn tools_list_result() -> String {
     format!("{{\"tools\":[{TOOL_SCREENSHOT},{TOOL_LIST_WINDOWS},{TOOL_WINDOW},{TOOL_DO},{TOOL_CURSOR},{TOOL_ELEMENTS}]}}")
@@ -173,7 +173,17 @@ fn call_window(args: &Map<String, Value>) -> String {
     check_no_extra(
         args,
         &mut errs,
-        &["action", "title", "hwnd", "x", "y", "width", "height"],
+        &[
+            "action",
+            "title",
+            "hwnd",
+            "x",
+            "y",
+            "width",
+            "height",
+            "target",
+            "allow_foreground",
+        ],
     );
     let action = match args.get("action") {
         None => {
@@ -210,6 +220,8 @@ fn call_window(args: &Map<String, Value>) -> String {
     let y = opt_int(args, &mut errs, "y");
     let width = opt_int(args, &mut errs, "width");
     let height = opt_int(args, &mut errs, "height");
+    let target = opt_target(args, &mut errs);
+    let allow_foreground = req_bool(args, &mut errs, "allow_foreground");
     if !errs.is_empty() {
         return err_result_text(&verr_text("window", &errs));
     }
@@ -221,6 +233,8 @@ fn call_window(args: &Map<String, Value>) -> String {
         y: y.unwrap(),
         width: width.unwrap(),
         height: height.unwrap(),
+        target: target.unwrap(),
+        allow_foreground: allow_foreground.unwrap(),
     })
 }
 
@@ -229,22 +243,29 @@ fn call_window(args: &Map<String, Value>) -> String {
 /// `shot::elements_block`) and return it as structured JSON.
 fn call_elements(args: &Map<String, Value>) -> String {
     let mut errs = Vec::new();
+    let fg_before =
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() as i64 };
+    let mut cur_before = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+    let cur_ok =
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut cur_before) != 0 };
     check_no_extra(
         args,
         &mut errs,
-        &["title", "hwnd", "detail", "max_depth", "offset"],
+        &["title", "hwnd", "detail", "max_depth", "offset", "target"],
     );
     let title = opt_str(args, &mut errs, "title");
     let hwnd = opt_int(args, &mut errs, "hwnd");
+    let target = opt_target(args, &mut errs);
     let detail = req_bool(args, &mut errs, "detail");
     let max_depth = req_int(args, &mut errs, "max_depth", 8);
     let offset = req_int(args, &mut errs, "offset", 0);
     if !errs.is_empty() {
         return err_result_text(&verr_text("elements", &errs));
     }
-    let (t, h, d, md, off) = (
+    let (t, h, tg, d, md, off) = (
         title.unwrap(),
         hwnd.unwrap(),
+        target.unwrap(),
         detail.unwrap(),
         max_depth.unwrap(),
         offset.unwrap(),
@@ -267,16 +288,31 @@ fn call_elements(args: &Map<String, Value>) -> String {
         );
         return wrapped_text(&py_dumps(&Value::Object(payload)));
     }
-    // Same branches as `cap::resolve_window`, spelled through
-    // `resolve_selector` directly: explicit hwnd wins, else title text.
-    let (hwnd_r, err, cands) = match (h, t) {
-        (Some(v), _) => resolve_selector(&format!("hwnd:{v}")),
-        (None, Some(v)) if !v.is_empty() => resolve_selector(&v),
-        _ => (
-            None,
-            Some("bad_window: need title or hwnd".to_string()),
-            None,
-        ),
+    // Target lock wins; the legacy title/hwnd pair stays for compatibility.
+    // The LOCK is kept (not just its hwnd) so the identity is revalidated
+    // immediately before the walk.
+    let mut locked: Option<crate::target::TargetLock> = None;
+    let (hwnd_r, err, cands) = match tg {
+        Some(v) => match crate::target::TargetSpec::parse(&v) {
+            Err(e) => (None, Some(e.text()), e.candidates.clone()),
+            Ok(spec) => match crate::target::lock(&spec) {
+                Err(e) => (None, Some(e.text()), e.candidates.clone()),
+                Ok(l) => {
+                    let h = l.hwnd as windows_sys::Win32::Foundation::HWND;
+                    locked = Some(l);
+                    (Some(h), None, None)
+                }
+            },
+        },
+        None => match (h, t) {
+            (Some(v), _) => resolve_selector(&format!("hwnd:{v}")),
+            (None, Some(v)) if !v.is_empty() => resolve_selector(&v),
+            _ => (
+                None,
+                Some("bad_window: need title or hwnd".to_string()),
+                None,
+            ),
+        },
     };
     if hwnd_r.is_none() {
         let mut payload = Map::new();
@@ -288,6 +324,15 @@ fn call_elements(args: &Map<String, Value>) -> String {
                 Value::from(c.into_iter().map(Value::Object).collect::<Vec<_>>()),
             );
         }
+        return wrapped_text(&py_dumps(&Value::Object(payload)));
+    }
+    // Revalidate immediately before enumerating: a closed or recycled
+    // handle must be a typed target_gone, not a walk of another window.
+    if let Err(e) = crate::screen::revalidate_locked(&locked) {
+        let mut payload = Map::new();
+        payload.insert("ok".to_string(), Value::from(false));
+        payload.insert("code".to_string(), Value::from("target_gone"));
+        payload.insert("error".to_string(), Value::from(e));
         return wrapped_text(&py_dumps(&Value::Object(payload)));
     }
     let model = element_model(hwnd_r.unwrap(), md, off as usize);
@@ -333,6 +378,25 @@ fn call_elements(args: &Map<String, Value>) -> String {
         &model.detail,
         model.next_offset,
     );
+    let mut o = o;
+    // Invariant telemetry: this walk is read-only and must leave the owner's
+    // foreground window and pointer exactly where it found them.
+    let mut cur_after = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+    let cur_ok2 =
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut cur_after) != 0 };
+    o.insert(
+        "foregroundUnchanged".to_string(),
+        Value::from(
+            unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() as i64 }
+                == fg_before,
+        ),
+    );
+    o.insert(
+        "cursorUnchanged".to_string(),
+        Value::from(
+            !cur_ok || !cur_ok2 || (cur_after.x == cur_before.x && cur_after.y == cur_before.y),
+        ),
+    );
     wrapped_text(&py_dumps(&Value::Object(o)))
 }
 
@@ -351,6 +415,7 @@ fn call_screenshot(args: &Map<String, Value>) -> String {
             "grid",
             "allow_crop_fallback",
             "elements",
+            "target",
         ],
     );
     let display = req_int(args, &mut errs, "display", -1);
@@ -369,6 +434,7 @@ fn call_screenshot(args: &Map<String, Value>) -> String {
         }
     };
     let window = opt_str(args, &mut errs, "window");
+    let target = opt_target(args, &mut errs);
     let max_px: Option<Option<i64>> = match args.get("max_px") {
         None => Some(Some(1280)),
         Some(Value::Null) => Some(None),
@@ -404,6 +470,7 @@ fn call_screenshot(args: &Map<String, Value>) -> String {
         grid: grid.unwrap(),
         allow_crop_fallback: allow_crop_fallback.unwrap(),
         elements: elements.unwrap(),
+        target: target.unwrap(),
     })
 }
 
@@ -420,6 +487,9 @@ fn call_do(args: &Map<String, Value>) -> String {
             "settle_ms",
             "dry_run",
             "desktop",
+            "target",
+            "allow_foreground",
+            "allow_cursor",
         ],
     );
     let actions: Option<Vec<Value>> = match args.get("actions") {
@@ -515,18 +585,44 @@ fn call_do(args: &Map<String, Value>) -> String {
             });
         }
     }
+    let target = opt_target(args, &mut errs);
+    let allow_foreground = do_bool(args, &mut errs, "allow_foreground");
+    let allow_cursor = do_bool(args, &mut errs, "allow_cursor");
     if !errs.is_empty() {
         return err_result_text(&verr_text("do", &errs));
     }
-    do_burst(
-        &actions.unwrap(),
-        background.unwrap(),
-        background_args.unwrap(),
-        focus_guard.unwrap(),
-        settle_ms.unwrap(),
-        dry_run.unwrap(),
-        desktop.unwrap(),
-    )
+    do_burst(&crate::burst::DoArgs {
+        actions: &actions.unwrap(),
+        background: background.unwrap(),
+        background_args: background_args.unwrap(),
+        focus_guard: focus_guard.unwrap(),
+        settle_ms: settle_ms.unwrap(),
+        dry_run: dry_run.unwrap(),
+        desktop: desktop.unwrap(),
+        target: target.unwrap(),
+        allow_foreground: allow_foreground.unwrap(),
+        allow_cursor: allow_cursor.unwrap(),
+    })
+}
+
+/// `target`: object | selector string | null. The SHAPE is validated here
+/// (non-object/string is a type error); the window is resolved in the
+/// handler, where a vanished or ambiguous target is a typed result.
+fn opt_target(args: &Map<String, Value>, errs: &mut Vec<crate::VErr>) -> Option<Option<Value>> {
+    match args.get("target") {
+        None | Some(Value::Null) => Some(None),
+        Some(v @ Value::Object(_)) | Some(v @ Value::String(_)) => Some(Some(v.clone())),
+        Some(v) => {
+            errs.push(crate::VErr {
+                loc: "target".to_string(),
+                msg: "Input should be a valid dictionary or string".to_string(),
+                typ: "model_type".to_string(),
+                iv: crate::render_iv(v),
+                it: crate::input_type_of(v).to_string(),
+            });
+            None
+        }
+    }
 }
 
 /// Pydantic v2 lax bool, probed verbatim against the live python server:

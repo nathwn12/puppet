@@ -1,6 +1,6 @@
 [package]
 name = "puppet"
-version = "4.5.8"
+version = "5.0.0"
 edition = "2021"
 license = "MIT"
 description = "Native-Rust Windows desktop-control MCP server over stdio: screenshot, windows, input, cursor."
@@ -40,6 +40,11 @@ windows = { version = "0.61", features = [
   "Win32_Graphics_Dxgi",
   "Win32_Graphics_Dxgi_Common",
   "Win32_Graphics_Gdi",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Variant",
+  "Win32_UI_Shell",
+  "Win32_UI_Shell_PropertiesSystem",
 ] }
 
 # ---------------------------------------------------------------- build speed
