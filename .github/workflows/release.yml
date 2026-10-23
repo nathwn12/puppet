@@ -362,6 +362,43 @@ jobs:
           $ver = $env:RELEASE_TAG -replace '^v', ''
           if ($ver -notmatch '^\d+\.\d+\.\d+$') { throw "cannot parse version from tag '$env:RELEASE_TAG'" }
           "CLEANROOM_VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      # npm's READ path can lag the publish by seconds: release 4.5.5 went red
+      # HERE with `ETARGET No matching version found` while the package was
+      # already live and correct. Same bounded retry as the package-verify
+      # loop in the publish job (`published_ok`, 4 attempts, sleep 10): retry
+      # ONLY the version-not-resolvable propagation shape. Any other FAIL is a
+      # real defect and fails on the first attempt; a persistent ETARGET still
+      # fails after the last attempt, with every attempt's output printed, so
+      # slow propagation stays distinguishable from a broken publish.
       - name: cleanroom check (registry install + boot)
         shell: pwsh
-        run: node scripts/cleanroom-check.mjs --registry --version "$env:CLEANROOM_VERSION"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # npm's ETARGET arrives on stderr and is data to classify, not a
+          # terminating error to throw on.
+          $PSNativeCommandUseErrorActionPreference = $false
+          $attempts = 4
+          $sleepSec = 10
+          $propagation = 'ETARGET|No matching version found|E404|notarget'
+          $logs = [System.Collections.Generic.List[string]]::new()
+          $passed = $false
+          for ($i = 1; $i -le $attempts; $i++) {
+            $out = & node scripts/cleanroom-check.mjs --registry --version "$env:CLEANROOM_VERSION" 2>&1 | Out-String
+            $code = $LASTEXITCODE
+            $logs.Add("--- attempt $i/$attempts (exit $code) ---`n$out")
+            if ($code -eq 0) { $passed = $true; break }
+            if ($out -notmatch $propagation) {
+              $logs | ForEach-Object { Write-Host $_ }
+              throw "cleanroom (public registry) failed on attempt $i/$attempts for a reason other than npm propagation; not retrying (see above)"
+            }
+            if ($i -lt $attempts) {
+              Write-Host "attempt $i/${attempts}: $env:CLEANROOM_VERSION is not resolvable from the public registry yet (npm propagation); retrying in $($sleepSec)s"
+              Start-Sleep -Seconds $sleepSec
+            }
+          }
+          if (-not $passed) {
+            $logs | ForEach-Object { Write-Host $_ }
+            throw "cleanroom (public registry) never resolved $env:CLEANROOM_VERSION after $attempts attempts: npm propagation did not catch up, or the publish is genuinely broken (every attempt printed above)"
+          }
+          Write-Host "cleanroom (public registry) passed on attempt $i/$attempts"
+          Write-Host $logs[$i - 1]
