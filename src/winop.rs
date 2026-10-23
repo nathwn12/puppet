@@ -392,9 +392,12 @@ pub fn do_window(a: &WinArgs) -> String {
                 // ShowWindowAsync(SW_MAXIMIZE) - non-blocking, so a busy
                 // target never stalls this call. SetWindowPlacement has no
                 // documented no-activate flag, so it is only the fallback
-                // when the async request does not establish IsZoomed; the
-                // live test proves GetForegroundWindow is unchanged either
-                // way.
+                // when the async request does not establish IsZoomed. NOTE:
+                // SW_MAXIMIZE is ShowWindow's ACTIVATING maximize, so the
+                // foreground may move to the target - measured on the
+                // message-only probe, which is exactly why this verb demands
+                // allow_foreground:true; the proof test asserts the foreground
+                // can only move to the target itself, never to a third window.
                 let mut wp: WINDOWPLACEMENT = std::mem::zeroed();
                 wp.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
                 if GetWindowPlacement(h, &mut wp) == 0 {
@@ -995,14 +998,32 @@ mod tests {
         );
     }
 
-    fn assert_foreground_held(before: i64, what: &str) {
+    /// Foreground invariant for the message-only maximize proof.
+    ///
+    /// MEASURED (diagnosed 2026-10-24): `ShowWindowAsync(SW_MAXIMIZE)` is
+    /// ShowWindow's ACTIVATING maximize - the probe window runs its own
+    /// message loop, so its thread processes the posted show command and
+    /// Windows may set the (hidden, message-only) probe as the foreground
+    /// window. That is exactly why `maximize` requires
+    /// `allow_foreground:true`; the verb never promised no activation. Whether
+    /// the arbitration grants it depends on the current foreground lock, so
+    /// the strict "handle is unchanged" form was an over-claim that failed
+    /// whenever Windows allowed the probe to take it (reproduced on the 5.0.0
+    /// baseline).
+    ///
+    /// What the tool must still never do is hand the owner's foreground to a
+    /// THIRD window: the handle must be the entry foreground or the probe
+    /// itself, and anything else fails here, naming the window that took it.
+    fn assert_foreground_moved_only_to(before: i64, allowed: i64, what: &str) {
         let after = crate::fixture::foreground_now();
         if before == 0 {
+            // No interactive session to protect (headless runner).
             return;
         }
-        assert_eq!(
-            after, before,
-            "{what}: GetForegroundWindow changed ({before} -> {after})"
+        assert!(
+            after == before || after == allowed,
+            "{what}: GetForegroundWindow moved to a window that is neither the entry foreground \
+             ({before}) nor the target probe ({allowed}) - window {after} took it"
         );
     }
 
@@ -1042,10 +1063,12 @@ mod tests {
     ///
     /// This is the executed evidence the gated visible tests cannot give:
     /// the canonical async path is taken (`how == "show_window_async"`, not
-    /// the SetWindowPlacement fallback), the foreground handle and the
-    /// pointer do not move, the saved normal rect holds the pre-maximize
-    /// geometry across a repeated maximize, and restore returns to it and
-    /// clears the saved entry only after success.
+    /// the SetWindowPlacement fallback), the foreground can only move to the
+    /// probe itself and never to a third window (SW_MAXIMIZE is activating,
+    /// which is why the verb requires `allow_foreground:true`), the pointer
+    /// does not move, the saved normal rect holds the pre-maximize geometry
+    /// across a repeated maximize, and restore returns to it and clears the
+    /// saved entry only after success.
     #[test]
     fn maximize_path_is_proven_on_a_message_only_window() {
         let f = crate::fixture::MessageWindow::new();
@@ -1186,8 +1209,11 @@ mod tests {
             "the saved entry is cleared only after a successful restore"
         );
 
-        // ---- non-intrusive invariants, measured across the whole sequence
-        assert_foreground_held(fg_before, "maximize sequence");
+        // ---- non-intrusive invariants, measured across the whole sequence.
+        // The foreground may land on the probe itself (SW_MAXIMIZE activates;
+        // that is why this verb needs allow_foreground:true), never on a third
+        // window; the probe is never displayed and the pointer never moves.
+        assert_foreground_moved_only_to(fg_before, hi, "maximize sequence");
         report_pointer(cur_before, "maximize sequence");
         println!(
             "MAXIMIZE_NONINTRUSIVE_OK normal_rect={want:?} how=show_window_async visible=0 fg={fg_before}"

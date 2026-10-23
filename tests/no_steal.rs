@@ -6,11 +6,13 @@
 //!    the explicit flags (and the explicit focus verb) can mint. A new call
 //!    site anywhere else turns this test red.
 //! 2. WIRE: `tools/list` declares `target` on every acting/capturing tool and
-//!    `allow_foreground`/`allow_cursor` on the verbs they gate.
+//!    `allow_foreground`/`allow_cursor`/`allow_clipboard` on the verbs they
+//!    gate.
 //! 3. SERVER: a typed target failure comes back as an MCP tool error with a
 //!    machine-readable `code` (`target_gone` / `bad_target`), never a
 //!    foreground fallback; a gated burst refuses with `foreground_required` /
-//!    `cursor_move_required` and reports zero events.
+//!    `cursor_move_required` / `clipboard_write_required` and reports zero
+//!    events.
 //!
 //! The live read-only check (an existing real window captured without
 //! changing the foreground) is gated by `PUPPET_LIVE_DESKTOP=1`.
@@ -118,6 +120,7 @@ fn gate_permits_are_the_only_way_in() {
     for mint in [
         "pub fn grant(allow_foreground: bool)",
         "pub fn grant(allow_cursor: bool)",
+        "pub fn grant(allow_clipboard: bool)",
     ] {
         assert!(gate.contains(mint), "gate must keep the mint `{mint}`");
     }
@@ -137,6 +140,11 @@ fn gate_permits_are_the_only_way_in() {
         1,
         "CursorPermit has exactly one, flag-only constructor"
     );
+    assert_eq!(
+        prod.matches("Some(ClipboardPermit(())").count(),
+        1,
+        "ClipboardPermit has exactly one, flag-only constructor"
+    );
     // Every constructor call site outside gate.rs would be a bypass: the
     // permits are only mintable there (the tokens are private to the module).
     let mut files = Vec::new();
@@ -148,11 +156,22 @@ fn gate_permits_are_the_only_way_in() {
         }
         let text = std::fs::read_to_string(f).expect("source file readable");
         assert!(
-            !text.contains("ForegroundPermit(())") && !text.contains("CursorPermit(())"),
+            !text.contains("ForegroundPermit(())")
+                && !text.contains("CursorPermit(())")
+                && !text.contains("ClipboardPermit(())"),
             "{name} must not construct a permit; only gate.rs may"
         );
     }
-    println!("NO_STEAL_MINT_OK permits=1-foreground,1-cursor,flag-only");
+    // The clipboard write APIs live in burst.rs, so the scan above cannot
+    // confine them; the permit is what binds them to the flag instead:
+    // `clipboard_set` must demand the token, so an unflagged caller does not
+    // compile rather than merely refusing at runtime.
+    let burst = std::fs::read_to_string(src_dir().join("burst.rs")).expect("burst.rs readable");
+    assert!(
+        burst.contains("fn clipboard_set(_permit: &crate::gate::ClipboardPermit"),
+        "clipboard_set must demand a ClipboardPermit (the allow_clipboard flag)"
+    );
+    println!("NO_STEAL_MINT_OK permits=1-foreground,1-cursor,1-clipboard,flag-only");
 }
 
 // ---------------------------------------------------------------- server
@@ -276,6 +295,28 @@ fn every_acting_tool_declares_target_and_the_gate_flags() {
         props.contains_key("allow_cursor"),
         "do must declare allow_cursor"
     );
+    assert!(
+        props.contains_key("allow_clipboard"),
+        "do must declare allow_clipboard (clipboard_set is deny-by-default)"
+    );
+    let ab = props.get("allow_clipboard").expect("allow_clipboard");
+    assert_eq!(
+        ab.get("type").and_then(|t| t.as_str()),
+        Some("boolean"),
+        "allow_clipboard must be a boolean, got: {ab}"
+    );
+    assert_eq!(
+        ab.get("default"),
+        Some(&Value::from(false)),
+        "allow_clipboard must default to false, got: {ab}"
+    );
+    assert!(
+        ab.get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or("")
+            .contains("global clipboard"),
+        "allow_clipboard must state what it permits, got: {ab}"
+    );
     // Read-only listing needs no target: it never acts on a window.
     let lw = tool(&tools, "list_windows")["inputSchema"]["properties"]
         .as_object()
@@ -370,6 +411,45 @@ fn gated_burst_refuses_with_typed_codes_and_zero_events() {
     assert_eq!(sc["events"], Value::from(0), "nothing may be injected");
     assert_eq!(sc["sendinput_calls"], Value::from(0));
     println!("NO_STEAL_GATE_OK codes={codes:?} events=0");
+}
+
+/// Writer-gate over the wire: `clipboard_set` without `allow_clipboard:true`
+/// is a typed per-action refusal that never reaches the clipboard, and the
+/// rest of the burst still runs. Safe ungated: no clipboard API is reached.
+#[test]
+fn clipboard_write_is_refused_over_the_wire() {
+    let mut s = Session::spawn();
+    let resp = s.call(
+        15,
+        "do",
+        serde_json::json!({
+            "actions": [
+                {"type": "clipboard_set", "text": "SHOULD-NOT-LAND"},
+                {"type": "wait", "ms": 1}
+            ]
+        }),
+    );
+    let sc = resp["result"]["structuredContent"].clone();
+    let results = sc["results"].as_array().expect("results");
+    assert_eq!(
+        results[0]["code"].as_str(),
+        Some("clipboard_write_required"),
+        "unflagged clipboard_set must be typed, got: {sc}"
+    );
+    assert_eq!(results[0]["ok"].as_bool(), Some(false));
+    assert!(
+        results[0]["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("allow_clipboard:true"),
+        "refusal must name the flag, got: {sc}"
+    );
+    assert_eq!(
+        results[1]["ok"].as_bool(),
+        Some(true),
+        "continue-always: the next action must still run, got: {sc}"
+    );
+    println!("NO_STEAL_CLIPBOARD_OK code=clipboard_write_required burst_continued");
 }
 
 #[test]

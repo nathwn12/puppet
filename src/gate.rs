@@ -11,8 +11,13 @@
 //! |--------------------|---------------------------------|
 //! | `ForegroundPermit` | `allow_foreground: true`        |
 //! | `CursorPermit`     | `allow_cursor: true`            |
+//! | `ClipboardPermit`  | `allow_clipboard: true`         |
 //!
-//! There are exactly two constructors, both flag-only. The explicit
+//! Writing the owner's global clipboard is a side effect outside the target
+//! window (every application shares that clipboard), so it is an explicit
+//! opt-in like the other two; reads (`clipboard_get`) stay free.
+//!
+//! There are exactly three constructors, all flag-only. The explicit
 //! `window` action=focus verb is double-explicit: the verb AND
 //! `allow_foreground:true` are required, so no code path can reach a focus
 //! call without the flag.
@@ -36,6 +41,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 pub const FOREGROUND_REQUIRED: &str = "foreground_required";
 pub const CURSOR_REQUIRED: &str = "cursor_move_required";
+/// Writing the owner's clipboard is refused unless `allow_clipboard:true`.
+pub const CLIPBOARD_REQUIRED: &str = "clipboard_write_required";
 pub const BACKGROUND_UNAVAILABLE: &str = "background_unavailable";
 pub const TARGET_REQUIRED: &str = "target_required";
 
@@ -45,6 +52,9 @@ pub struct ForegroundPermit(());
 
 /// Proof the caller passed `allow_cursor: true`.
 pub struct CursorPermit(());
+
+/// Proof the caller passed `allow_clipboard: true`.
+pub struct ClipboardPermit(());
 
 impl ForegroundPermit {
     /// The ONLY constructor. `None` means the call did not ask to touch the
@@ -64,6 +74,18 @@ impl CursorPermit {
     pub fn grant(allow_cursor: bool) -> Option<Self> {
         if allow_cursor {
             Some(CursorPermit(()))
+        } else {
+            None
+        }
+    }
+}
+
+impl ClipboardPermit {
+    /// The ONLY constructor. `None` means the call did not ask to overwrite
+    /// the owner's global clipboard.
+    pub fn grant(allow_clipboard: bool) -> Option<Self> {
+        if allow_clipboard {
+            Some(ClipboardPermit(()))
         } else {
             None
         }
@@ -218,6 +240,20 @@ fn cursor_refusal(verb: &str) -> GateError {
     }
 }
 
+/// Overwriting the owner's global clipboard is a side effect OUTSIDE the
+/// target window: every application shares that clipboard, so it is an
+/// explicit opt-in like foreground and cursor input.
+pub(crate) fn clipboard_refusal(verb: &str) -> GateError {
+    GateError {
+        code: CLIPBOARD_REQUIRED,
+        message: format!(
+            "{verb} would overwrite the owner's global clipboard, a side effect outside the \
+             target window (every application shares it); pass allow_clipboard:true to \
+             overwrite it on purpose. Nothing was written."
+        ),
+    }
+}
+
 fn target_refusal(verb: &str) -> GateError {
     GateError {
         code: TARGET_REQUIRED,
@@ -243,6 +279,10 @@ pub struct Gate {
     pub has_target: bool,
     pub allow_foreground: bool,
     pub allow_cursor: bool,
+    /// True only when the call passed `allow_clipboard: true`. Writing the
+    /// owner's global clipboard is a side effect outside the target window,
+    /// so it is refused unless asked for by name.
+    pub allow_clipboard: bool,
     /// True only for `desktop:"hidden"`: a private desktop the server created
     /// for one launched program. Posted keyboard is allowed there because
     /// there is no owner session to desync and no other way to drive it; on
@@ -256,8 +296,16 @@ impl Gate {
             has_target,
             allow_foreground,
             allow_cursor,
+            allow_clipboard: false,
             private_desktop: false,
         }
+    }
+
+    /// Mark this call as permitted to overwrite the owner's global clipboard.
+    /// The default (never calling this) refuses `clipboard_set`.
+    pub fn allow_clipboard(mut self, allow: bool) -> Self {
+        self.allow_clipboard = allow;
+        self
     }
 
     /// Mark this call as driving a PRIVATE desktop (the server's own hidden
@@ -421,6 +469,15 @@ impl Gate {
                     Err(foreground_refusal("focus_window"))
                 }
             }
+            // Writing the clipboard mutates owner-global state that lives
+            // outside the target window; reads (clipboard_get) stay free.
+            "clipboard_set" => {
+                if self.allow_clipboard {
+                    Ok(Delivery::None)
+                } else {
+                    Err(clipboard_refusal(verb))
+                }
+            }
             _ => Ok(Delivery::None),
         }
     }
@@ -517,9 +574,55 @@ mod tests {
             gate.decide("clipboard_get", false, false),
             Ok(Delivery::None)
         );
+        // Writing the owner's clipboard is a side effect outside the target
+        // window: refused by default, like the foreground family.
         assert_eq!(
-            gate.decide("clipboard_set", false, false),
+            code(gate.decide("clipboard_set", false, false)),
+            Some(CLIPBOARD_REQUIRED)
+        );
+    }
+
+    #[test]
+    fn clipboard_write_needs_the_explicit_flag() {
+        let e = g(false, false, false)
+            .decide("clipboard_set", false, false)
+            .unwrap_err();
+        assert_eq!(e.code, CLIPBOARD_REQUIRED);
+        assert!(
+            e.text().contains("allow_clipboard:true"),
+            "refusal must name the exact flag: {}",
+            e.text()
+        );
+        assert!(
+            e.text().starts_with(CLIPBOARD_REQUIRED) && e.text().contains("Nothing was written."),
+            "refusal must be typed and state nothing changed: {}",
+            e.text()
+        );
+        // Neither of the other flags buys clipboard access.
+        for gate in [g(false, true, true), g(true, true, true)] {
+            assert_eq!(
+                code(gate.decide("clipboard_set", false, false)),
+                Some(CLIPBOARD_REQUIRED),
+                "allow_foreground/allow_cursor must not authorise a clipboard write"
+            );
+        }
+        // The flag opens exactly the clipboard write, nothing else.
+        let allow = g(false, false, false).allow_clipboard(true);
+        assert_eq!(
+            allow.decide("clipboard_set", false, false),
             Ok(Delivery::None)
+        );
+        assert_eq!(
+            allow.decide("clipboard_get", false, false),
+            Ok(Delivery::None)
+        );
+        assert_eq!(
+            code(allow.decide("type", false, false)),
+            Some(FOREGROUND_REQUIRED)
+        );
+        assert_eq!(
+            code(allow.decide("move", true, false)),
+            Some(CURSOR_REQUIRED)
         );
     }
 
@@ -650,7 +753,9 @@ mod tests {
         assert!(ForegroundPermit::grant(true).is_some());
         assert!(CursorPermit::grant(false).is_none());
         assert!(CursorPermit::grant(true).is_some());
-        // No unflagged constructor exists: the ONLY mints are the two flag
+        assert!(ClipboardPermit::grant(false).is_none());
+        assert!(ClipboardPermit::grant(true).is_some());
+        // No unflagged constructor exists: the ONLY mints are the three flag
         // checks above (also pinned by the source scan in tests/no_steal.rs).
         let gate = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/gate.rs"))
             .expect("gate.rs readable");
@@ -666,6 +771,11 @@ mod tests {
             prod.matches("Some(CursorPermit(())").count(),
             1,
             "CursorPermit has exactly one, flag-only constructor"
+        );
+        assert_eq!(
+            prod.matches("Some(ClipboardPermit(())").count(),
+            1,
+            "ClipboardPermit has exactly one, flag-only constructor"
         );
     }
 
