@@ -13,19 +13,18 @@
 # there is identical to the current fixture, so one exact-value entry
 # covers the working tree and both historical hits.
 #
-# Schema note: gitleaks 8.24.3 expects the global allowlist as a singular
-# `[allowlist]` map (plural `[[allowlists]]` is silently ignored -- verified:
-# even `regexes = ['.*']` in plural form still leaks). The plural blocks
-# below are kept for record/forward-compat; the singular `[allowlist]`
-# table is what 8.24.3 enforces.
+# Schema note (2026-10-29): exactly ONE allowlist form may be present.
+# gitleaks 8.30.1 refuses to load a config that carries `[allowlist]`
+# alongside `[[allowlists]]` -- "[allowlist] is deprecated, it cannot be
+# used alongside [[allowlists]]" -- exit 1 before any scan, so this file no
+# longer has a plural block. Verified on 8.30.1: the singular table alone
+# loads, scans the full history, and still has teeth (removing it reports 2
+# leaks, this fixture and its historical copy). The ci workflow pins 8.24.3,
+# whose prior note (2026-10-20) recorded that it enforces the singular map
+# and ignores the plural one, so dropping the ignored block leaves that
+# version's behaviour unchanged. Do not add `[[allowlists]]` back beside it.
 [extend]
 useDefault = true
-
-[[allowlists]]
-description = "Test-only fixture dummy 'fixture-secret-4821' at src/burst.rs (#[test] set_value_success_writes_and_never_echoes @87e69fd); not a credential."
-condition = "AND"
-paths = ['''(^|[\\/])src[\\/]burst\.rs$''']
-regexes = ['''^fixture-secret-4821$''']
 
 [allowlist]
 description = "test fixture secret, not a live credential"
