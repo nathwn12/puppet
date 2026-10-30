@@ -1,4 +1,7 @@
-# nathwn12 house CI — fast gate (<3 min): fmt, clippy, gitleaks, build+test.
+# nathwn12 house CI — static gate only: fmt, clippy, gitleaks, compile check.
+# Build + test live in release.yml (`cargo build --release --locked`,
+# `cargo test --release --locked`), so this gate never compiles twice for the
+# same answer. Job name `build` is the required check — do not rename.
 name: ci
 on:
   pull_request:
@@ -37,7 +40,5 @@ jobs:
           if (Test-Path $Dir) { Remove-Item -Recurse -Force $Dir }
           Expand-Archive -Path $Zip -DestinationPath $Dir
           & (Join-Path $Dir 'gitleaks.exe') detect --source . --config .gitleaks.toml --redact --no-banner
-      - name: build
-        run: cargo build --locked
-      - name: test (live tests self-skip without PUPPET_LIVE_DESKTOP)
-        run: cargo test --locked
+      - name: check (compile, no link)
+        run: cargo check --locked
