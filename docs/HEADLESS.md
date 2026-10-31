@@ -122,50 +122,13 @@ fixture app (`argv[2]` adds N named buttons after the baseline edit so a
 251-control tree exercises real page boundaries; without it the window is
 exactly the single-edit fixture).
 
-## Elements continuation
+## Elements, element wait and UIA patterns
 
-`elements` accepts `max_depth` (1..32, default 8) bounding the UIA walk
-(report back as `depth_limit`, with `depth_capped` telling whether the
-cut-off hid controls) and `offset` (default 0) skipping that many leading
-controls. The walk still caps at 200 entries; when the cap is hit and more
-controls remain, `next_offset` carries offset + returned count, else null.
-Both backends (UIA walk and Win32 fallback) page identically. The
-screenshot `elements=true` block always uses the defaults (depth 8,
-offset 0, cap 200).
+`elements` paging (`max_depth`, `offset`, `next_offset`), `wait_for`
+`kind:"element"`, and the `invoke` expand/collapse and `set_value`
+RangeValue behaviour are general tool depth, not hidden-desktop depth —
+they are documented once, in [GUIDE.md](GUIDE.md#every-tool) and
+[GUIDE.md](GUIDE.md#the-do-burst).
 
-## Element wait
-
-`wait_for` `kind:"element"` polls the element model instead of pixels:
-`window` is an optional window selector (same grammar as the `window`
-tool; omitted means the foreground window, and no foreground window is
-unsatisfied with a reason, not an error), `element` is a required
-`name:`/`auto_id:`/`path:` selector (same resolution as
-invoke/`set_value`), `state` is `appear` (default), `disappear`,
-`enabled`, or `disabled`. `enabled`/`disabled` query UIA IsEnabled (or
-the Win32 enabled flag under the fallback); the control need not be
-invokable. A timeout is satisfied:false with ok:true like the other
-kinds; a malformed selector, an ambiguous match, or an unresolvable
-window is a per-action error. If the window disappears mid-wait,
-`disappear` is satisfied and the other states keep polling to timeout.
-Polling is cancellable like the other kinds. UIA is best-effort and the
-walk is raw-view: offscreen and framework-hosted controls appear as the
-provider exposes them.
-
-## UIA patterns (P4c)
-
-`invoke` accepts an optional `state` `"expand"|"collapse"` which drives
-only the UIA ExpandCollapse pattern — never Invoke (a SplitButton
-supports both, and Invoke could open a menu instead of collapsing). A
-control without the pattern is a typed error, and the result reports the
-post-action state in `expand_state`
-(Collapsed|Expanded|PartiallyExpanded|LeafNode).
-`set_value` falls back to UIA RangeValue for numeric controls (sliders):
-numeric text is parsed as f64, range-checked against the control's
-minimum/maximum, and read-only is honored; success reports the live value
-in `value`. `elements` with `detail:true` adds each UIA entry's
-TextPattern document text as `text`, capped at 4000 chars with a
-`text_truncated` flag (entries without readable text omit both keys);
-text never participates in the `fp` fingerprint.
-`tests/p4c_patterns.rs` (schema assertions always run; live parts gated)
-proves all three against the fixture app's `p4c` mode (tree + trackbar +
-multiline edit).
+The tests named above still cover them: `tests/p3b_elements.rs` and
+`tests/p4c_patterns.rs`.
