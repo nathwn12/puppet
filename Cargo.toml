@@ -33,7 +33,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 png = "0.18"
 jpeg-encoder = "0.7"
 base64 = "0.23"
-windows = { version = "0.61", features = [
+windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_Graphics_Direct3D",
   "Win32_Graphics_Direct3D11",
