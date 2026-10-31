@@ -117,7 +117,7 @@ fn create_device_on(
             return Ok((d, c));
         }
     }
-    Err(windows::core::Error::from_win32())
+    Err(windows::core::Error::from_thread())
 }
 
 fn open_session(adapter_idx: u32, output_idx: u32) -> windows::core::Result<Session> {
@@ -213,7 +213,7 @@ fn acquire(ses: &mut Session) -> Result<Img, GrabFail> {
         let mut d = D3D11_TEXTURE2D_DESC::default();
         unsafe { tex.GetDesc(&mut d) };
         if d.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
-            return Err(windows::core::Error::from_win32());
+            return Err(windows::core::Error::from_thread());
         }
         copy_frame(ses, d.Width, d.Height, &tex)
     })();
