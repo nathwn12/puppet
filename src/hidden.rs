@@ -235,14 +235,14 @@ fn quote_cmd_arg(s: &str) -> String {
             continue;
         }
         if c == '"' {
-            o.extend(std::iter::repeat('\\').take(backslashes * 2 + 1));
+            o.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
         } else {
-            o.extend(std::iter::repeat('\\').take(backslashes));
+            o.extend(std::iter::repeat_n('\\', backslashes));
         }
         backslashes = 0;
         o.push(c);
     }
-    o.extend(std::iter::repeat('\\').take(backslashes * 2));
+    o.extend(std::iter::repeat_n('\\', backslashes * 2));
     o.push('"');
     o
 }
