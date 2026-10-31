@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed
+- Bump jpeg-encoder to 0.7, whose output is byte-identical to 0.6, and raise
+  the minimum supported Rust version to 1.87 because that crate requires it.
+  `rust-toolchain.toml` and both CI workflows now pin 1.87.0.
 
 ## [6.0.1] - 2026-10-28
 ### Changed

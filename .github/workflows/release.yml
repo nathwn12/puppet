@@ -26,9 +26,10 @@
 # GitHub Releases API on 2026-10-17 there):
 # checkout v7 (v7.0.1), setup-node v7 (v7.1.0), upload-artifact v7 (v7.0.2),
 # download-artifact v8 (v8.0.2), softprops/action-gh-release v3 (v3.0.3).
-# The toolchain is pinned to the MSRV floor (1.85: rust-toolchain.toml,
-# Cargo.toml rust-version, and hashbrown 0.17.1 / indexmap 2.14.2 in
-# Cargo.lock all agree on 1.85), not to the action's floating tag.
+# The toolchain is pinned to the MSRV floor (1.87: rust-toolchain.toml and
+# Cargo.toml rust-version agree, and jpeg-encoder 0.7.1 in Cargo.lock is the
+# crate that sets that floor - it declares rust-version 1.87), not to the
+# action's floating tag.
 name: release
 on:
   push:
@@ -64,7 +65,7 @@ jobs:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', inputs.version) || github.ref_name }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.87.0
       - name: build
         run: cargo build --release --locked
       - name: test
