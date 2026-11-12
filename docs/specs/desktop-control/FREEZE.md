@@ -136,3 +136,13 @@ does, recorded here so a reviewer can check the reasoning rather than the conclu
    `ok:true`. L2 is right and the guide is wrong. W4.6 makes the reply honest
    (`truncated:true`) and W1.1's claims source carries the truth; the guide is corrected
    when the contract is regenerated, not before, because this spec modifies no existing doc.
+
+## Amendments
+
+A change to a frozen clause is made by a written amendment, not by editing SPEC.md, so the
+hash above still matches and the freeze holds. Each one is named here with the clauses it
+reaches; a second needs one more row.
+
+| Amendment | Amends | Effort | Commit |
+|---|---|---|---|
+| [AMENDMENT-01-sizing.md](AMENDMENT-01-sizing.md) — what an image reply says about its own pixels | W3.1 and W3.2, the image replies only; W3.3–W3.5, D1–D7, I1–I6 and the sequence in [PLAN.md](PLAN.md) untouched. Supersedes nothing. | 1.5 d | `a93cdfa` |
