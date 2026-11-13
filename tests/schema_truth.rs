@@ -122,6 +122,26 @@ impl Session {
         });
         Session { child, stdin, rx }
     }
+
+    /// One request/response round-trip on this session.
+    fn call(&mut self, id: i64, method: &str, params: Value) -> Value {
+        let frame = serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": method, "params": params,
+        });
+        let line = serde_json::to_string(&frame).unwrap();
+        self.stdin.write_all(line.as_bytes()).expect("write");
+        self.stdin.write_all(b"\n").expect("newline");
+        self.stdin.flush().expect("flush");
+        let resp: Value = self
+            .rx
+            .recv_timeout(TIMEOUT)
+            .ok()
+            .map(|l| serde_json::from_str(&l).expect("response is JSON"))
+            .expect("response in time");
+        resp.get("result")
+            .cloned()
+            .unwrap_or_else(|| panic!("{method} must succeed, got: {resp}"))
+    }
 }
 
 impl Drop for Session {
@@ -600,7 +620,7 @@ fn every_action_type_is_classified_and_refused_verbs_say_so() {
             }
             let lo = at.saturating_sub(160);
             let hi = (at + verb.len() + 160).min(do_desc.len());
-            let window = &do_desc[lo..hi];
+            let window = do_desc[lo..hi].to_lowercase();
             if window.contains("refus") && window.contains(code.as_str()) {
                 documented = true;
                 break;
@@ -641,5 +661,158 @@ fn no_description_documents_a_code_that_never_existed() {
                 "{name}'s inputSchema documents {code}, which no code emits"
             );
         }
+    }
+}
+
+/// SPEC W1.4: each `TOOL_*` const stays under its budget, and the whole
+/// surface under their sum. Measured on the consts the server serves, not on
+/// a re-serialisation of them.
+const TOOL_BUDGETS: [(&str, usize); 7] = [
+    ("screenshot", 4000),
+    ("diff", 2400),
+    ("list_windows", 1400),
+    ("window", 3000),
+    ("do", 12000),
+    ("cursor", 700),
+    ("elements", 3200),
+];
+const BUDGET_SUM: usize = 26700;
+
+/// The `r#"…"#` value of one `pub const TOOL_*` line in `src/schemas.rs`.
+fn tool_const(name: &str) -> String {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/schemas.rs"),
+    )
+    .expect("src/schemas.rs must be readable");
+    let prefix = format!("pub const TOOL_{}: &str = r#\"", name.to_uppercase());
+    let at = src
+        .find(&prefix)
+        .unwrap_or_else(|| panic!("schemas.rs must declare TOOL_{}", name.to_uppercase()));
+    let rest = &src[at + prefix.len()..];
+    let end = rest
+        .find("\"#;")
+        .unwrap_or_else(|| panic!("TOOL_{} must close with \"#;", name.to_uppercase()));
+    rest[..end].to_string()
+}
+
+/// One `pub const NAME: &str = "value";` claim from the claims source.
+fn claims_const(name: &str) -> String {
+    let at = CLAIMS
+        .find(&format!("pub const {name}:"))
+        .unwrap_or_else(|| panic!("claims.rs must declare {name}"));
+    quoted(&CLAIMS[at..])
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("{name} must carry a string value"))
+}
+
+#[test]
+fn tool_consts_fit_their_byte_budgets() {
+    let mut sum = 0;
+    for (name, budget) in TOOL_BUDGETS {
+        let len = tool_const(name).len();
+        sum += len;
+        assert!(
+            len <= budget,
+            "TOOL_{} is {len} bytes, over its {budget}-byte budget (W1.4)",
+            name.to_uppercase()
+        );
+    }
+    assert!(
+        sum <= BUDGET_SUM,
+        "the seven consts total {sum} bytes, over the {BUDGET_SUM}-byte surface budget"
+    );
+    println!("BUDGET_OK sum={sum}");
+}
+
+/// The budget may not delete truth: every load-bearing claim the claims
+/// source states still reaches an agent through the contract it reads
+/// (`initialize` instructions plus the seven tool descriptions).
+#[test]
+fn the_budget_cut_kept_every_load_bearing_claim() {
+    let mut s = Session::spawn();
+    let init = s.call(
+        1,
+        "initialize",
+        serde_json::json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "schema_truth", "version": "0"},
+        }),
+    );
+    let instructions = init
+        .get("instructions")
+        .and_then(|v| v.as_str())
+        .expect("initialize must carry instructions")
+        .to_string();
+    let list = s.call(2, "tools/list", serde_json::json!({}));
+    let tools = list["tools"].as_array().expect("tools/list tools").clone();
+    let do_desc = tools
+        .iter()
+        .find(|t| t["name"] == "do")
+        .and_then(|t| t["description"].as_str())
+        .expect("do description")
+        .to_string();
+    let elements_desc = tools
+        .iter()
+        .find(|t| t["name"] == "elements")
+        .and_then(|t| t["description"].as_str())
+        .expect("elements description")
+        .to_string();
+    let surface = format!(
+        "{instructions}\n{}\n",
+        tools
+            .iter()
+            .filter_map(|t| t["description"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // The coordinate rule, verbatim from the claims source.
+    let coord = claims_const("COORD_RULE");
+    assert!(
+        surface.contains(&coord),
+        "the byte cut must not drop the coordinate rule"
+    );
+    // `SendInput` is never called (I1), and the effect/satisfied readings
+    // that keep `ok` from being mistaken for a result.
+    let i1 = claims_rows("INVARIANTS", 2)
+        .into_iter()
+        .find(|r| r[0] == "I1")
+        .expect("I1 must be claimed");
+    assert!(
+        surface.contains(&i1[1]),
+        "the byte cut must not drop the no-SendInput invariant"
+    );
+    for row in claims_rows("LIMITS", 2) {
+        match row[0].as_str() {
+            "ok_vs_effect" => assert!(
+                surface.contains(&row[1]),
+                "the byte cut must not drop the effect semantics"
+            ),
+            "wait_for" => assert!(
+                surface.contains(&row[1]),
+                "the byte cut must not drop the satisfied-vs-ok reading"
+            ),
+            _ => {}
+        }
+    }
+    // expect_fp is an agent-facing requirement, not a footnote: it has to
+    // be readable on both tools that take it.
+    assert!(
+        do_desc.contains("expect_fp") && elements_desc.contains("expect_fp"),
+        "do and elements must both state the expect_fp requirement"
+    );
+    // The refusal table survives in the tool an agent reads before acting.
+    for row in claims_rows("REFUSALS", 3) {
+        if row[1] != "refused" {
+            continue;
+        }
+        assert!(
+            do_desc.contains(&row[0]) && do_desc.contains(&row[2]),
+            "do's description must keep the refusal {verb} -> {code}",
+            verb = row[0],
+            code = row[2]
+        );
     }
 }
