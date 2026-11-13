@@ -1227,6 +1227,38 @@ fn wf_done(t0: &Instant, ok: bool, sat: bool, err: Option<String>) -> Map<String
     d
 }
 
+/// `wf_done` for an element wait, which is the only kind that reports which
+/// control satisfied it (W2.3).
+///
+/// `satisfied_by` is the winner — `{selector, fp, path}` for a satisfied wait
+/// that found a control, `null` when nothing won (a timeout, or a `disappear`
+/// satisfied by the control being gone). A caller that passed `expect_fp` also
+/// gets `fp_matched`, and a mismatch is a report, never an error: a wait has to
+/// survive a churning UI, so it says what it found instead of refusing.
+fn wf_done_element(
+    t0: &Instant,
+    ok: bool,
+    sat: bool,
+    by: Option<Map<String, Value>>,
+    err: Option<String>,
+) -> Map<String, Value> {
+    let mut d = wf_done(t0, ok, sat, err);
+    d.insert(
+        "satisfied_by".to_string(),
+        by.map(Value::Object).unwrap_or(Value::Null),
+    );
+    d
+}
+
+/// The control that satisfied an element wait, as `satisfied_by` reports it.
+fn wf_satisfied_by(selector: &str, entry: &Map<String, Value>) -> Map<String, Value> {
+    let mut by = Map::new();
+    by.insert("selector".to_string(), Value::from(selector));
+    by.insert("fp".to_string(), Value::from(entry_str(entry, "fp")));
+    by.insert("path".to_string(), Value::from(entry_str(entry, "path")));
+    by
+}
+
 fn wf_nap(t0: &Instant, timeout_s: f64, poll_s: f64) -> bool {
     let remain = timeout_s - t0.elapsed().as_secs_f64();
     let nap = if remain > 0.001 {
@@ -1499,6 +1531,35 @@ fn wait_for(a: &Map<String, Value>, t0: &Instant) -> Map<String, Value> {
             }
         };
         let elem_v = a.get("element").cloned().unwrap_or(Value::Null);
+        // The fingerprint the caller saw, when it supplied one. It is reported
+        // (`fp_matched`), never enforced: a wait has to survive a churning UI,
+        // so it names what it found instead of refusing.
+        let want_fp: Option<String> = match a.get("expect_fp") {
+            None | Some(Value::Null) => None,
+            Some(v) => {
+                let s = py_str(v);
+                if s.trim().is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            }
+        };
+        // A satisfied element wait reports which control satisfied it (W2.3):
+        // `by` is the winner, None when nothing won (a timeout, or a
+        // `disappear` satisfied by the control being gone).
+        let done = |sat: bool, by: Option<Map<String, Value>>| {
+            let mut d = wf_done_element(t0, true, sat, by.clone(), None);
+            if let Some(want) = want_fp.as_deref() {
+                let matched = by
+                    .as_ref()
+                    .and_then(|b| b.get("fp"))
+                    .and_then(|v| v.as_str())
+                    == Some(want);
+                d.insert("fp_matched".to_string(), Value::from(matched));
+            }
+            d
+        };
         if !py_truthy(&elem_v) || py_str(&elem_v).trim().is_empty() {
             return wf_done(
                 t0,
@@ -1595,7 +1656,7 @@ fn wait_for(a: &Map<String, Value>, t0: &Instant) -> Map<String, Value> {
             let alive = tgt.is_some_and(|h| unsafe { IsWindow(h) != 0 });
             if !alive {
                 if state == "disappear" {
-                    return wf_done(t0, true, true, None);
+                    return done(true, None);
                 }
             } else {
                 let h = tgt.unwrap() as i64;
@@ -1650,7 +1711,7 @@ fn wait_for(a: &Map<String, Value>, t0: &Instant) -> Map<String, Value> {
                         // Absent on every page: disappear is satisfied, the
                         // rest keep polling for its arrival.
                         if state == "disappear" {
-                            return wf_done(t0, true, true, None);
+                            return done(true, None);
                         }
                     }
                     Some((e, backend)) => {
@@ -1660,13 +1721,13 @@ fn wait_for(a: &Map<String, Value>, t0: &Instant) -> Map<String, Value> {
                             None
                         };
                         if element_wait_satisfied(&state, true, enabled) {
-                            return wf_done(t0, true, true, None);
+                            return done(true, Some(wf_satisfied_by(&elem_s, &e)));
                         }
                     }
                 }
             }
             if t0.elapsed().as_secs_f64() >= timeout_s {
-                return wf_done(t0, true, false, None);
+                return done(false, None);
             }
             if wf_nap(t0, timeout_s, poll_s) {
                 return wf_done(t0, false, false, Some("cancelled".to_string()));
@@ -4511,6 +4572,19 @@ pub fn do_burst(args: &DoArgs) -> String {
                 d.insert("ms".to_string(), wr["waited_ms"].clone());
                 if let Some(e) = wr.get("error") {
                     d.insert("error".to_string(), e.clone());
+                }
+                // An element wait names the control that satisfied it (W2.3):
+                // present as an object or null, and absent on every other
+                // kind. `fp_matched` is reported only when the caller passed
+                // `expect_fp`, and a mismatch is never an error.
+                if ad.get("kind").and_then(|k| k.as_str()) == Some("element") {
+                    d.insert(
+                        "satisfied_by".to_string(),
+                        wr.get("satisfied_by").cloned().unwrap_or(Value::Null),
+                    );
+                    if let Some(m) = wr.get("fp_matched") {
+                        d.insert("fp_matched".to_string(), m.clone());
+                    }
                 }
                 if want_ms > left_ms && wr.get("satisfied") != Some(&Value::from(true)) {
                     d.insert("ok".to_string(), Value::from(false));

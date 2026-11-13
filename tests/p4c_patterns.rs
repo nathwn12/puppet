@@ -548,6 +548,18 @@ fn rename_live_button(title: &str) {
     assert!(posted != 0, "the re-render post must land");
 }
 
+/// Post the W2.3 swap: a different control takes the waited name.
+fn swap_waited_name(title: &str) {
+    const WM_P4C_SWAP: u32 = 0x8000 + 2;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW};
+    let cls = wide("PuppetFixtureApp");
+    let t = wide(title);
+    let hwnd = unsafe { FindWindowW(cls.as_ptr(), t.as_ptr()) };
+    assert!(!hwnd.is_null(), "fixture window {title:?} must exist");
+    let posted = unsafe { PostMessageW(hwnd, WM_P4C_SWAP, 0, 0) };
+    assert!(posted != 0, "the swap post must land");
+}
+
 /// The fingerprint the refusal hands back, so the retry costs one call.
 fn fresh_fp(error: &str) -> String {
     let at = error
@@ -763,6 +775,139 @@ fn elements_detail_text_and_fp_stability() {
     );
     drop(fx);
     println!("TEXT_OK extract+truncation-flag+fp-stability green");
+}
+
+/// SPEC W2.3: an element wait names the control that satisfied it. The
+/// fixture renames a different control to the waited name 200 ms in, so the
+/// wait is satisfied by a control the caller never snapshotted: `satisfied_by`
+/// carries that winner's fingerprint and path, `fp_matched` reports the
+/// mismatch as a fact, and the wait is still not an error.
+#[test]
+fn an_element_wait_reports_the_control_that_satisfied_it() {
+    if !live() {
+        return;
+    }
+    kill_stale_fixtures("p4c-wait-winner");
+    let fx = Fixture::spawn("p4c-wait-winner", "p4c");
+    let title = fx.title.clone();
+    std::thread::sleep(Duration::from_millis(500));
+    let mut s = Session::spawn();
+    let bg = format!("title:{title}");
+    // The caller's snapshot: the control that carries the name now, disabled,
+    // so an `enabled` wait cannot be satisfied by it.
+    let snapshot = fp_of(&mut s, 100, &title, "name", "p4c-wait");
+    // A different control takes the name 200 ms into the wait.
+    let swap_title = title.clone();
+    let swap = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        swap_waited_name(&swap_title);
+    });
+    let waited = do_one(
+        &mut s,
+        101,
+        serde_json::json!({
+            "type": "wait_for",
+            "kind": "element",
+            "element": "name:p4c-wait",
+            "state": "enabled",
+            "window": bg.clone(),
+            "timeout_ms": 4000,
+            "expect_fp": snapshot.clone(),
+        }),
+        &bg,
+    );
+    swap.join().expect("the swap thread must not panic");
+    assert_eq!(
+        waited.get("satisfied"),
+        Some(&Value::from(true)),
+        "the wait must be satisfied by the control that took the name, got: {waited}"
+    );
+    assert_eq!(
+        waited.get("ok"),
+        Some(&Value::from(true)),
+        "a satisfied wait is never an error, got: {waited}"
+    );
+    let by = waited
+        .get("satisfied_by")
+        .and_then(|b| b.as_object())
+        .unwrap_or_else(|| panic!("a satisfied element wait must report satisfied_by: {waited}"));
+    assert_eq!(
+        by.get("selector").and_then(|v| v.as_str()),
+        Some("name:p4c-wait"),
+        "satisfied_by must name the selector that won, got: {by:?}"
+    );
+    let winner = by
+        .get("fp")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("satisfied_by must carry the winner's fp: {by:?}"));
+    assert_ne!(
+        winner, snapshot,
+        "the winner is the control that took the name, not the snapshot's"
+    );
+    assert!(
+        by.get("path").and_then(|v| v.as_str()).is_some(),
+        "satisfied_by must carry the winner's path, got: {by:?}"
+    );
+    assert_eq!(
+        waited.get("fp_matched"),
+        Some(&Value::from(false)),
+        "a supplied expect_fp is reported, never enforced, got: {waited}"
+    );
+    // A timeout is the same report with no winner: satisfied_by null, and the
+    // action still delivered (ok:true).
+    let timed_out = do_one(
+        &mut s,
+        102,
+        serde_json::json!({
+            "type": "wait_for",
+            "kind": "element",
+            "element": "name:never-appears",
+            "window": bg.clone(),
+            "timeout_ms": 200,
+        }),
+        &bg,
+    );
+    assert_eq!(
+        timed_out.get("ok"),
+        Some(&Value::from(true)),
+        "a timeout is never an error, got: {timed_out}"
+    );
+    assert_eq!(
+        timed_out.get("satisfied"),
+        Some(&Value::from(false)),
+        "got: {timed_out}"
+    );
+    assert_eq!(
+        timed_out.get("satisfied_by"),
+        Some(&Value::Null),
+        "nothing won, so satisfied_by is null, got: {timed_out}"
+    );
+    // Every other kind is unchanged: no satisfied_by on its result.
+    let window_wait = do_one(
+        &mut s,
+        103,
+        serde_json::json!({
+            "type": "wait_for",
+            "kind": "window_appear",
+            "selector": format!("title:{title}"),
+            "timeout_ms": 1000,
+        }),
+        &bg,
+    );
+    assert_eq!(
+        window_wait.get("satisfied"),
+        Some(&Value::from(true)),
+        "the fixture window exists, got: {window_wait}"
+    );
+    assert!(
+        !window_wait
+            .as_object()
+            .expect("result object")
+            .contains_key("satisfied_by"),
+        "satisfied_by belongs to element waits only, got: {window_wait}"
+    );
+    drop(fx);
+    println!("WAIT_WINNER_OK winner={winner} snapshot={snapshot} fp_matched=false");
 }
 
 /// SPEC W2.2 live: `fp` is identity, never state. A real state change (the

@@ -1843,6 +1843,29 @@ mod tests {
         }
     }
 
+    /// SPEC W2.3: an element wait may carry the caller's fingerprint, which is
+    /// reported (`fp_matched`) and never enforced, so the schema declares it.
+    #[test]
+    fn do_wait_for_action_schema_declares_expect_fp() {
+        let t: Value = serde_json::from_str(crate::schemas::TOOL_DO).expect("TOOL_DO JSON");
+        let variants = t["inputSchema"]["properties"]["actions"]["items"]["oneOf"]
+            .as_array()
+            .expect("do.actions.items.oneOf");
+        let wf = variants
+            .iter()
+            .find(|v| v["properties"]["type"]["const"].as_str() == Some("wait_for"))
+            .expect("a wait_for action variant");
+        let props = wf["properties"].as_object().expect("wait_for properties");
+        assert!(
+            props.contains_key("expect_fp"),
+            "the wait_for schema must declare expect_fp: {wf}"
+        );
+        assert!(
+            props.contains_key("element") && props.contains_key("state"),
+            "the wait_for schema must keep element and state: {wf}"
+        );
+    }
+
     /// The elements/screenshot descriptions must describe what the runtime
     /// actually emits: `offscreen`, `moved_during_capture`, `elements_window`.
     #[test]

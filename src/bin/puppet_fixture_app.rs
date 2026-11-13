@@ -42,6 +42,7 @@ use windows_sys::Win32::UI::Controls::{
     TVINSERTSTRUCTW, TVITEMW, TVI_LAST, TVI_ROOT, TVM_INSERTITEMW, TVS_HASBUTTONS, TVS_HASLINES,
     TVS_LINESATROOT,
 };
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 // ---------------------------------------------------------------- W6.2 caps
@@ -65,7 +66,13 @@ const CAPS_FRAME_BTN_ID: i32 = 4100;
 // snapshot saw.
 const P4C_LIVE_BTN_ID: i32 = 3003;
 const P4C_COUNT_ID: i32 = 3004;
+// W2.3: the control a wait snapshots (disabled, so an `enabled` wait cannot be
+// satisfied by it) and the control that replaces it — a fresh one with the same
+// name and a different automation id, so its fingerprint moves.
+const P4C_WAIT_ID: i32 = 3005;
+const P4C_WAIT_TAKER_ID: i32 = 3007;
 const WM_P4C_RENAME: u32 = WM_APP + 1;
+const WM_P4C_SWAP: u32 = WM_APP + 2;
 
 /// Button hwnd, counter hwnd and activation count, all 0 until the p4c
 /// window creates them: every other mode leaves them 0, so its behaviour is
@@ -73,6 +80,10 @@ const WM_P4C_RENAME: u32 = WM_APP + 1;
 static P4C_BTN: AtomicIsize = AtomicIsize::new(0);
 static P4C_COUNT: AtomicIsize = AtomicIsize::new(0);
 static P4C_ACT: AtomicIsize = AtomicIsize::new(0);
+/// W2.3's pair: the disabled holder of the waited name and the control that
+/// takes it, 0 until the p4c window creates them.
+static P4C_WAIT: AtomicIsize = AtomicIsize::new(0);
+static P4C_WAIT_NEW: AtomicIsize = AtomicIsize::new(0);
 
 /// The stamped log's own window, 0 until it exists.
 static CAPS_LOG_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -293,6 +304,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> i
         let btn = P4C_BTN.load(Ordering::SeqCst);
         if btn != 0 {
             SetWindowTextW(btn as HWND, wide("p4c-live-2").as_ptr());
+        }
+        return 0;
+    }
+    // W2.3: a different control takes the name the wait is polling for. The
+    // holder is DESTROYED rather than renamed: the Win32 UIA provider serves a
+    // cached Name for an existing element for seconds after WM_SETTEXT, so a
+    // rename would make the swap unobservable inside a wait. A destroyed
+    // control leaves the tree at once and the new one is a fresh element.
+    if msg == WM_P4C_SWAP {
+        let holder = P4C_WAIT.load(Ordering::SeqCst);
+        if holder != 0 {
+            DestroyWindow(holder as HWND);
+            P4C_WAIT.store(0, Ordering::SeqCst);
+        }
+        let newcomer = CreateWindowExW(
+            0,
+            wide("BUTTON").as_ptr(),
+            wide("p4c-wait").as_ptr(),
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32,
+            12,
+            320,
+            200,
+            24,
+            hwnd,
+            P4C_WAIT_TAKER_ID as isize as *mut _,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        );
+        if !newcomer.is_null() {
+            P4C_WAIT_NEW.store(newcomer as isize, Ordering::SeqCst);
         }
         return 0;
     }
@@ -801,6 +842,29 @@ fn main() {
             }
             P4C_BTN.store(live_btn as isize, Ordering::SeqCst);
             P4C_COUNT.store(count as isize, Ordering::SeqCst);
+            // W2.3's pair: a disabled holder of `p4c-wait`, so an `enabled`
+            // wait cannot be satisfied by it, and (on the posted swap) a fresh
+            // enabled control with the same name and a different automation id.
+            let wait_btn = CreateWindowExW(
+                0,
+                btn_cls.as_ptr(),
+                wide("p4c-wait").as_ptr(),
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32,
+                12,
+                320,
+                200,
+                24,
+                hwnd,
+                P4C_WAIT_ID as isize as *mut _,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            if wait_btn.is_null() {
+                DestroyWindow(hwnd);
+                return;
+            }
+            EnableWindow(wait_btn, 0);
+            P4C_WAIT.store(wait_btn as isize, Ordering::SeqCst);
         }
         ShowWindow(hwnd, SW_SHOW);
         let mut msg: MSG = std::mem::zeroed();
