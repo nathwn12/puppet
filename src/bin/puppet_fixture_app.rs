@@ -19,6 +19,12 @@
 //! readable through `elements` detail:text. Every capability is opt-in by
 //! argv, so `p4c`, a numeric button count and the baseline window are
 //! byte-for-byte what they were.
+//!
+//! W2.1 adds the p4c mode's live button and its activation counter: a posted
+//! `WM_APP+1` renames the button (same auto_id, new name, so its fingerprint
+//! moves while its selector keeps resolving), and every activation is
+//! mirrored into a read-only STATIC, so a refused mutation can prove it
+//! activated nothing.
 
 #![windows_subsystem = "windows"]
 
@@ -50,6 +56,23 @@ const CAPS_FRAME_ID: i32 = 4005;
 const CAPS_TRACK_ID: i32 = 4006;
 const CAPS_TREE_ID: i32 = 4007;
 const CAPS_FRAME_BTN_ID: i32 = 4100;
+
+// ---------------------------------------------------------------- W2.1 p4c
+// The p4c window's live button, the read-only STATIC that reports its
+// activation count, and the posted message that re-renders (renames) it. A
+// rename changes `name`, so the element fingerprint moves while `auto_id`
+// keeps resolving: the selector still finds a control, just not the one the
+// snapshot saw.
+const P4C_LIVE_BTN_ID: i32 = 3003;
+const P4C_COUNT_ID: i32 = 3004;
+const WM_P4C_RENAME: u32 = WM_APP + 1;
+
+/// Button hwnd, counter hwnd and activation count, all 0 until the p4c
+/// window creates them: every other mode leaves them 0, so its behaviour is
+/// unchanged.
+static P4C_BTN: AtomicIsize = AtomicIsize::new(0);
+static P4C_COUNT: AtomicIsize = AtomicIsize::new(0);
+static P4C_ACT: AtomicIsize = AtomicIsize::new(0);
 
 /// The stamped log's own window, 0 until it exists.
 static CAPS_LOG_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -238,6 +261,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> i
         PostQuitMessage(0);
         return 0;
     }
+    // W2.1: the p4c live button counts its activations into a read-only
+    // STATIC (an absent activation reads as `activations=0`), and renames
+    // itself on the posted re-render, which moves its fingerprint without
+    // moving its selector.
+    if msg == WM_COMMAND {
+        let id = (w & 0xffff) as i32;
+        let code = ((w >> 16) & 0xffff) as u32;
+        if code == BN_CLICKED && id == P4C_LIVE_BTN_ID {
+            let n = P4C_ACT.fetch_add(1, Ordering::SeqCst) + 1;
+            let count = P4C_COUNT.load(Ordering::SeqCst);
+            if count != 0 {
+                SetWindowTextW(count as HWND, wide(&format!("activations={n}")).as_ptr());
+            }
+            return 0;
+        }
+    }
+    if msg == WM_P4C_RENAME {
+        let btn = P4C_BTN.load(Ordering::SeqCst);
+        if btn != 0 {
+            SetWindowTextW(btn as HWND, wide("p4c-live-2").as_ptr());
+        }
+        return 0;
+    }
     DefWindowProcW(hwnd, msg, w, l)
 }
 
@@ -277,7 +323,15 @@ fn main() {
         if RegisterClassW(&wc) == 0 {
             return;
         }
-        let (win_w, win_h) = if caps { (760, 620) } else { (480, 320) };
+        let (win_w, win_h) = if caps {
+            (760, 620)
+        } else if p4c {
+            // W2.1's live button and activation counter sit under the
+            // baseline edit; the extra height is the room for them.
+            (480, 420)
+        } else {
+            (480, 320)
+        };
         let title_w = wide(&title);
         let edit_cls = wide("EDIT");
         let base_w = wide("baseline");
@@ -696,6 +750,45 @@ fn main() {
                 DestroyWindow(hwnd);
                 return;
             }
+            // W2.1: a live button whose selector survives a re-render. The
+            // posted WM_P4C_RENAME renames it (fingerprint moves, auto_id
+            // does not), and every activation is counted into the STATIC so
+            // a refused mutation can prove zero activations.
+            let btn_cls = wide("BUTTON");
+            let live_btn = CreateWindowExW(
+                0,
+                btn_cls.as_ptr(),
+                wide("p4c-live").as_ptr(),
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32,
+                12,
+                260,
+                200,
+                26,
+                hwnd,
+                P4C_LIVE_BTN_ID as isize as *mut _,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            let count = CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                wide("activations=0").as_ptr(),
+                WS_CHILD | WS_VISIBLE,
+                12,
+                292,
+                200,
+                20,
+                hwnd,
+                P4C_COUNT_ID as isize as *mut _,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            if live_btn.is_null() || count.is_null() {
+                DestroyWindow(hwnd);
+                return;
+            }
+            P4C_BTN.store(live_btn as isize, Ordering::SeqCst);
+            P4C_COUNT.store(count as isize, Ordering::SeqCst);
         }
         ShowWindow(hwnd, SW_SHOW);
         let mut msg: MSG = std::mem::zeroed();

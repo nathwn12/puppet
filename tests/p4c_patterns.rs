@@ -304,10 +304,11 @@ fn invoke_expand_collapse_tree_node() {
     let mut s = Session::spawn();
     let bg = format!("title:{title}");
     // Expand the root node: only ExpandCollapse may fire (never Invoke).
+    let root = fp_of(&mut s, 9, &title, "name", "p4c-root");
     let first = do_one(
         &mut s,
         10,
-        serde_json::json!({"type": "invoke", "element": "name:p4c-root", "state": "expand"}),
+        serde_json::json!({"type": "invoke", "element": "name:p4c-root", "state": "expand", "expect_fp": root}),
         &bg,
     );
     assert_eq!(
@@ -329,7 +330,7 @@ fn invoke_expand_collapse_tree_node() {
     let first = do_one(
         &mut s,
         11,
-        serde_json::json!({"type": "invoke", "element": "name:p4c-root", "state": "collapse"}),
+        serde_json::json!({"type": "invoke", "element": "name:p4c-root", "state": "collapse", "expect_fp": root}),
         &bg,
     );
     assert_eq!(
@@ -366,10 +367,11 @@ fn invoke_state_without_pattern_is_typed_error_no_click() {
     let mut s = Session::spawn();
     let bg = format!("title:{title}");
     // The baseline EDIT (auto_id 100) is ValuePattern-only.
+    let edit = fp_of(&mut s, 69, &title, "auto_id", "100");
     let first = do_one(
         &mut s,
         70,
-        serde_json::json!({"type": "invoke", "element": "auto_id:100", "state": "expand", "fallback": "click"}),
+        serde_json::json!({"type": "invoke", "element": "auto_id:100", "state": "expand", "fallback": "click", "expect_fp": edit}),
         &bg,
     );
     assert_eq!(
@@ -404,10 +406,11 @@ fn invoke_state_dry_run_validation() {
     std::thread::sleep(Duration::from_millis(500));
     let mut s = Session::spawn();
     let bg = format!("title:{title}");
+    let root = fp_of(&mut s, 70, &title, "name", "p4c-root");
     let first = do_one_dry(
         &mut s,
         71,
-        serde_json::json!({"type": "invoke", "element": "name:p4c-root", "state": "bogus"}),
+        serde_json::json!({"type": "invoke", "element": "name:p4c-root", "state": "bogus", "expect_fp": root}),
         &bg,
     );
     assert_eq!(
@@ -426,7 +429,7 @@ fn invoke_state_dry_run_validation() {
     let first = do_one_dry(
         &mut s,
         72,
-        serde_json::json!({"type": "invoke", "element": "name:p4c-root", "state": "expand"}),
+        serde_json::json!({"type": "invoke", "element": "name:p4c-root", "state": "expand", "expect_fp": root}),
         &bg,
     );
     assert_eq!(
@@ -524,6 +527,183 @@ fn find_auto<'a>(els: &'a [Value], auto_id: &str) -> &'a Value {
     els.iter()
         .find(|e| e.get("auto_id").and_then(|v| v.as_str()) == Some(auto_id))
         .unwrap_or_else(|| panic!("elements must list auto_id:{auto_id}"))
+}
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Post the fixture's own re-render message to its top-level window: the p4c
+/// fixture renames its live button, so `auto_id:3003` still resolves while the
+/// fingerprint moves. The trigger comes from the harness, never from the
+/// server under test.
+fn rename_live_button(title: &str) {
+    const WM_P4C_RENAME: u32 = 0x8000 + 1;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW};
+    let cls = wide("PuppetFixtureApp");
+    let t = wide(title);
+    let hwnd = unsafe { FindWindowW(cls.as_ptr(), t.as_ptr()) };
+    assert!(!hwnd.is_null(), "fixture window {title:?} must exist");
+    let posted = unsafe { PostMessageW(hwnd, WM_P4C_RENAME, 0, 0) };
+    assert!(posted != 0, "the re-render post must land");
+}
+
+/// The fingerprint the refusal hands back, so the retry costs one call.
+fn fresh_fp(error: &str) -> String {
+    let at = error
+        .find("(fp ")
+        .unwrap_or_else(|| panic!("refusal must carry the fresh fp, got: {error:?}"));
+    error[at + 4..]
+        .split(')')
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The live button's activation count, read back through `elements`: the
+/// fixture mirrors it into a read-only STATIC (`activations=N`).
+fn activations(s: &mut Session, id: i64, title: &str) -> String {
+    let (els, _) = detail_text(s, id, title);
+    find_auto(&els, "3004")
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The fingerprint of one control, read from a fresh `elements` snapshot: the
+/// value every element mutation now passes as `expect_fp` (W2.1).
+fn fp_of(s: &mut Session, id: i64, title: &str, key: &str, value: &str) -> String {
+    let (els, _) = detail_text(s, id, title);
+    els.iter()
+        .find(|e| e.get(key).and_then(|v| v.as_str()) == Some(value))
+        .and_then(|e| e.get("fp"))
+        .and_then(|v| v.as_str())
+        .map(|fp| fp.to_string())
+        .unwrap_or_else(|| panic!("elements must list {key}:{value} with an fp"))
+}
+
+/// W2.1: an element mutation with no `expect_fp` refuses and hands back the
+/// fresh fingerprint; a stale one keeps `stale_ref`; the one-call retry acts.
+/// The fixture re-renders between the snapshot and the invoke, so the
+/// selector resolves to a control the snapshot never saw.
+#[test]
+fn invoke_without_expect_fp_refuses_and_the_one_call_retry_acts() {
+    if !live() {
+        return;
+    }
+    kill_stale_fixtures("p4c-fp-live");
+    let fx = Fixture::spawn("p4c-fp-live", "p4c");
+    let title = fx.title.clone();
+    std::thread::sleep(Duration::from_millis(500));
+    let mut s = Session::spawn();
+    let bg = format!("title:{title}");
+    // Snapshot the button, then re-render it under the same selector.
+    let (els, _) = detail_text(&mut s, 40, &title);
+    let fp_before = find_auto(&els, "3003")
+        .get("fp")
+        .cloned()
+        .expect("entry carries fp");
+    assert_eq!(activations(&mut s, 41, &title), "activations=0");
+    rename_live_button(&title);
+    std::thread::sleep(Duration::from_millis(200));
+    // No expect_fp: refused before anything is activated, with the fresh
+    // fingerprint in the refusal so no second round-trip is needed.
+    let refused = do_one(
+        &mut s,
+        42,
+        serde_json::json!({"type": "invoke", "element": "auto_id:3003"}),
+        &bg,
+    );
+    assert_eq!(
+        refused.get("ok"),
+        Some(&Value::from(false)),
+        "a mutation with no expect_fp must refuse, got: {refused}"
+    );
+    assert_eq!(
+        refused.get("code").and_then(|c| c.as_str()),
+        Some("expect_fp_required"),
+        "refusal must be typed expect_fp_required, got: {refused}"
+    );
+    assert_eq!(
+        refused.get("resolution").and_then(|r| r.as_str()),
+        Some("expect_fp_required"),
+        "refusal must name its resolution, got: {refused}"
+    );
+    let error = refused
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        error.contains("auto_id:3003"),
+        "refusal must name the selector, got: {error:?}"
+    );
+    let fresh = fresh_fp(&error);
+    assert_ne!(
+        Some(fresh.as_str()),
+        fp_before.as_str(),
+        "the re-render must move the fingerprint, got: {fresh:?}"
+    );
+    assert_eq!(
+        activations(&mut s, 43, &title),
+        "activations=0",
+        "a refused mutation must activate nothing"
+    );
+    // Under dry_run the same refusal fires: a dry run that resolved while the
+    // live call refuses would be a lie.
+    let dry = do_one_dry(
+        &mut s,
+        48,
+        serde_json::json!({"type": "invoke", "element": "auto_id:3003"}),
+        &bg,
+    );
+    assert_eq!(
+        dry.get("code").and_then(|c| c.as_str()),
+        Some("expect_fp_required"),
+        "dry_run must refuse exactly like the live call, got: {dry}"
+    );
+    // The snapshot's fingerprint is now stale: same shape, fresh value added.
+    let stale = do_one(
+        &mut s,
+        44,
+        serde_json::json!({"type": "invoke", "element": "auto_id:3003", "expect_fp": fp_before}),
+        &bg,
+    );
+    assert_eq!(
+        stale.get("code").and_then(|c| c.as_str()),
+        Some("stale_ref"),
+        "a mismatched expect_fp must stay stale_ref, got: {stale}"
+    );
+    assert_eq!(
+        stale.get("resolution").and_then(|r| r.as_str()),
+        Some("stale"),
+        "a mismatched expect_fp must keep resolution:stale, got: {stale}"
+    );
+    assert_eq!(
+        activations(&mut s, 45, &title),
+        "activations=0",
+        "a stale ref must activate nothing"
+    );
+    // The one-call retry, with the fingerprint the refusal returned.
+    let retried = do_one(
+        &mut s,
+        46,
+        serde_json::json!({"type": "invoke", "element": "auto_id:3003", "expect_fp": fresh}),
+        &bg,
+    );
+    assert_eq!(
+        retried.get("ok"),
+        Some(&Value::from(true)),
+        "the one-call retry must act, got: {retried}"
+    );
+    assert_eq!(
+        activations(&mut s, 47, &title),
+        "activations=1",
+        "the retry must activate the control exactly once"
+    );
+    drop(fx);
+    println!("EXPECT_FP_OK refused, stale-refused, one-call retry activated once");
 }
 
 #[test]

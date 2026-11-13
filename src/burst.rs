@@ -1976,28 +1976,57 @@ pub(crate) fn rect_refusal_message(entry: &Map<String, Value>, r: RectRefusal) -
     }
 }
 
-/// re-walked entry's fingerprint must equal it. Returns the typed refusal on
-/// mismatch, None when the gate passes (no/empty expect_fp, or a match).
-/// Applies live and under dry_run alike: a stale ref never acts.
+/// W2.1: an element mutation with no fingerprint. Typed, and carrying the
+/// fresh value so the retry costs one call.
+const EXPECT_FP_REQUIRED: &str = "expect_fp_required";
+
+/// One typed refusal from the fingerprint gate.
+struct FpRefusal {
+    code: &'static str,
+    resolution: &'static str,
+    text: String,
+}
+
+/// The re-walked entry's fingerprint must equal `expect_fp`. Returns the typed
+/// refusal when it does not, None when the gate passes. `required` refuses an
+/// absent fingerprint too: a mutation without one may act on a different
+/// control than the one the caller saw (W2.1). Applies live and under dry_run
+/// alike: a stale ref never acts.
 fn check_expect_fp(
     a: &Map<String, Value>,
     entry: &Map<String, Value>,
     sel: &str,
-) -> Option<String> {
+    required: bool,
+) -> Option<FpRefusal> {
+    let got = entry_str(entry, "fp");
     let want = match a.get("expect_fp") {
-        None | Some(Value::Null) => return None,
+        None | Some(Value::Null) => String::new(),
         Some(v) => py_str(v),
     };
     if want.trim().is_empty() {
-        return None;
+        if !required {
+            return None;
+        }
+        return Some(FpRefusal {
+            code: EXPECT_FP_REQUIRED,
+            resolution: "expect_fp_required",
+            text: format!(
+                "expect_fp_required: element \"{sel}\" was resolved fresh (fp {got}). Pass expect_fp \
+                 with the fingerprint from your elements snapshot; a mutation without one may act \
+                 on a different control."
+            ),
+        });
     }
-    let got = entry_str(entry, "fp");
     if got == want {
         return None;
     }
-    Some(format!(
-        "stale_ref: element \"{sel}\" changed since its snapshot (expected fp {want}, now {got}). Take a fresh `elements` snapshot and retry with the new ref/fp."
-    ))
+    Some(FpRefusal {
+        code: "stale_ref",
+        resolution: "stale",
+        text: format!(
+            "stale_ref: element \"{sel}\" changed since its snapshot (expected fp {want}, now {got}). Take a fresh `elements` snapshot and retry with the new ref/fp."
+        ),
+    })
 }
 
 // ---------------------------------------------------------------- invoke activation (UIA patterns + Win32 extent)
@@ -3038,10 +3067,11 @@ pub fn do_burst(args: &DoArgs) -> String {
                         return Ok(Some(d));
                     }
                     let entry = entry.unwrap();
-                    if let Some(se) = check_expect_fp(ad, &entry, &py_str(&elem_v)) {
+                    if let Some(se) = check_expect_fp(ad, &entry, &py_str(&elem_v), false) {
                         d.insert("ok".to_string(), Value::from(false));
-                        d.insert("error".to_string(), Value::from(se));
-                        d.insert("resolution".to_string(), Value::from("stale"));
+                        d.insert("code".to_string(), Value::from(se.code));
+                        d.insert("error".to_string(), Value::from(se.text));
+                        d.insert("resolution".to_string(), Value::from(se.resolution));
                         d.insert("via".to_string(), Value::from("none"));
                         d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
                         return Ok(Some(d));
@@ -3171,9 +3201,12 @@ pub fn do_burst(args: &DoArgs) -> String {
                     ad,
                     &entry,
                     &py_str(ad.get("element").unwrap_or(&Value::Null)),
+                    true,
                 ) {
-                    d.insert("error".to_string(), Value::from(se));
-                    d.insert("resolution".to_string(), Value::from("stale"));
+                    d.insert("ok".to_string(), Value::from(false));
+                    d.insert("code".to_string(), Value::from(se.code));
+                    d.insert("error".to_string(), Value::from(se.text));
+                    d.insert("resolution".to_string(), Value::from(se.resolution));
                     d.insert("via".to_string(), Value::from("none"));
                     d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
                     return Ok(Some(d));
@@ -3428,9 +3461,12 @@ pub fn do_burst(args: &DoArgs) -> String {
                         ad,
                         &entry,
                         &py_str(ad.get("element").unwrap_or(&Value::Null)),
+                        true,
                     ) {
-                        d.insert("error".to_string(), Value::from(se));
-                        d.insert("resolution".to_string(), Value::from("stale"));
+                        d.insert("ok".to_string(), Value::from(false));
+                        d.insert("code".to_string(), Value::from(se.code));
+                        d.insert("error".to_string(), Value::from(se.text));
+                        d.insert("resolution".to_string(), Value::from(se.resolution));
                         d.insert("via".to_string(), Value::from("none"));
                         d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
                         return Ok(Some(d));
@@ -4075,10 +4111,12 @@ pub fn do_burst(args: &DoArgs) -> String {
                     ad,
                     &entry,
                     &py_str(ad.get("element").unwrap_or(&Value::Null)),
+                    true,
                 ) {
                     d.insert("ok".to_string(), Value::from(false));
-                    d.insert("error".to_string(), Value::from(se));
-                    d.insert("resolution".to_string(), Value::from("stale"));
+                    d.insert("code".to_string(), Value::from(se.code));
+                    d.insert("error".to_string(), Value::from(se.text));
+                    d.insert("resolution".to_string(), Value::from(se.resolution));
                     d.insert("via".to_string(), Value::from("none"));
                     d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
                     return Ok(Some(d));
@@ -4320,10 +4358,12 @@ pub fn do_burst(args: &DoArgs) -> String {
                         ad,
                         &entry,
                         &py_str(ad.get("element").unwrap_or(&Value::Null)),
+                        true,
                     ) {
                         d.insert("ok".to_string(), Value::from(false));
-                        d.insert("error".to_string(), Value::from(se));
-                        d.insert("resolution".to_string(), Value::from("stale"));
+                        d.insert("code".to_string(), Value::from(se.code));
+                        d.insert("error".to_string(), Value::from(se.text));
+                        d.insert("resolution".to_string(), Value::from(se.resolution));
                         d.insert("via".to_string(), Value::from("none"));
                         d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
                         return Ok(Some(d));
@@ -4898,7 +4938,7 @@ mod tests {
         }
         // The walk is asynchronous after ShowWindow, so poll for the entry
         // and click the one it actually produced.
-        let (path, rect) = {
+        let (path, fp, rect) = {
             let t0 = std::time::Instant::now();
             loop {
                 let m = element_model(fx.hwnd(), crate::UIA_DEPTH_LIMIT, 0);
@@ -4909,6 +4949,7 @@ mod tests {
                 if let Some(e) = hit {
                     break (
                         entry_str(e, "path"),
+                        entry_str(e, "fp"),
                         e.get("rect").cloned().unwrap_or(Value::Null),
                     );
                 }
@@ -4919,7 +4960,9 @@ mod tests {
             }
         };
         crate::fixture::reset_msg_counts();
-        let actions = vec![serde_json::json!({"type": "click", "element": format!("path:{path}")})];
+        let actions = vec![
+            serde_json::json!({"type": "click", "element": format!("path:{path}"), "expect_fp": fp}),
+        ];
         let out = do_burst(&DoArgs {
             target: Some(serde_json::json!({ "hwnd": hwnd })),
             ..DoArgs::new(&actions)
@@ -4970,7 +5013,7 @@ mod tests {
             };
             assert_ne!(moved, 0, "collapse a fixture child");
         }
-        let path = {
+        let (path, fp) = {
             let t0 = std::time::Instant::now();
             loop {
                 let m = element_model(fx.hwnd(), crate::UIA_DEPTH_LIMIT, 0);
@@ -4979,7 +5022,7 @@ mod tests {
                     .iter()
                     .find(|e| e.get("offscreen") == Some(&Value::from(true)))
                 {
-                    break entry_str(e, "path");
+                    break (entry_str(e, "path"), entry_str(e, "fp"));
                 }
                 if t0.elapsed() > std::time::Duration::from_secs(10) {
                     panic!("no zero-area entry appeared: {:?}", m.entries);
@@ -4987,7 +5030,9 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
         };
-        let actions = vec![serde_json::json!({"type": "click", "element": format!("path:{path}")})];
+        let actions = vec![
+            serde_json::json!({"type": "click", "element": format!("path:{path}"), "expect_fp": fp}),
+        ];
         let out = do_burst(&DoArgs {
             dry_run: true,
             target: Some(serde_json::json!({ "hwnd": hwnd })),
@@ -5224,8 +5269,10 @@ mod tests {
         // bogus state fails typed even though the element resolves.
         let (fx, bg) = fixture_bg();
         let _ = fx.hwnd();
-        let actions =
-            vec![serde_json::json!({"type": "invoke", "element": "name:OK", "state": "sideways"})];
+        let fp = live_fp(fx.hwnd(), "name", "OK");
+        let actions = vec![
+            serde_json::json!({"type": "invoke", "element": "name:OK", "state": "sideways", "expect_fp": fp}),
+        ];
         let (_, first) = burst_bg(&actions, &bg, true);
         assert_eq!(
             first.get("ok"),
@@ -5248,8 +5295,10 @@ mod tests {
         // Valid state passes dry-run resolution (ok, found, no firing).
         let (fx, bg) = fixture_bg();
         let _ = fx.hwnd();
-        let actions =
-            vec![serde_json::json!({"type": "invoke", "element": "name:OK", "state": "expand"})];
+        let fp = live_fp(fx.hwnd(), "name", "OK");
+        let actions = vec![
+            serde_json::json!({"type": "invoke", "element": "name:OK", "state": "expand", "expect_fp": fp}),
+        ];
         let (_, first) = burst_bg(&actions, &bg, true);
         assert_eq!(
             first.get("ok"),
@@ -6140,6 +6189,18 @@ mod tests {
         }
     }
 
+    /// The live fingerprint of one control from a fresh walk. W2.1 makes it
+    /// mandatory for every element mutation, so a test that means to prove
+    /// something else passes the current value.
+    fn live_fp(hwnd: HWND, key: &str, want: &str) -> String {
+        let m = element_model(hwnd, crate::UIA_DEPTH_LIMIT, 0);
+        m.entries
+            .iter()
+            .find(|e| entry_str(e, key) == want)
+            .map(|e| entry_str(e, "fp"))
+            .unwrap_or_else(|| panic!("the walk must list {key}:{want}"))
+    }
+
     fn edit_paths() -> (crate::fixture::Fixture, String, String, String) {
         // Returns (fixture, bg, writable_path, readonly_path) by enumerating
         // the live model and splitting the two Edit roles by screen-y.
@@ -6848,8 +6909,9 @@ mod tests {
         let fx = crate::fixture::Fixture::new();
         let hwnd = fx.hwnd_i64();
         wait_uia_stable(fx.hwnd());
+        let fp = live_fp(fx.hwnd(), "auto_id", "100");
         let actions = vec![serde_json::json!({
-            "type": "click", "element": "auto_id:100"
+            "type": "click", "element": "auto_id:100", "expect_fp": fp
         })];
         let out = do_burst(&DoArgs {
             target: Some(serde_json::json!({ "hwnd": hwnd })),
@@ -7180,8 +7242,9 @@ mod tests {
         let _g = crate::fixture::desktop();
         let (fx, bg) = fixture_bg();
         wait_uia_stable(fx.hwnd());
+        let fp = live_fp(fx.hwnd(), "name", "OK");
         let actions = vec![serde_json::json!({
-            "type": "click", "element": "name:OK", "expect_fp": null
+            "type": "click", "element": "name:OK", "expect_fp": fp
         })];
         let out = do_burst(&DoArgs {
             background: Some(bg),

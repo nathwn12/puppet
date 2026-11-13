@@ -59,6 +59,7 @@ pub const ERROR_CODES: &[&str] = &[
     "capture_timeout",
     "capture_unavailable",
     "empty_crop",
+    "expect_fp_required",
     "no_clipboard_policy",
     "no_cursor_policy",
     "no_foreground_policy",
