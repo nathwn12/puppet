@@ -175,16 +175,19 @@ pointer.
 | `window` | `null` | Selector for a side-effect-free window capture; wins over `display`. |
 | `region` | `null` | `[left,top,right,bottom]` in virtual-desktop px, applied after the window crop. |
 | `max_px` | `1280` | Long-edge clamp, aspect-preserving, never upscales; `null` returns native pixels (max 8192). |
-| `fmt` | `"jpeg"` | `png`, `jpeg` (`jpg` is an alias). |
-| `quality` | `80` | JPEG quality 1..100; PNG ignores it. |
+| `fmt` | `"png"` | `png`, `jpeg` (`jpg` is an alias). Lossless by default; JPEG is an explicit request. |
+| `quality` | `80` | JPEG quality 1..100; PNG ignores it (a `quality` sent with `png` warns `quality_ignored`). |
 | `grid` | `false` | Overlay a light 128 px lattice. |
 | `allow_crop_fallback` | `false` | Permit a foreground-only desktop crop to `dwm_rect` when `PrintWindow` refuses. |
 | `elements` | `false` | Append a third content block with the element model. |
-| `out` | `null` | Absolute path: also write the exact returned bytes to disk (parent dirs created) and add `out:{path,bytes,fmt}` to the payload. PNG when `out` is set and `fmt` is omitted (a diff needs lossless pixels). |
+| `out` | `null` | Absolute path: also write the exact returned bytes to disk (parent dirs created) and add `out:{path,bytes,fmt}` to the payload. |
 
 **Returns** `[image, coordinate_map_json]`, plus the element block when `elements=true`.
 The map carries `source{x,y,w,h,kind}`, `scale`, `monitors{count,origin,virtual,rects}`,
-`cursor`, `window`, `capture`, `formula`, `foregroundUnchanged`, `cursorUnchanged`. Map
+`cursor`, `window`, `capture`, `formula`, `foregroundUnchanged`, `cursorUnchanged`, and
+`warnings` only when the server altered a request (`quality_clamped`, `quality_ignored`).
+`capture.blank_check{max_channel,verdict,threshold}` is the blank-frame measurement:
+full-frame only (`max channel < 8`), never partial or stale. Map
 image pixels back with:
 
 ```
@@ -222,14 +225,21 @@ never raise.
 | `max_px` | `1280` | Long-edge clamp for the returned diff image, aspect-preserving, never upscaling. |
 | `out` | `null` | Absolute path: write the diff PNG to disk (parent dirs created). |
 | `bbox` | `true` | Toggle the union box of changed pixels. |
+| `mask` | `null` | `[[left,top,right,bottom],…]` in native operand pixels: masked pixels leave `changed`, `total`, `ratio` and `bbox`, and are counted in `masked_px`. Overlapping rects union; a rect outside the frame is `bad_region`. |
 
 Both sides must land on the SAME pixel dimensions: a mismatch is a typed
 `size_mismatch` naming both sizes, never a silent scale.
 
-**Returns** `{changed,total,ratio,bbox:[x,y,w,h]|null,identical,base:{w,h},next:{w,h},threshold,diff_out?}`.
+**Returns** `{changed,total,ratio,bbox:[x,y,w,h]|null,identical,base:{w,h},next:{w,h},threshold,masked_px,bbox_space,image?,scale?,base_source?,next_source?,diff_out?}`.
+`changed`, `total` (the unmasked total), `ratio` and `bbox` are NATIVE operand pixels
+(`bbox_space:"native"`); `image{w,h,format,quality}` and `scale` describe the returned
+bytes and are absent when no image returns. A native box maps onto the image with
+`img_x = floor(bbox.x * scale)`; a live operand's `base_source`/`next_source` is the
+`{x,y,w,h,kind}` its capture reported (`screen_x = base_source.x + bbox.x`), and a
+`{path}` operand reports `null` because it has no origin.
 When anything changed, a second content block carries the diff image (changed
-pixels solid red over a dimmed greyscale copy of `base`); when identical there
-is no image block and `bbox` is `null`.
+pixels solid red over a dimmed greyscale copy of `base`, masked pixels never red);
+when identical there is no image block and `bbox` is `null`.
 
 ```json
 { "base": {"path": "C:/captures/before.png"}, "next": {"path": "C:/captures/after.png"} }
