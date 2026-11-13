@@ -145,4 +145,5 @@ reaches; a second needs one more row.
 
 | Amendment | Amends | Effort | Commit |
 |---|---|---|---|
-| [AMENDMENT-01-sizing.md](AMENDMENT-01-sizing.md) — what an image reply says about its own pixels | W3.1 and W3.2, the image replies only; W3.3–W3.5, D1–D7, I1–I6 and the sequence in [PLAN.md](PLAN.md) untouched. Supersedes nothing. | 1.5 d | `a93cdfa` |
+| [AMENDMENT-01-sizing.md](AMENDMENT-01-sizing.md) - what an image reply says about its own pixels | W3.1 and W3.2, the image replies only; W3.3-W3.5, D1-D7, I1-I6 and the sequence in [PLAN.md](PLAN.md) untouched. Supersedes nothing. | 1.5 d | `a93cdfa` |
+| [AMENDMENT-02-budget.md](AMENDMENT-02-budget.md) - room for the diff contract W3 adds | W1.4's per-tool byte budget for `diff` (2 400 → 2 800); the 26 700 sum and the other six budgets untouched. Supersedes nothing. | 0 d | `c0b5b06` |
