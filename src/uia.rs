@@ -630,6 +630,28 @@ fn verify_identity(el: &Iface, expect_fp: &str, path: &str) -> Result<(), String
     Err(crate::shot::stale_ref_text(path, expect_fp, &now))
 }
 
+/// Test-only injection point between the path resolution and the identity
+/// read: a test arms it to mutate the tree in exactly that interval and prove
+/// the act-time check refuses. `#[cfg(test)]` only, so a release build has no
+/// hook, no branch and no state here; the activation path is otherwise
+/// unchanged.
+#[cfg(test)]
+pub(crate) static BETWEEN_RESOLVE_AND_VERIFY: std::sync::Mutex<Option<fn()>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn between_resolve_and_verify() {
+    let hook = *BETWEEN_RESOLVE_AND_VERIFY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn between_resolve_and_verify() {}
+
 struct Walk {
     entries: Vec<Map<String, Value>>,
     pager: Pager,
@@ -865,6 +887,40 @@ fn uia_is_enabled_inner(hwnd: HWND, path: &str) -> Result<bool, String> {
     }
 }
 
+/// The enabled bit AND the identity fingerprint of ONE resolved element, read
+/// in a single resolution. A waiter can then accept the bit only when it still
+/// describes the control its walk matched: re-resolving the path for the read
+/// alone would let a control that replaced the match answer for it.
+pub fn uia_enabled_identity(hwnd: i64, path: &str) -> Result<(bool, String), String> {
+    let p = path.to_string();
+    crate::deadline::bound(
+        crate::deadline::Family::Uia,
+        "uia_enabled_identity",
+        move || uia_enabled_identity_inner(hwnd, &p),
+    )?
+}
+
+fn uia_enabled_identity_inner(hwnd: i64, path: &str) -> Result<(bool, String), String> {
+    let auto = automation().map_err(|e| format!("UIA resolve failed: {e}"))?;
+    let el = element_from_handle(&auto, hwnd as HWND)
+        .map_err(|hr| format!("UIA resolve failed: {}", crate::hr_text(hr)))?;
+    let walker = raw_view_walker(&auto)
+        .map_err(|hr| format!("UIA resolve failed: {}", crate::hr_text(hr)))?;
+    let el = resolve_path_el(&walker, el, path)?;
+    let fp = el_identity_fp(&el);
+    let enabled = unsafe {
+        type GetEnabled = unsafe extern "system" fn(*mut c_void, *mut i32) -> HRESULT;
+        let f: GetEnabled = el.slot(IDX_CURRENT_IS_ENABLED);
+        let mut v: i32 = 0;
+        let hr = f(el.0, &mut v);
+        if hr != 0 {
+            return Err(format!("UIA IsEnabled read failed: {}", crate::hr_text(hr)));
+        }
+        v != 0
+    };
+    Ok((enabled, fp))
+}
+
 /// Shared path-walk resolver: follow `path` (`"0.1.2"`) from `el` through
 /// the raw-view walker, transferring the chosen child's ref at each level.
 /// Err carries the already-formatted resolve message (`UIA resolve failed:`
@@ -955,6 +1011,7 @@ fn uia_activate_inner(hwnd: i64, path: &str, expect_fp: &str) -> (bool, String, 
     // resolved again here. Re-read this element's own properties and compare
     // immediately before the pattern call, so the control that fires IS the
     // control whose properties were just read.
+    between_resolve_and_verify();
     if let Err(msg) = verify_identity(&el, expect_fp, path) {
         return (false, String::new(), Some(msg));
     }
@@ -1129,6 +1186,7 @@ fn uia_expand_collapse_inner(
     };
     // Same gate as uia_activate: the state request fires on the element whose
     // properties were just read, never on a path resolved a second time.
+    between_resolve_and_verify();
     if let Err(msg) = verify_identity(&el, expect_fp, path) {
         return (false, String::new(), Some(msg));
     }

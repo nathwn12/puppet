@@ -758,12 +758,16 @@ fn invoke_without_expect_fp_refuses_and_the_one_call_retry_acts() {
         Some(&Value::from(true)),
         "the one-call retry must act, got: {retried}"
     );
-    // SPEC W2.1: the retry reports `effect:"changed"` - `ok` alone says the
-    // pattern call was delivered, never that the control acted.
+    // SPEC W2.1: the retry reports `effect`, and the value is read, not
+    // assumed: a push button exposes no state an activation can move
+    // (no ExpandCollapse, no RangeValue, no TextPattern), so the honest
+    // reading is `unverified` - SPEC Appendix B's own words for "pattern
+    // activations with no readable state". `ok` alone says the pattern was
+    // delivered.
     assert_eq!(
         retried.get("effect").and_then(|e| e.as_str()),
-        Some("changed"),
-        "a successful invoke must report effect:changed, got: {retried}"
+        Some("unverified"),
+        "a stateless control's invoke must not claim a change, got: {retried}"
     );
     assert_eq!(
         retried.get("delivered").and_then(|d| d.as_str()),
@@ -1038,6 +1042,13 @@ fn fp_is_identity_not_state_across_a_real_state_change() {
         expanded.get("expand_state").and_then(|v| v.as_str()),
         Some("Expanded"),
         "the state must actually move, got: {expanded}"
+    );
+    // The same verb on a control whose state an activation CAN move reads the
+    // change: `effect` is derived from the readback, never a constant.
+    assert_eq!(
+        expanded.get("effect").and_then(|v| v.as_str()),
+        Some("changed"),
+        "an expand that moved the state must report effect:changed, got: {expanded}"
     );
     let after = fp_of(&mut s, 92, &title, "name", "p4c-root");
     assert_eq!(
