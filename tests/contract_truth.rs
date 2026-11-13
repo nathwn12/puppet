@@ -397,3 +397,45 @@ fn instructions_scope_the_fingerprint_to_identity() {
         );
     }
 }
+
+/// SPEC W3.5: neither backend composites the cursor into the pixels, and the
+/// contract says so in both texts an agent reads before it goes looking for a
+/// pointer in an image. A claim that the cursor can be seen is a defect.
+#[test]
+fn the_contract_says_the_pointer_is_not_in_the_pixels() {
+    let (instructions, tools) = instructions_and_tools();
+    let claim = claims_rows("LIMITS", 2)
+        .into_iter()
+        .find(|r| r[0] == "pointer")
+        .unwrap_or_else(|| panic!("LIMITS must carry the pointer claim, got: {instructions}"));
+    let text = &claim[1];
+    for phrase in ["never in the pixels", "composites", "position report"] {
+        assert!(
+            text.contains(phrase),
+            "the pointer claim must state {phrase:?}: {text:?}"
+        );
+    }
+    assert!(
+        instructions.contains(text.as_str()),
+        "instructions must carry the pointer claim verbatim, got: {instructions}"
+    );
+    let shot = tools
+        .iter()
+        .find(|t| t["name"] == "screenshot")
+        .expect("screenshot must be listed");
+    let desc = shot["description"].as_str().expect("description");
+    assert!(
+        desc.contains(text.as_str()),
+        "the screenshot description must carry the pointer claim verbatim, got: {desc}"
+    );
+    for t in &tools {
+        let name = t["name"].as_str().unwrap_or("?");
+        let desc = t["description"].as_str().unwrap_or("").to_lowercase();
+        for banned in ["cursor is visible", "see the cursor"] {
+            assert!(
+                !desc.contains(banned),
+                "{name} must never claim {banned:?}: nothing composites the pointer"
+            );
+        }
+    }
+}

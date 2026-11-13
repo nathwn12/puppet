@@ -155,6 +155,10 @@ pub const LIMITS: &[(&str, &str)] = &[
         "clipboard_get truncates text past 1048576 chars and reports truncated:true",
     ),
     (
+        "pointer",
+        "the pointer is never in the pixels - neither capture backend composites it; `cursor{x,y}` is a position report",
+    ),
+    (
         "ime",
         "IME, dead-key and AltGr composition are not supported: there is no composition path on posted WM_CHAR",
     ),
