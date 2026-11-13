@@ -193,6 +193,40 @@ impl Drop for Fixture {
     }
 }
 
+/// The joined text of a tool result's text blocks (a refusal carries its
+/// detail there).
+fn result_text(r: &Value) -> String {
+    r.get("content")
+        .and_then(|c| c.as_array())
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+        .unwrap_or_default()
+}
+
+/// Capture through the server, waiting out the all-black first-frame refusal
+/// a freshly spawned window produces before it composites — the same startup
+/// race `src/fixture.rs`'s readiness wait exists for, seen from outside the
+/// process. Bounded at 5 s; every assertion that follows is about a capture
+/// that actually produced a frame.
+fn shot_waited(s: &mut Session, mut id: i64, args: &Value) -> Value {
+    let t0 = std::time::Instant::now();
+    loop {
+        let r = s.result(id, "screenshot", args.clone());
+        let first_frame =
+            r.get("isError") == Some(&Value::from(true)) && result_text(&r).contains("all-black");
+        if !first_frame || t0.elapsed() > Duration::from_secs(5) {
+            return r;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        id += 1;
+    }
+}
+
 /// The base64 image block of a reply, if it returned one.
 fn image_block_bytes(r: &Value) -> Option<Vec<u8>> {
     r.get("content")
@@ -339,8 +373,8 @@ fn default_captures_are_lossless() {
     std::thread::sleep(Duration::from_millis(500));
     let mut s = Session::spawn();
     let shot = serde_json::json!({"window": fx.title});
-    let first = s.result(1, "screenshot", shot.clone());
-    let second = s.result(2, "screenshot", shot);
+    let first = shot_waited(&mut s, 1, &shot);
+    let second = shot_waited(&mut s, 2, &shot);
     assert_ne!(
         first.get("isError"),
         Some(&Value::from(true)),
@@ -382,10 +416,10 @@ fn a_clamp_that_altered_the_request_says_so() {
     std::thread::sleep(Duration::from_millis(500));
     let mut s = Session::spawn();
 
-    let r = s.result(
+    let r = shot_waited(
+        &mut s,
         1,
-        "screenshot",
-        serde_json::json!({"window": fx.title, "fmt": "jpeg", "quality": 500}),
+        &serde_json::json!({"window": fx.title, "fmt": "jpeg", "quality": 500}),
     );
     let sc = sc_of(&r, "clamped screenshot");
     let w = sc
@@ -405,10 +439,10 @@ fn a_clamp_that_altered_the_request_says_so() {
     assert_eq!(w[0].get("requested"), Some(&Value::from(500)));
     assert_eq!(w[0].get("applied"), Some(&Value::from(100)));
 
-    let r = s.result(
+    let r = shot_waited(
+        &mut s,
         2,
-        "screenshot",
-        serde_json::json!({"window": fx.title, "fmt": "png", "quality": 50}),
+        &serde_json::json!({"window": fx.title, "fmt": "png", "quality": 50}),
     );
     let sc = sc_of(&r, "png with quality");
     let w = sc
@@ -424,7 +458,7 @@ fn a_clamp_that_altered_the_request_says_so() {
     assert_eq!(w[0].get("applied"), Some(&Value::Null));
 
     // The default path is silent: no key, not an empty array.
-    let r = s.result(3, "screenshot", serde_json::json!({"window": fx.title}));
+    let r = shot_waited(&mut s, 3, &serde_json::json!({"window": fx.title}));
     let sc = sc_of(&r, "default screenshot");
     assert!(
         sc.get("warnings").is_none(),
@@ -555,21 +589,6 @@ fn a_diff_can_exclude_a_region() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The joined text of a tool result's text blocks (a refusal carries its
-/// detail there).
-fn result_text(r: &Value) -> String {
-    r.get("content")
-        .and_then(|c| c.as_array())
-        .map(|blocks| {
-            blocks
-                .iter()
-                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join(" | ")
-        })
-        .unwrap_or_default()
-}
-
 /// SPEC W3.4: a successful capture reports the blank-frame measurement, so a
 /// frame with a black region is visibly measured content; a fully blank frame
 /// still refuses, and the refusal carries the measurement that refused it.
@@ -582,7 +601,7 @@ fn a_capture_reports_the_blank_frame_measurement() {
     let fx = Fixture::spawn("p3c-blackrect", Some("blackrect"));
     std::thread::sleep(Duration::from_millis(500));
     let mut s = Session::spawn();
-    let r = s.result(1, "screenshot", serde_json::json!({"window": fx.title}));
+    let r = shot_waited(&mut s, 1, &serde_json::json!({"window": fx.title}));
     assert_ne!(
         r.get("isError"),
         Some(&Value::from(true)),
