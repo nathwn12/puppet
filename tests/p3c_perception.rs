@@ -333,6 +333,10 @@ fn default_captures_are_lossless() {
     }
     kill_stale_fixtures("p3c-lossless");
     let fx = Fixture::spawn("p3c-lossless", None);
+    // The fixture's first composited frame is a startup race the harness
+    // waits out (src/fixture.rs `await_ready`), and a spawned app has the
+    // same race from outside: let it paint before the pair is measured.
+    std::thread::sleep(Duration::from_millis(500));
     let mut s = Session::spawn();
     let shot = serde_json::json!({"window": fx.title});
     let first = s.result(1, "screenshot", shot.clone());
@@ -362,5 +366,68 @@ fn default_captures_are_lossless() {
         "two captures of a static window must be byte-identical ({} vs {} bytes)",
         a.len(),
         b.len()
+    );
+}
+
+/// AMENDMENT-01 A2: a request that was altered announces itself, and a
+/// default call carries no `warnings` key at all — the channel is for
+/// requests the server changed, not for every reply.
+#[test]
+fn a_clamp_that_altered_the_request_says_so() {
+    if !live() {
+        return;
+    }
+    kill_stale_fixtures("p3c-clamp");
+    let fx = Fixture::spawn("p3c-clamp", None);
+    std::thread::sleep(Duration::from_millis(500));
+    let mut s = Session::spawn();
+
+    let r = s.result(
+        1,
+        "screenshot",
+        serde_json::json!({"window": fx.title, "fmt": "jpeg", "quality": 500}),
+    );
+    let sc = sc_of(&r, "clamped screenshot");
+    let w = sc
+        .get("warnings")
+        .and_then(|v| v.as_array())
+        .unwrap_or_else(|| panic!("quality:500 must warn, got: {sc}"));
+    assert_eq!(
+        w.len(),
+        1,
+        "one warning for one altered request, got: {w:?}"
+    );
+    assert_eq!(
+        w[0].get("code").and_then(|v| v.as_str()),
+        Some("quality_clamped")
+    );
+    assert_eq!(w[0].get("field").and_then(|v| v.as_str()), Some("quality"));
+    assert_eq!(w[0].get("requested"), Some(&Value::from(500)));
+    assert_eq!(w[0].get("applied"), Some(&Value::from(100)));
+
+    let r = s.result(
+        2,
+        "screenshot",
+        serde_json::json!({"window": fx.title, "fmt": "png", "quality": 50}),
+    );
+    let sc = sc_of(&r, "png with quality");
+    let w = sc
+        .get("warnings")
+        .and_then(|v| v.as_array())
+        .unwrap_or_else(|| panic!("quality with fmt:png must warn, got: {sc}"));
+    assert_eq!(w.len(), 1, "one warning, got: {w:?}");
+    assert_eq!(
+        w[0].get("code").and_then(|v| v.as_str()),
+        Some("quality_ignored")
+    );
+    assert_eq!(w[0].get("requested"), Some(&Value::from(50)));
+    assert_eq!(w[0].get("applied"), Some(&Value::Null));
+
+    // The default path is silent: no key, not an empty array.
+    let r = s.result(3, "screenshot", serde_json::json!({"window": fx.title}));
+    let sc = sc_of(&r, "default screenshot");
+    assert!(
+        sc.get("warnings").is_none(),
+        "a default capture must carry no warnings key, got: {sc}"
     );
 }

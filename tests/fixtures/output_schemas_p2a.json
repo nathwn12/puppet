@@ -86,6 +86,9 @@
           "object",
           "null"
         ]
+      },
+      "warnings": {
+        "type": "array"
       }
     },
     "required": [
@@ -223,37 +226,40 @@
     "type": "object"
   },
   "screenshot": {
-    "additionalProperties": true,
+    "type": "object",
     "properties": {
-      "capture": {
-        "type": "object"
-      },
-      "cursor": {
-        "type": "object"
-      },
-      "formula": {
-        "type": "string"
-      },
       "image": {
         "type": "object"
       },
-      "monitors": {
+      "source": {
         "type": "object"
       },
       "scale": {
         "type": "number"
       },
-      "source": {
+      "monitors": {
+        "type": "object"
+      },
+      "cursor": {
         "type": "object"
       },
       "window": {
         "type": "object"
+      },
+      "capture": {
+        "type": "object"
+      },
+      "formula": {
+        "type": "string"
       },
       "foregroundUnchanged": {
         "type": "boolean"
       },
       "cursorUnchanged": {
         "type": "boolean"
+      },
+      "warnings": {
+        "type": "array"
       }
     },
     "required": [
@@ -265,7 +271,7 @@
       "capture",
       "formula"
     ],
-    "type": "object"
+    "additionalProperties": true
   },
   "window": {
     "additionalProperties": true,

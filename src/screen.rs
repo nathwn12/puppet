@@ -64,6 +64,36 @@ pub fn shot_err_list(items: Vec<String>) -> String {
     tool_err_blocks(&[text_block(&serde_json::to_string(&items).unwrap())])
 }
 
+/// AMENDMENT-01 A2: a request the server altered announces itself, in one
+/// channel reserved for that — `quality` outside 1..100 (`quality_clamped`,
+/// with the applied value) and `quality` sent with a format that cannot use
+/// it (`quality_ignored`, applied null). A call that requested nothing the
+/// server changed returns an empty vec, and the caller emits no key at all:
+/// an always-present empty array would train an agent to ignore the channel.
+fn warnings_of(quality: Option<i64>, applied: i64, fmt: &str) -> Vec<Value> {
+    let Some(req) = quality else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if !(1..=100).contains(&req) {
+        let mut w = Map::new();
+        w.insert("code".to_string(), Value::from("quality_clamped"));
+        w.insert("field".to_string(), Value::from("quality"));
+        w.insert("requested".to_string(), Value::from(req));
+        w.insert("applied".to_string(), Value::from(applied));
+        out.push(Value::Object(w));
+    }
+    if fmt == "png" {
+        let mut w = Map::new();
+        w.insert("code".to_string(), Value::from("quality_ignored"));
+        w.insert("field".to_string(), Value::from("quality"));
+        w.insert("requested".to_string(), Value::from(req));
+        w.insert("applied".to_string(), Value::Null);
+        out.push(Value::Object(w));
+    }
+    out
+}
+
 fn py_int_elem(v: &Value) -> Option<i64> {
     match v {
         Value::Number(n) => {
@@ -396,6 +426,10 @@ pub fn screenshot_window(a: &ShotArgs) -> String {
     }
     cmap.insert("capture".to_string(), Value::from(capt));
     cmap.insert("formula".to_string(), Value::from(FORMULA));
+    let warnings = warnings_of(a.quality, q, &f);
+    if !warnings.is_empty() {
+        cmap.insert("warnings".to_string(), Value::from(warnings));
+    }
     if let Some(o) = out_obj {
         cmap.insert("out".to_string(), Value::from(o));
     }
@@ -802,6 +836,10 @@ pub fn screenshot_desktop(a: &ShotArgs) -> String {
         Value::from(cur_after == cur_before),
     );
     cmap.insert("formula".to_string(), Value::from(FORMULA));
+    let warnings = warnings_of(a.quality, q, &f);
+    if !warnings.is_empty() {
+        cmap.insert("warnings".to_string(), Value::from(warnings));
+    }
     if let Some(o) = out_obj {
         cmap.insert("out".to_string(), Value::from(o));
     }

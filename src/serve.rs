@@ -449,6 +449,10 @@ fn call_screenshot(args: &Map<String, Value>) -> String {
     // W3.2 (D4): every capture path is lossless by default. JPEG is an
     // explicit request (`fmt:"jpeg"`), never a default a caller inherits.
     let fmt = req_str(args, &mut errs, "fmt", "png");
+    // AMENDMENT-01 A2: only a `quality` the caller named can be a request the
+    // server altered, so it is passed as Some only when it was supplied;
+    // `finalize` still defaults the applied value to 80.
+    let quality_supplied = !matches!(args.get("quality"), None | Some(Value::Null));
     let quality = req_int(args, &mut errs, "quality", 80);
     let grid = req_bool(args, &mut errs, "grid");
     let allow_crop_fallback = req_bool(args, &mut errs, "allow_crop_fallback");
@@ -462,7 +466,11 @@ fn call_screenshot(args: &Map<String, Value>) -> String {
         window: window.unwrap(),
         max_px: max_px.unwrap(),
         fmt: fmt.unwrap(),
-        quality: Some(quality.unwrap()),
+        quality: if quality_supplied {
+            Some(quality.unwrap())
+        } else {
+            None
+        },
         grid: grid.unwrap(),
         allow_crop_fallback: allow_crop_fallback.unwrap(),
         elements: elements.unwrap(),
