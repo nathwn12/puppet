@@ -15,6 +15,75 @@ use serde_json::{Map, Value};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Every action type `do.actions.items` must cover, and every verb the
+/// claims source must classify.
+const ACTION_TYPES: [&str; 16] = [
+    "click",
+    "clipboard_get",
+    "clipboard_set",
+    "down",
+    "drag",
+    "focus_window",
+    "hotkey",
+    "invoke",
+    "key",
+    "move",
+    "scroll",
+    "set_value",
+    "type",
+    "up",
+    "wait",
+    "wait_for",
+];
+
+/// The claims source and its tables, parsed rather than copied (W1.1, W1.3).
+const CLAIMS: &str = include_str!("../src/claims.rs");
+
+/// The bracketed body of one `pub const NAME … = [ … ];` declaration.
+fn table_body(name: &str) -> &'static str {
+    let at = CLAIMS
+        .find(&format!("pub const {name}:"))
+        .unwrap_or_else(|| panic!("claims.rs must declare {name}"));
+    let rest = &CLAIMS[at..];
+    let eq = rest
+        .find('=')
+        .unwrap_or_else(|| panic!("{name} must be a declaration"));
+    let open = eq
+        + rest[eq..]
+            .find('[')
+            .unwrap_or_else(|| panic!("{name} must be a bracketed table"))
+        + 1;
+    let close = rest[open..]
+        .find("\n];")
+        .map(|i| open + i)
+        .unwrap_or_else(|| panic!("{name} table must close with ];"));
+    &rest[open..close]
+}
+
+/// Every double-quoted string in a fragment, in order.
+fn quoted(fragment: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = fragment;
+    while let Some(i) = rest.find('"') {
+        let after = &rest[i + 1..];
+        let Some(j) = after.find('"') else { break };
+        out.push(after[..j].to_string());
+        rest = &after[j + 1..];
+    }
+    out
+}
+
+/// A table of `arity`-field rows from the claims source.
+fn claims_rows(name: &str, arity: usize) -> Vec<Vec<String>> {
+    let values = quoted(table_body(name));
+    assert_eq!(
+        values.len() % arity,
+        0,
+        "{name} must be whole {arity}-field rows"
+    );
+    values.chunks(arity).map(|c| c.to_vec()).collect()
+}
+
 struct Session {
     child: Child,
     stdin: ChildStdin,
@@ -239,24 +308,8 @@ fn do_actions_schema_declares_all_sixteen_types() {
     let variants = union_variants(items, &root);
     let mut types: Vec<String> = variants.iter().flat_map(|v| variant_types(v)).collect();
     types.sort();
-    let want = [
-        "click",
-        "clipboard_get",
-        "clipboard_set",
-        "down",
-        "drag",
-        "focus_window",
-        "hotkey",
-        "invoke",
-        "key",
-        "move",
-        "scroll",
-        "set_value",
-        "type",
-        "up",
-        "wait",
-        "wait_for",
-    ];
+    let mut want: Vec<String> = ACTION_TYPES.iter().map(|s| s.to_string()).collect();
+    want.sort();
     assert_eq!(
         types, want,
         "do.actions.items must cover exactly the 16 runtime types"
@@ -508,5 +561,85 @@ fn p2a_output_schemas_match_frozen_fixture() {
             got, want,
             "{name} outputSchema must equal the frozen P2a value"
         );
+    }
+}
+
+/// W1.3: the schema prose may not document a dead verb or a code that does
+/// not exist. Every action type is classified in the claims source, and a
+/// verb classified `refused` is only ever described inside a refusal
+/// clause (`refused`/`refuses`/`refusal` within the same sentence).
+#[test]
+fn every_action_type_is_classified_and_refused_verbs_say_so() {
+    let tools = list_tools();
+    let do_desc = tool(&tools, "do")
+        .get("description")
+        .and_then(|v| v.as_str())
+        .expect("do must carry a description");
+    let rows = claims_rows("REFUSALS", 3);
+
+    // Every action type the schema declares has a classification.
+    let classified: Vec<String> = rows.iter().map(|r| r[0].clone()).collect();
+    for verb in ACTION_TYPES {
+        assert!(
+            classified.iter().any(|v| v == verb),
+            "claims REFUSALS must classify {verb}"
+        );
+    }
+
+    // A refused verb is documented as refused, naming its code.
+    for row in rows.iter().filter(|r| r[1] == "refused") {
+        let (verb, code) = (&row[0], &row[2]);
+        let mut documented = false;
+        for (at, _) in do_desc.match_indices(verb.as_str()) {
+            let before = do_desc[..at].chars().next_back();
+            let after = do_desc[at + verb.len()..].chars().next();
+            let word =
+                |c: Option<char>| c.map(|c| c.is_alphanumeric() || c == '_').unwrap_or(false);
+            if word(before) || word(after) {
+                continue;
+            }
+            let lo = at.saturating_sub(160);
+            let hi = (at + verb.len() + 160).min(do_desc.len());
+            let window = &do_desc[lo..hi];
+            if window.contains("refus") && window.contains(code.as_str()) {
+                documented = true;
+                break;
+            }
+        }
+        assert!(
+            documented,
+            "do's description must call {verb} refused with {code} (W1.3)"
+        );
+    }
+}
+
+/// W1.3: three codes never existed as behaviour and must not survive in any
+/// tool description.
+#[test]
+fn no_description_documents_a_code_that_never_existed() {
+    let dead = [
+        "clipboard_write_required",
+        "cursor_move_required",
+        "foreground_required",
+    ];
+    let tools = list_tools();
+    for t in &tools {
+        let name = t.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+        let desc = t.get("description").and_then(|d| d.as_str()).unwrap_or("");
+        for code in dead {
+            assert!(
+                !desc.contains(code),
+                "{name} documents {code}, which no code emits"
+            );
+        }
+        // The input schema's own prose counts too: an option description is
+        // read by the agent as the tool's contract.
+        let schema = serde_json::to_string(&t["inputSchema"]).unwrap();
+        for code in dead {
+            assert!(
+                !schema.contains(code),
+                "{name}'s inputSchema documents {code}, which no code emits"
+            );
+        }
     }
 }

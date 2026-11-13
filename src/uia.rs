@@ -1014,7 +1014,9 @@ fn uia_activate_inner(hwnd: i64, path: &str) -> (bool, String, Option<String>) {
         false,
         String::new(),
         Some(
-            "element supports neither Invoke, SelectionItem nor Toggle (pass \"fallback\":\"click\" for a pixel click)"
+            "element supports neither Invoke, SelectionItem nor Toggle: there is no pixel \
+             fallback, because fallback:\"click\" is refused with no_cursor_policy and the \
+             pointer is never moved"
                 .to_string(),
         ),
     )

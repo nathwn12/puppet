@@ -1007,10 +1007,11 @@ fn bg_execute(
         return (
             false,
             Some(
-                "foreground_required: keyboard input is never posted to the owner's desktop \\
-                 (WM_CHAR/WM_KEYDOWN bypass the input queue and are ignored by many controls); \\
-                 use type with an element (UIA SetValue) or allow_foreground:true. Nothing was \\
-                 posted."
+                "no_foreground_policy: keyboard input is never posted to the owner's desktop \
+                 (WM_CHAR/WM_KEYDOWN bypass the input queue and are ignored by many controls), \
+                 and no flag buys a foreground act: this cannot be done under the background-only \
+                 policy. type with an element works only on the server's own hidden desktop. \
+                 Nothing was posted."
                     .to_string(),
             ),
             0,
@@ -2012,7 +2013,9 @@ fn win32_activate(entry: &Map<String, Value>) -> (bool, String, Option<String>) 
             false,
             String::new(),
             Some(
-                "element is not invokable under the Win32 backend (pass \"fallback\":\"click\" for a pixel click)"
+                "element is not invokable under the Win32 backend: there is no pixel fallback, \
+                 because fallback:\"click\" is refused with no_cursor_policy and the pointer is \
+                 never moved"
                     .to_string(),
             ),
         );
@@ -3287,8 +3290,9 @@ pub fn do_burst(args: &DoArgs) -> String {
                                              delivered to the control but its state did not \
                                              change ({pre}); controls that ignore posted button \
                                              messages report exactly this. Use invoke for the \
-                                             UIA pattern, or allow_foreground:true for a real \
-                                             click."
+                                             UIA pattern; when the control has no pattern there \
+                                             is no pixel fallback, and allow_foreground:true is \
+                                             refused with no_foreground_policy."
                                             ));
                                             "unchanged"
                                         }
