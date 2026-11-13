@@ -972,7 +972,38 @@ mod tests {
         }
         let _g = crate::fixture::desktop();
         let f = crate::fixture::Fixture::new();
-        let cap = unsafe { capture_window(f.hwnd(), false) }.expect("fixture captures");
+        // A fresh window may not have processed WM_PAINT yet, and the capture
+        // rejects an all-black frame: paint it synchronously first, so the
+        // test measures the rect and not the paint race.
+        unsafe {
+            windows_sys::Win32::Graphics::Gdi::RedrawWindow(
+                f.hwnd(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                windows_sys::Win32::Graphics::Gdi::RDW_INVALIDATE
+                    | windows_sys::Win32::Graphics::Gdi::RDW_UPDATENOW
+                    | windows_sys::Win32::Graphics::Gdi::RDW_ALLCHILDREN,
+            );
+        }
+        // A brand-new window's composited frame can still read all-black while
+        // DWM settles, and the capture rejects an all-black frame: paint it,
+        // then wait for a frame that exists. The assertions below are
+        // unchanged; only the wait is new.
+        let cap = {
+            let mut last = String::new();
+            let mut got = None;
+            for _ in 0..60 {
+                match unsafe { capture_window(f.hwnd(), false) } {
+                    Ok(c) => {
+                        got = Some(c);
+                        break;
+                    }
+                    Err(e) => last = e,
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            got.unwrap_or_else(|| panic!("fixture captures: {last}"))
+        };
         assert!(
             !cap.moved_during_capture,
             "a stationary window must not be flagged moved_during_capture"
