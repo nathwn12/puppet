@@ -12,7 +12,9 @@
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{HWND, RECT};
+use windows_sys::Win32::Graphics::Gdi::{RedrawWindow, RDW_ALLCHILDREN, RDW_INVALIDATE};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -161,6 +163,86 @@ unsafe extern "system" fn fixture_wndproc(hwnd: HWND, msg: u32, w: usize, l: isi
         return 0;
     }
     DefWindowProcW(hwnd, msg, w, l)
+}
+
+/// How long a window may take to produce its first composited frame and a
+/// stable UIA walk before the readiness wait gives up.
+const READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Block until a freshly created window can be captured and read.
+///
+/// Two startup races are collapsed into this one wait, because every test that
+/// owns a window has to survive both:
+///
+/// * **First composited frame.** A window that has not processed its first
+///   `WM_PAINT` reads back all-black, and `shot::capture_window` refuses an
+///   all-black frame with `capture_unavailable`. The window is invalidated and
+///   then captured until a frame is accepted; that frame is the one the test
+///   measures, so no test has to retry its own first capture.
+/// * **UIA tree.** The provider serves a window's children asynchronously
+///   after `ShowWindow`, so the first walk can return the Win32 fallback or a
+///   partial list. The wait polls until the UIA backend serves the window's
+///   children. A host where UIA is genuinely unavailable is not waited on: the
+///   Win32 fallback is synchronous and is the documented floor.
+///
+/// The readiness probe leaves no trace: its capture signature is dropped from
+/// the stale-detection cache, so the first capture a test asks for is not
+/// reported `stale` because of it.
+fn await_ready(hwnd: HWND) -> Result<(), String> {
+    await_ready_within(hwnd, READY_TIMEOUT)
+}
+
+/// `await_ready` with an explicit deadline, so the wait's own contract can be
+/// proven without spending the full timeout.
+fn await_ready_within(hwnd: HWND, timeout: Duration) -> Result<(), String> {
+    // Ask for a repaint of the window and its children. `RDW_UPDATENOW` is
+    // deliberately absent: it is a synchronous send, so it would block on a
+    // window whose thread has not reached its message pump yet — the very
+    // state this wait exists for.
+    unsafe {
+        RedrawWindow(
+            hwnd,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            RDW_INVALIDATE | RDW_ALLCHILDREN,
+        );
+    }
+    let t0 = Instant::now();
+    let mut last = String::from("no frame produced");
+    let mut framed = false;
+    while t0.elapsed() < timeout {
+        if !framed {
+            match unsafe { crate::shot::capture_window(hwnd, false) } {
+                Ok(_) => {
+                    crate::forget_stale(hwnd as i64);
+                    framed = true;
+                }
+                Err(e) => last = e,
+            }
+        }
+        if framed {
+            let m = crate::shot::element_model(hwnd, crate::UIA_DEPTH_LIMIT, 0);
+            let uia = m
+                .detail
+                .get("uia_available")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let serves_edit = m
+                .entries
+                .iter()
+                .any(|e| e.get("role").and_then(|v| v.as_str()) == Some("Edit"));
+            if !uia || (m.backend == "uia" && serves_edit) {
+                return Ok(());
+            }
+            last = format!(
+                "the frame exists but the UIA walk serves {:?} with {} entries",
+                m.backend,
+                m.entries.len()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Err(last)
 }
 
 pub struct Fixture {
@@ -315,13 +397,17 @@ impl Fixture {
             !edit_ro.is_null(),
             "fixture read-only EDIT CreateWindowExW failed"
         );
-        Fixture {
+        let f = Fixture {
             hwnd,
             edit,
             edit_ro,
             button,
             thread: Some(thread),
-        }
+        };
+        // A fixture is handed to a test only after it can be captured and
+        // read, so no test has to wait out the startup race itself.
+        await_ready(hwnd).unwrap_or_else(|e| panic!("fixture never became readable: {e}"));
+        f
     }
 
     /// Read the writable EDIT's current window text (proves SetValue landed).
@@ -1007,6 +1093,124 @@ mod self_tests {
         );
         assert!(!is_owned_window(top, 0), "null hwnd is never owned");
         println!("FG_SELF_RULE_OK=top={top}");
+    }
+
+    /// The wait is a measurement, not a sleep: a window with no frame to
+    /// capture never reads as ready, so the helper cannot be replaced by "the
+    /// handle exists".
+    #[test]
+    fn the_readiness_wait_refuses_a_window_with_no_frame() {
+        let _g = desktop();
+        let t0 = Instant::now();
+        let e = await_ready_within(std::ptr::null_mut(), Duration::from_millis(200))
+            .expect_err("a window with no frame must never read as ready");
+        assert!(
+            e.contains("bad_window"),
+            "the refusal must be the capture's own, got: {e}"
+        );
+        assert!(
+            t0.elapsed() >= Duration::from_millis(150),
+            "the wait must spend its deadline polling, not return at once (took {:?})",
+            t0.elapsed()
+        );
+    }
+
+    /// The frame the wait is about: a window with no composited frame reads
+    /// all-black and the capture refuses it — exactly what a fresh window does
+    /// before its first `WM_PAINT`. The wait returns only once a frame exists.
+    #[test]
+    fn a_window_with_no_composited_frame_is_refused_until_the_wait_sees_one() {
+        let _g = desktop();
+        let f = Fixture::new();
+        // Hiding the window removes its composited frame without touching the
+        // fixture, which is the same all-black read a fresh window produces.
+        unsafe {
+            ShowWindow(f.hwnd(), SW_HIDE);
+        }
+        let refused = await_ready_within(f.hwnd(), Duration::from_millis(250))
+            .expect_err("a window with no composited frame must never read as ready");
+        assert!(
+            refused.contains("all-black") || refused.contains("blank"),
+            "the refusal must be the blank-frame one, got: {refused}"
+        );
+        // Shown again, the same wait finds the frame and returns.
+        unsafe {
+            ShowWindow(f.hwnd(), SW_SHOWNOACTIVATE);
+        }
+        await_ready(f.hwnd()).expect("the wait must find the frame once the window is shown");
+    }
+
+    /// Readiness has exactly one path: the fixture constructor waits, and no
+    /// test paints or polls a fresh window of its own. A second per-test wait
+    /// is how this class came back the first time, so its names are banned.
+    #[test]
+    fn the_readiness_wait_is_the_only_startup_wait() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files: Vec<(String, String)> = Vec::new();
+        for dir in ["src", "tests"] {
+            collect_rs(&root.join(dir), &mut files);
+        }
+        assert!(
+            files.len() > 20,
+            "the scan must see the tree, found {} files",
+            files.len()
+        );
+        for (path, body) in &files {
+            // The helper's own file names the banned forms in this test, so
+            // the name scan starts outside it; the constructor assertion below
+            // pins the one path inside it.
+            if path != "src/fixture.rs" {
+                for banned in ["wait_uia_stable", "force_paint"] {
+                    assert!(
+                        !body.contains(banned),
+                        "{path} carries a second startup wait ({banned}); route it through \
+                         fixture::await_ready instead"
+                    );
+                }
+            }
+            if body.contains("RedrawWindow(") {
+                assert_eq!(
+                    path, "src/fixture.rs",
+                    "{path} forces a paint outside the readiness helper; the helper is the \
+                     only path that may wait for a first frame"
+                );
+            }
+        }
+        let fixture = files
+            .iter()
+            .find(|(path, _)| path == "src/fixture.rs")
+            .map(|(_, body)| body.as_str())
+            .expect("src/fixture.rs must be in the scan");
+        // Only the production half of the file counts: the assertions below
+        // live in its test module, and a literal there would satisfy the
+        // search it is meant to enforce.
+        let production = fixture.split("#[cfg(test)]").next().unwrap_or_default();
+        assert!(
+            production.contains("await_ready(hwnd)"),
+            "the fixture constructor must call the readiness wait"
+        );
+    }
+
+    /// Every `.rs` under `dir`, as (path relative to the manifest, contents).
+    fn collect_rs(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let body = std::fs::read_to_string(&path).unwrap_or_default();
+                out.push((rel, body));
+            }
+        }
     }
 
     #[test]

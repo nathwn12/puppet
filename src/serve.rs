@@ -1913,37 +1913,10 @@ mod tests {
         let fg_before = crate::fixture::foreground_now();
         let f = crate::fixture::Fixture::new();
         let hwnd = f.hwnd() as i64;
-        // Determinism note (was flaky: failed once, passed on rerun): the
-        // UIA provider exposes the fixture's children asynchronously after
-        // ShowWindow, so the first walk can return the win32 fallback or a
-        // partial UIA list. The old proxy poll (`backend == "uia" && n >= 3`,
-        // 5 s) still asserted `backend == "uia"`, which flaked when UIA was
-        // slow — a timing flake, not ordering or environment. Poll for the
-        // asserted conditions themselves (Edit + OK present, either
-        // backend); the win32 fallback lists the same children
-        // synchronously, so it is the deterministic floor.
-        let payload = {
-            let t0 = std::time::Instant::now();
-            loop {
-                let p = elements_payload(&elements_args(&[("hwnd", Value::from(hwnd))]));
-                let els = p
-                    .get("elements")
-                    .and_then(|v| v.as_array())
-                    .map(|a| a.as_slice())
-                    .unwrap_or(&[]);
-                let has_edit = els
-                    .iter()
-                    .any(|e| e.get("role").and_then(|v| v.as_str()) == Some("Edit"));
-                let has_ok = els.iter().any(|e| {
-                    e.get("name").and_then(|v| v.as_str()) == Some("OK")
-                        && e.get("role").and_then(|v| v.as_str()) == Some("Button")
-                });
-                if (has_edit && has_ok) || t0.elapsed() > std::time::Duration::from_secs(10) {
-                    break p;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        };
+        // The fixture constructor waited for the first composited frame and a
+        // UIA walk that serves the window's children, so the walk below is
+        // read once: no per-test poll for the startup race.
+        let payload = elements_payload(&elements_args(&[("hwnd", Value::from(hwnd))]));
         assert_eq!(payload.get("uia_available"), Some(&Value::from(true)));
         let els = payload
             .get("elements")

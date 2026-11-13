@@ -200,8 +200,46 @@ fn log_text(s: &mut Session, id: i64, title: &str) -> String {
         .replace('\r', "\n")
 }
 
-/// One `layout <name> cx=<n> cy=<n> w=<n> h=<n>` line the fixture writes at
-/// boot, in the top-level's client coordinates — the "known client rect" a
+/// Wait for the fixture's own readiness signal.
+///
+/// A freshly spawned fixture window reads all-black until its first `WM_PAINT`
+/// has been composited, and the capture refuses that frame; its children also
+/// appear in the UIA tree a moment later. The caps window writes `painted`
+/// into its stamped log on that first paint, so the log is evidence rather
+/// than a guess: a fixed sleep is how this suite flaked once mid-run.
+fn wait_painted(s: &mut Session, title: &str) {
+    static NEXT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(900);
+    let t0 = std::time::Instant::now();
+    let mut last = String::from("no elements answer");
+    while t0.elapsed() < Duration::from_secs(15) {
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let r = s.result(
+            id,
+            "elements",
+            serde_json::json!({"title": title, "detail": true}),
+        );
+        let text = r
+            .get("structuredContent")
+            .and_then(|sc| sc.get("elements"))
+            .and_then(|e| e.as_array())
+            .and_then(|els| {
+                els.iter()
+                    .find(|e| e.get("auto_id").and_then(|v| v.as_str()) == Some("4000"))
+                    .and_then(|log| log.get("text"))
+                    .and_then(|t| t.as_str())
+            })
+            .map(|t| t.to_string());
+        match text {
+            Some(t) if t.contains("painted") => return,
+            Some(t) => last = t,
+            None => last = format!("elements did not serve the log yet: {r}"),
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("the caps fixture never reported a painted frame: {last}");
+}
+
+/// One `layout <name> cx=<n> cy=<n> w=<n> h=<n>` line the fixture writes at/// boot, in the top-level's client coordinates — the "known client rect" a
 /// coordinate click can aim at.
 fn layout_of(log: &str, name: &str) -> (i64, i64, i64, i64) {
     let key = format!("layout {name} ");
@@ -255,8 +293,10 @@ fn caps_fixture_exposes_every_control_and_a_stamped_log() {
     kill_stale_fixtures("caps-controls");
     let fx = Fixture::spawn_caps("caps-controls");
     let title = fx.title.clone();
-    std::thread::sleep(Duration::from_millis(600));
     let mut s = Session::spawn();
+    // The fixture reports when its first frame exists; the 600 ms sleep this
+    // replaces was a guess that lost once mid-run.
+    wait_painted(&mut s, &title);
 
     let els = elements_detail(&mut s, 1, &title);
     // Controls whose UIA name is their window text.
@@ -308,8 +348,10 @@ fn caps_fixture_records_posted_clicks_and_never_activates() {
     kill_stale_fixtures("caps-posted");
     let fx = Fixture::spawn_caps("caps-posted");
     let title = fx.title.clone();
-    std::thread::sleep(Duration::from_millis(600));
     let mut s = Session::spawn();
+    // The fixture reports when its first frame exists; the 600 ms sleep this
+    // replaces was a guess that lost once mid-run.
+    wait_painted(&mut s, &title);
 
     let log = log_text(&mut s, 10, &title);
     let (bx, by) = centre(layout_of(&log, "dc-frame-btn"));
@@ -362,8 +404,10 @@ fn caps_fixture_log_orders_a_burst_before_the_settle_pause() {
     kill_stale_fixtures("caps-timing");
     let fx = Fixture::spawn_caps("caps-timing");
     let title = fx.title.clone();
-    std::thread::sleep(Duration::from_millis(600));
     let mut s = Session::spawn();
+    // The fixture reports when its first frame exists; the 600 ms sleep this
+    // replaces was a guess that lost once mid-run.
+    wait_painted(&mut s, &title);
 
     let log = log_text(&mut s, 20, &title);
     let (tx, ty) = centre(layout_of(&log, "dc-toggle"));

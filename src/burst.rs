@@ -6071,22 +6071,6 @@ mod tests {
         (f, bg)
     }
 
-    /// Synchronously paint a fixture window (plus children) before a
-    /// verify capture: a fresh window may not have processed WM_PAINT yet,
-    /// and PrintWindow of an unpainted frame reads back all-black.
-    fn force_paint(hwnd: i64) {
-        unsafe {
-            windows_sys::Win32::Graphics::Gdi::RedrawWindow(
-                hwnd as windows_sys::Win32::Foundation::HWND,
-                std::ptr::null(),
-                std::ptr::null_mut(),
-                windows_sys::Win32::Graphics::Gdi::RDW_INVALIDATE
-                    | windows_sys::Win32::Graphics::Gdi::RDW_UPDATENOW
-                    | windows_sys::Win32::Graphics::Gdi::RDW_ALLCHILDREN,
-            );
-        }
-    }
-
     /// Background-only policy: every set_value/type-on-element is refused
     /// with background_unavailable naming the element, before any provider
     /// call — dry_run included. The EDIT must be untouched.
@@ -6162,31 +6146,10 @@ mod tests {
         // button is named, never written.
         let (fx, bg) = fixture_bg();
         let _ = fx.hwnd();
-        wait_uia_stable(fx.hwnd());
         let actions =
             vec![serde_json::json!({"type": "set_value", "element": "name:OK", "text": "hi"})];
         let (_, first) = burst_bg(&actions, &bg, false);
         assert_set_value_refused(&first, "name:OK");
-    }
-
-    fn wait_uia_stable(hwnd: HWND) {
-        // Poll only the fixture HWND until the UIA backend serves Edit
-        // controls (or 5s elapses and the caller asserts on the real state).
-        let t0 = Instant::now();
-        loop {
-            let m = element_model(hwnd, crate::UIA_DEPTH_LIMIT, 0);
-            let has_edit = m
-                .entries
-                .iter()
-                .any(|e| e.get("role").and_then(|v| v.as_str()) == Some("Edit"));
-            if m.backend == "uia" && has_edit {
-                return;
-            }
-            if t0.elapsed() > std::time::Duration::from_secs(5) {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
     }
 
     /// The live fingerprint of one control from a fresh walk. W2.1 makes it
@@ -6206,7 +6169,6 @@ mod tests {
         // the live model and splitting the two Edit roles by screen-y.
         let f = crate::fixture::Fixture::new();
         let bg = format!("hwnd:{}", f.hwnd_i64());
-        wait_uia_stable(f.hwnd());
         let model = element_model(f.hwnd(), crate::UIA_DEPTH_LIMIT, 0);
         let mut edits: Vec<(i64, String)> = Vec::new();
         for e in &model.entries {
@@ -6296,7 +6258,6 @@ mod tests {
     fn value_pattern_set_value_replaces_without_keystrokes() {
         let _g = crate::fixture::desktop();
         let f = crate::fixture::Fixture::new();
-        wait_uia_stable(f.hwnd());
         let model = crate::shot::element_model(f.hwnd(), crate::UIA_DEPTH_LIMIT, 0);
         let entry = model
             .entries
@@ -6662,7 +6623,6 @@ mod tests {
         let _g = crate::fixture::desktop();
         let fx = crate::fixture::Fixture::new();
         let hwnd = fx.hwnd_i64();
-        wait_uia_stable(fx.hwnd());
         let actions = vec![
             serde_json::json!({"type": "set_value", "element": "auto_id:100", "text": "secret"}),
             serde_json::json!({"type": "type", "element": "auto_id:100", "text": "secret"}),
@@ -6705,11 +6665,10 @@ mod tests {
         let _g = crate::fixture::desktop();
         let fx = crate::fixture::Fixture::new();
         // Verify captures the locked target: use the EDIT child (a real
-        // control PrintWindow renders) instead of the offscreen frame.
+        // control PrintWindow renders) instead of the offscreen frame. The
+        // fixture's first composited frame is already waited for by its
+        // constructor, so no paint is forced here.
         let hwnd = fx.edit() as i64;
-        // Paint before the verify captures: a fresh window may not have
-        // processed WM_PAINT yet and would read back all-black.
-        force_paint(hwnd);
         let actions = vec![
             serde_json::json!({"type": "type", "text": "x"}),
             serde_json::json!({"type": "key", "name": "a"}),
@@ -6908,7 +6867,6 @@ mod tests {
         let _g = crate::fixture::desktop();
         let fx = crate::fixture::Fixture::new();
         let hwnd = fx.hwnd_i64();
-        wait_uia_stable(fx.hwnd());
         let fp = live_fp(fx.hwnd(), "auto_id", "100");
         let actions = vec![serde_json::json!({
             "type": "click", "element": "auto_id:100", "expect_fp": fp
@@ -7212,11 +7170,10 @@ mod tests {
         let _g = crate::fixture::desktop();
         let fx = crate::fixture::Fixture::new();
         // Verify captures the locked target: use the EDIT child (a real
-        // control PrintWindow renders) instead of the offscreen frame.
+        // control PrintWindow renders) instead of the offscreen frame. The
+        // fixture's first composited frame is already waited for by its
+        // constructor, so no paint is forced here.
         let hwnd = fx.edit() as i64;
-        // Paint before the verify captures: a fresh window may not have
-        // processed WM_PAINT yet and would read back all-black.
-        force_paint(hwnd);
         let fg_before = crate::fixture::foreground_now();
         let owned = crate::fixture::OwnedWindows::new().with_fixture(&fx);
         let out = do_burst(&DoArgs {
@@ -7241,7 +7198,6 @@ mod tests {
     fn live_click_on_element_resolves_to_uia_pattern() {
         let _g = crate::fixture::desktop();
         let (fx, bg) = fixture_bg();
-        wait_uia_stable(fx.hwnd());
         let fp = live_fp(fx.hwnd(), "name", "OK");
         let actions = vec![serde_json::json!({
             "type": "click", "element": "name:OK", "expect_fp": fp

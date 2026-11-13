@@ -28,7 +28,7 @@
 
 #![windows_subsystem = "windows"]
 
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -76,6 +76,8 @@ static P4C_ACT: AtomicIsize = AtomicIsize::new(0);
 
 /// The stamped log's own window, 0 until it exists.
 static CAPS_LOG_HWND: AtomicIsize = AtomicIsize::new(0);
+/// Set by the caps window's first WM_PAINT: the harness's readiness signal.
+static CAPS_PAINTED: AtomicBool = AtomicBool::new(false);
 /// Process-relative clock: every stamp is milliseconds since boot.
 static CAPS_START: OnceLock<Instant> = OnceLock::new();
 static CAPS_LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -153,6 +155,16 @@ fn caps_name_of(id: i32) -> &'static str {
 /// activations, which is what W4.1/W4.2 assert).
 unsafe extern "system" fn wndproc_caps(hwnd: HWND, msg: u32, w: usize, l: isize) -> isize {
     match msg {
+        // Readiness signal: the first processed WM_PAINT is the moment this
+        // window has a frame a capture can accept, so the harness waits for
+        // this line instead of guessing with a sleep. A fresh window reads
+        // all-black until then and the capture refuses that frame.
+        WM_PAINT => {
+            if !CAPS_PAINTED.swap(true, Ordering::SeqCst) {
+                caps_push("painted".to_string());
+            }
+            return DefWindowProcW(hwnd, msg, w, l);
+        }
         WM_CLOSE => {
             caps_push("WM_CLOSE".to_string());
             DestroyWindow(hwnd);

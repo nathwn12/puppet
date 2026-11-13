@@ -57,6 +57,16 @@ type StaleMap = HashMap<i64, (String, (i32, i32, i32, i32), u64)>;
 
 static STALE: LazyLock<Mutex<StaleMap>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Drop the stale-detection entry for one window (test-only).
+///
+/// A readiness probe (`fixture::await_ready`) is not a capture the caller asked
+/// for. Without this, the probe's signature would make the first real capture
+/// of an unchanged frame report `stale:true`, which no caller earned.
+#[cfg(test)]
+pub fn forget_stale(hwnd: i64) {
+    STALE.lock().unwrap().remove(&hwnd);
+}
+
 // ---------------------------------------------------------------- python numerics
 
 /// Python round() half-to-even to an integer value.
