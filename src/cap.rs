@@ -420,6 +420,48 @@ pub struct Verdict {
     pub mean: f64,
     pub var: f64,
     pub black_ratio: f64,
+    /// The largest channel value anywhere in the frame: what the blank rule
+    /// measured, reported so a partial-black frame is visibly measured rather
+    /// than silently passed.
+    pub max_channel: u8,
+}
+
+/// The full-blank threshold: a frame whose largest channel value is under
+/// this is refused, and every capture reports the value it measured against
+/// it (W3.4).
+pub const BLANK_THRESHOLD: u8 = 8;
+
+/// The largest channel value in an image, in one pass (no thumbnail, no
+/// histogram): the measurement behind `blank_check` on a capture path that
+/// does not otherwise run the detector.
+pub fn max_channel_of(img: &Img) -> u8 {
+    let mut hi = 0u8;
+    for i in 0..(img.w as usize * img.h as usize) {
+        for c in 0..3 {
+            let v = img.px[3 * i + c];
+            if v > hi {
+                hi = v;
+            }
+        }
+    }
+    hi
+}
+
+/// The `blank_check{max_channel,verdict,threshold}` object every successful
+/// capture reports (W3.4).
+pub fn blank_check_json(max_channel: u8) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("max_channel".to_string(), Value::from(max_channel));
+    m.insert(
+        "verdict".to_string(),
+        Value::from(if max_channel < BLANK_THRESHOLD {
+            "full_blank"
+        } else {
+            "content"
+        }),
+    );
+    m.insert("threshold".to_string(), Value::from(BLANK_THRESHOLD));
+    m
 }
 
 fn gray(r: u8, g: u8, b: u8) -> u8 {
@@ -441,6 +483,7 @@ pub fn detector_verdict(img: &Img) -> Verdict {
             mean: 0.0,
             var: 0.0,
             black_ratio: 1.0,
+            max_channel: 0,
         };
     }
     let n = w * h;
@@ -485,14 +528,16 @@ pub fn detector_verdict(img: &Img) -> Verdict {
         mean: py_round_n(mean, 2),
         var: py_round_n(var, 2),
         black_ratio: py_round_n(black as f64 / 4096.0, 4),
+        max_channel: hi,
     };
-    if hi < 8 {
+    if hi < BLANK_THRESHOLD {
         return Verdict {
             rejected: true,
             reason: Some("all-black".to_string()),
             mean: stats.mean,
             var: stats.var,
             black_ratio: stats.black_ratio,
+            max_channel: hi,
         };
     }
     stats
@@ -516,9 +561,25 @@ pub fn detector_json(v: &Verdict) -> Map<String, Value> {
 
 pub fn detector_tag(v: &Verdict) -> String {
     format!(
-        "detector{{mean={},var={},black_ratio={}}}",
-        v.mean, v.var, v.black_ratio
+        "detector{{mean={},var={},black_ratio={}}} blank_check{}",
+        v.mean,
+        v.var,
+        v.black_ratio,
+        tag_of(&blank_check_json(v.max_channel))
     )
+}
+
+/// One `{k=v,k=v}` tag body, in insertion order, for the refusal text a
+/// caller can assert on.
+fn tag_of(m: &Map<String, Value>) -> String {
+    let body: Vec<String> = m
+        .iter()
+        .map(|(k, v)| match v {
+            Value::String(s) => format!("{k}={s}"),
+            other => format!("{k}={other}"),
+        })
+        .collect();
+    format!("{{{}}}", body.join(","))
 }
 
 // ---------------------------------------------------------------- Pillow-compatible resample

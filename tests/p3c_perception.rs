@@ -554,3 +554,107 @@ fn a_diff_can_exclude_a_region() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The joined text of a tool result's text blocks (a refusal carries its
+/// detail there).
+fn result_text(r: &Value) -> String {
+    r.get("content")
+        .and_then(|c| c.as_array())
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+        .unwrap_or_default()
+}
+
+/// SPEC W3.4: a successful capture reports the blank-frame measurement, so a
+/// frame with a black region is visibly measured content; a fully blank frame
+/// still refuses, and the refusal carries the measurement that refused it.
+#[test]
+fn a_capture_reports_the_blank_frame_measurement() {
+    if !live() {
+        return;
+    }
+    kill_stale_fixtures("p3c-blackrect");
+    let fx = Fixture::spawn("p3c-blackrect", Some("blackrect"));
+    std::thread::sleep(Duration::from_millis(500));
+    let mut s = Session::spawn();
+    let r = s.result(1, "screenshot", serde_json::json!({"window": fx.title}));
+    assert_ne!(
+        r.get("isError"),
+        Some(&Value::from(true)),
+        "content with a black region is a legal frame, got: {}",
+        result_text(&r)
+    );
+    let sc = sc_of(&r, "blackrect screenshot");
+    let bc = sc
+        .get("capture")
+        .and_then(|c| c.get("blank_check"))
+        .unwrap_or_else(|| panic!("every capture reports blank_check, got: {sc}"));
+    assert_eq!(
+        bc.get("verdict").and_then(|v| v.as_str()),
+        Some("content"),
+        "a partially black frame is content, got: {bc}"
+    );
+    let max = bc.get("max_channel").and_then(|v| v.as_i64()).unwrap_or(-1);
+    assert!(
+        max >= 8,
+        "the measured maximum must clear the threshold, got: {bc}"
+    );
+    assert_eq!(
+        bc.get("threshold"),
+        Some(&Value::from(8)),
+        "the threshold is reported with the measurement, got: {bc}"
+    );
+
+    // A window that paints nothing at all still refuses, and says what it
+    // measured.
+    kill_stale_fixtures("p3c-blank");
+    let blank = Fixture::spawn("p3c-blank", Some("blank"));
+    std::thread::sleep(Duration::from_millis(500));
+    let r = s.result(2, "screenshot", serde_json::json!({"window": blank.title}));
+    assert_eq!(
+        r.get("isError"),
+        Some(&Value::from(true)),
+        "an all-black frame must still refuse, got: {r}"
+    );
+    let text = result_text(&r);
+    assert!(
+        text.contains("capture_unavailable"),
+        "the refusal keeps its typed code, got: {text}"
+    );
+    assert!(
+        text.contains("blank_check{max_channel=0,verdict=full_blank,threshold=8}"),
+        "the refusal must carry the measurement that refused it, got: {text}"
+    );
+
+    // The desktop path reports the measurement too: every successful capture
+    // does, whichever backend produced the frame.
+    let r = s.result(
+        3,
+        "screenshot",
+        serde_json::json!({"display": -1, "region": [0, 0, 32, 32]}),
+    );
+    let sc = sc_of(&r, "region capture");
+    let bc = sc
+        .get("capture")
+        .and_then(|c| c.get("blank_check"))
+        .unwrap_or_else(|| panic!("a region capture reports blank_check too, got: {sc}"));
+    assert_eq!(
+        bc.get("threshold"),
+        Some(&Value::from(8)),
+        "the threshold travels with the measurement, got: {bc}"
+    );
+    assert!(
+        bc.get("max_channel").and_then(|v| v.as_i64()).is_some(),
+        "the measurement is a number, got: {bc}"
+    );
+    let verdict = bc.get("verdict").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        verdict == "content" || verdict == "full_blank",
+        "the verdict is one of the two the contract names, got: {bc}"
+    );
+}

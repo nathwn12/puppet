@@ -1,7 +1,8 @@
 //! Window capture chain (Mode A + Mode C; B deferred) + element model.
 
 use crate::cap::{
-    bitblt_grab, detector_json, detector_tag, detector_verdict, printwindow_grab, Img,
+    bitblt_grab, blank_check_json, detector_json, detector_tag, detector_verdict, printwindow_grab,
+    Img,
 };
 use crate::{
     cloaked, dwm_rect, enum_child_windows, exe_of_pid, pid_of, win_class, win_text, ELEMENT_CAP,
@@ -22,6 +23,9 @@ pub struct CapOk {
     pub rect_source: String,
     pub rect_delta: [i32; 4],
     pub detector: Map<String, Value>,
+    /// W3.4: the blank-frame measurement the capture made, reported on every
+    /// success so a partial-black frame is visibly measured, never assumed.
+    pub blank_check: Map<String, Value>,
     pub stale: bool,
     /// True when the DWM frame rect changed between the pre-capture read and
     /// the final read: `dwm` is then the POST-capture rect, so the mapping
@@ -320,6 +324,7 @@ unsafe fn capture_window_inner(hwnd: HWND, allow_crop_fallback: bool) -> Result<
             rect_source,
             rect_delta,
             detector: detector_json(&verdict),
+            blank_check: blank_check_json(verdict.max_channel),
             stale,
             moved_during_capture: moved,
             dwm,
@@ -373,6 +378,7 @@ unsafe fn capture_window_inner(hwnd: HWND, allow_crop_fallback: bool) -> Result<
                     rect_source: crop_source,
                     rect_delta: crop_delta,
                     detector: detector_json(&verdict),
+                    blank_check: blank_check_json(verdict.max_channel),
                     stale: false,
                     moved_during_capture: crop_moved,
                     dwm: crop_dwm,

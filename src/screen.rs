@@ -409,6 +409,7 @@ pub fn screenshot_window(a: &ShotArgs) -> String {
         ),
     );
     capt.insert("detector".to_string(), Value::from(cap.detector));
+    capt.insert("blank_check".to_string(), Value::from(cap.blank_check));
     capt.insert("stale".to_string(), Value::from(cap.stale));
     capt.insert(
         "moved_during_capture".to_string(),
@@ -760,6 +761,9 @@ pub fn screenshot_desktop(a: &ShotArgs) -> String {
         };
     }
     let (sw, sh) = (img.w, img.h);
+    // W3.4: the blank-frame measurement is taken on the captured frame, before
+    // `finalize` consumes it for the wire.
+    let blank_check = crate::cap::blank_check_json(crate::cap::max_channel_of(&img));
     let (data, iw, ih, scale, f, q) = match finalize(img, a.max_px, &a.fmt, a.quality, a.grid) {
         Ok(v) => v,
         Err(e) => return shot_err_list(vec![e]),
@@ -813,6 +817,10 @@ pub fn screenshot_desktop(a: &ShotArgs) -> String {
     let mut capt = Map::new();
     capt.insert("backend".to_string(), Value::from(backend));
     capt.insert("ms".to_string(), Value::from(py_round_n(cap_ms, 3)));
+    // W3.4: every successful capture reports what the blank rule measured.
+    // This path has no window detector, so the frame's own maximum is read
+    // here in one pass rather than left unstated.
+    capt.insert("blank_check".to_string(), Value::from(blank_check));
     if let Some(n) = note {
         capt.insert("note".to_string(), Value::from(n));
     }

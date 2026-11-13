@@ -355,7 +355,14 @@ fn main() {
     // W6.2 capability window: the p4c controls plus the frame/button,
     // swallowing control, checkbox, listbox, grid and stamped log.
     let caps = mode == "caps";
-    let extra: usize = if p4c || caps {
+    // W3.4: two opt-in frames for the blank-frame measurement. `blackrect`
+    // paints real content with one genuinely black rectangle inside it, and
+    // `blank` paints nothing at all (no class brush, no children). Both are
+    // offscreen popups, so neither ever appears on a monitor.
+    let blackrect = mode == "blackrect";
+    let blank = mode == "blank";
+    let offscreen = blackrect || blank;
+    let extra: usize = if p4c || caps || offscreen {
         0
     } else {
         mode.parse().ok().map(|n: usize| n.min(1000)).unwrap_or(0)
@@ -367,7 +374,7 @@ fn main() {
         wc.style = if caps { CS_DBLCLKS } else { 0 };
         wc.hInstance = std::ptr::null_mut();
         wc.lpszClassName = cls_w.as_ptr();
-        wc.hbrBackground = if caps {
+        wc.hbrBackground = if caps || blackrect {
             GetSysColorBrush(COLOR_WINDOW)
         } else {
             std::ptr::null_mut()
@@ -392,9 +399,13 @@ fn main() {
             0,
             cls_w.as_ptr(),
             title_w.as_ptr(),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            100,
-            100,
+            if offscreen {
+                WS_POPUP
+            } else {
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE
+            },
+            if offscreen { -4000 } else { 100 },
+            if offscreen { -4000 } else { 100 },
             win_w,
             win_h,
             std::ptr::null_mut(),
@@ -403,6 +414,57 @@ fn main() {
             std::ptr::null(),
         );
         if hwnd.is_null() {
+            return;
+        }
+        if offscreen {
+            // W3.4: `blackrect` gets real painted content (a BUTTON paints
+            // itself, the proven paint path for an offscreen window) with a
+            // genuinely black rectangle inside it; `blank` gets no child at
+            // all, so its frame reads all-black and the capture must refuse.
+            if blackrect {
+                let content = CreateWindowExW(
+                    0,
+                    wide("BUTTON").as_ptr(),
+                    wide("w3-content").as_ptr(),
+                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32,
+                    12,
+                    12,
+                    200,
+                    30,
+                    hwnd,
+                    5001isize as *mut _,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                );
+                let rect = CreateWindowExW(
+                    0,
+                    wide("STATIC").as_ptr(),
+                    std::ptr::null(),
+                    WS_CHILD | WS_VISIBLE | 0x0000_0004, // SS_BLACKRECT
+                    12,
+                    60,
+                    220,
+                    120,
+                    hwnd,
+                    5002isize as *mut _,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                );
+                if content.is_null() || rect.is_null() {
+                    DestroyWindow(hwnd);
+                    return;
+                }
+            }
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let mut msg: MSG = std::mem::zeroed();
+            loop {
+                let r = GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0);
+                if r == 0 || r == -1 {
+                    break;
+                }
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
             return;
         }
         let edit = CreateWindowExW(
