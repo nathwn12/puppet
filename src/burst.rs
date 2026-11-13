@@ -2613,6 +2613,34 @@ pub fn do_burst(args: &DoArgs) -> String {
         };
         let typ_v = ad["type"].clone();
         let typ = typ_v.as_str().unwrap_or("\u{0}");
+        let has_element =
+            matches!(ad.get("element"), Some(v) if py_truthy(v) && !py_str(v).trim().is_empty());
+        // UIA text entry may take the foreground (the provider can focus
+        // its control): refused under the background-only policy, naming
+        // the control — no flag can buy a focus change. This runs before
+        // the gate so the refusal names the element, under dry_run too, and
+        // before the `allow_foreground` pre-check so the code does not depend
+        // on a flag that buys nothing: the verb has no background delivery
+        // whether or not the caller asks for the foreground.
+        if typ == "set_value" || (typ == "type" && has_element) {
+            let sel = ad.get("element").map(py_str).unwrap_or_default();
+            let e = crate::gate::uia_text_unavailable(sel.trim());
+            let mut m = base_entry(i, &typ_v, false, elapsed_ms(&t0));
+            m.insert("code".to_string(), Value::from(e.code));
+            m.insert("error".to_string(), Value::from(e.text()));
+            if bg_mode {
+                m.insert("mode".to_string(), Value::from("background"));
+                m.insert(
+                    "bg_hwnd".to_string(),
+                    bg_hwnd.map(Value::from).unwrap_or(Value::Null),
+                );
+            }
+            if dry_run {
+                m.insert("dry_run".to_string(), Value::from(true));
+            }
+            st.results.push(m);
+            continue;
+        }
         // The lock is revalidated before EVERY action: a target that closed
         // or whose handle was recycled is a typed refusal, never a retarget
         // and never a foreground fallback.
@@ -2704,33 +2732,8 @@ pub fn do_burst(args: &DoArgs) -> String {
         // Element scroll resolves a UIA pattern on an explicit window (like
         // invoke/set_value), never a posted message: keep it out of the
         // background-PostMessage branch, which targets bg_hwnd directly.
-        let has_element =
-            matches!(ad.get("element"), Some(v) if py_truthy(v) && !py_str(v).trim().is_empty());
         let has_scroll_element = typ == "scroll" && has_element;
         let has_coords = ad.contains_key("x") && ad.contains_key("y");
-        // UIA text entry may take the foreground (the provider can focus
-        // its control): refused under the background-only policy, naming
-        // the control — no flag can buy a focus change. This runs before
-        // the gate so the refusal names the element, under dry_run too.
-        if typ == "set_value" || (typ == "type" && has_element) {
-            let sel = ad.get("element").map(py_str).unwrap_or_default();
-            let e = crate::gate::uia_text_unavailable(sel.trim());
-            let mut m = base_entry(i, &typ_v, false, elapsed_ms(&t0));
-            m.insert("code".to_string(), Value::from(e.code));
-            m.insert("error".to_string(), Value::from(e.text()));
-            if bg_mode {
-                m.insert("mode".to_string(), Value::from("background"));
-                m.insert(
-                    "bg_hwnd".to_string(),
-                    bg_hwnd.map(Value::from).unwrap_or(Value::Null),
-                );
-            }
-            if dry_run {
-                m.insert("dry_run".to_string(), Value::from(true));
-            }
-            st.results.push(m);
-            continue;
-        }
         // The gate decides delivery BEFORE anything is queued or posted, and
         // refuses identically under dry_run: a dry run that says ok while the
         // live call would refuse is a lie.
