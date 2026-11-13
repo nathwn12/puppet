@@ -591,6 +591,45 @@ fn el_invokable(el: &Iface) -> bool {
         || el_get_pattern(el, UIA_TogglePatternId).is_ok()
 }
 
+/// The role one element reports: ControlTypeName minus "Control", else the
+/// numeric control type, else "Unknown" (puppet.py's derivation). Shared by
+/// the walk and the activation-time identity read so the two fingerprints are
+/// computed by the same code, never by two copies of the rule.
+fn el_role(el: &Iface) -> String {
+    let ct = el_control_type(el);
+    let ctn = ct.and_then(control_type_name).unwrap_or("");
+    let role = if ctn.ends_with("Control") && ctn.len() > "Control".len() {
+        ctn[..ctn.len() - "Control".len()].to_string()
+    } else if let Some(id) = ct {
+        id.to_string()
+    } else {
+        ctn.to_string()
+    };
+    if role.is_empty() {
+        "Unknown".to_string()
+    } else {
+        role
+    }
+}
+
+/// The identity fingerprint of ONE resolved element, from the same four
+/// properties the walk hashes. Read at activation time on the element that is
+/// about to receive the pattern call: there is no path re-resolution between
+/// the read and the act, so a re-render cannot slip a replacement in.
+fn el_identity_fp(el: &Iface) -> String {
+    crate::shot::element_fp(&el_role(el), &el_name(el), &el_aid(el), el_invokable(el))
+}
+
+/// Refuse when the resolved element is not the control the caller's snapshot
+/// verified. `Err` carries the typed stale_ref text naming both fingerprints.
+fn verify_identity(el: &Iface, expect_fp: &str, path: &str) -> Result<(), String> {
+    let now = el_identity_fp(el);
+    if now == expect_fp {
+        return Ok(());
+    }
+    Err(crate::shot::stale_ref_text(path, expect_fp, &now))
+}
+
 struct Walk {
     entries: Vec<Map<String, Value>>,
     pager: Pager,
@@ -692,22 +731,7 @@ impl Walk {
             };
             let name = el_name(k);
             let aid = el_aid(k);
-            let ct = el_control_type(k);
-            let ctn = ct.and_then(control_type_name).unwrap_or("");
-            // puppet.py: role = ControlTypeName minus "Control", else
-            // str(ControlType), else name-or-"Unknown" chain.
-            let role = if ctn.ends_with("Control") && ctn.len() > "Control".len() {
-                ctn[..ctn.len() - "Control".len()].to_string()
-            } else if let Some(id) = ct {
-                id.to_string()
-            } else {
-                ctn.to_string()
-            };
-            let role = if role.is_empty() {
-                "Unknown".to_string()
-            } else {
-                role
-            };
+            let role = el_role(k);
             let inv = el_invokable(k);
             match self
                 .pager
@@ -872,12 +896,19 @@ fn resolve_path_el(walker: &Iface, mut el: Iface, path: &str) -> Result<Iface, S
 
 /// Fire Invoke/SelectionItem/Toggle on the UIA element at path
 /// (puppet.py:1391-1439). No mouse, no focus change.
+///
+/// `expect_fp` is the fingerprint the caller verified against its snapshot:
+/// the resolved element's own properties are re-read immediately before the
+/// pattern call, and a mismatch refuses with `stale_ref` instead of firing on
+/// whatever a re-render left at that path. The verification and the call
+/// address the SAME resolved element, so there is no check-then-act window.
 /// `unconfirmed: activation needs owner permission` - implemented but never
 /// exercised by the headless parity harness.
-pub fn uia_activate(hwnd: i64, path: &str) -> (bool, String, Option<String>) {
+pub fn uia_activate(hwnd: i64, path: &str, expect_fp: &str) -> (bool, String, Option<String>) {
     let p = path.to_string();
+    let f = expect_fp.to_string();
     match crate::deadline::bound(crate::deadline::Family::Uia, "uia_activate", move || {
-        uia_activate_inner(hwnd, &p)
+        uia_activate_inner(hwnd, &p, &f)
     }) {
         Ok(r) => r,
         // Timeout shape matches a resolve failure: no `via` was reached.
@@ -885,7 +916,7 @@ pub fn uia_activate(hwnd: i64, path: &str) -> (bool, String, Option<String>) {
     }
 }
 
-fn uia_activate_inner(hwnd: i64, path: &str) -> (bool, String, Option<String>) {
+fn uia_activate_inner(hwnd: i64, path: &str, expect_fp: &str) -> (bool, String, Option<String>) {
     let auto = match automation() {
         Ok(a) => a,
         Err(e) => {
@@ -920,6 +951,13 @@ fn uia_activate_inner(hwnd: i64, path: &str) -> (bool, String, Option<String>) {
         Ok(e) => e,
         Err(msg) => return (false, String::new(), Some(msg)),
     };
+    // The fingerprint was verified against the caller's snapshot; the path was
+    // resolved again here. Re-read this element's own properties and compare
+    // immediately before the pattern call, so the control that fires IS the
+    // control whose properties were just read.
+    if let Err(msg) = verify_identity(&el, expect_fp, path) {
+        return (false, String::new(), Some(msg));
+    }
     // One arm per pattern (puppet.py:1391-1439): a failed GetCurrentPattern
     // silently tries the next pattern; QueryInterface and fire failures
     // return. The intermediate IUnknown releases on scope exit in all arms.
@@ -1025,15 +1063,22 @@ fn uia_activate_inner(hwnd: i64, path: &str) -> (bool, String, Option<String>) {
 /// Expand or collapse the UIA element at `path` via ExpandCollapse.
 /// Only that pattern is tried: a SplitButton supports both Invoke and
 /// ExpandCollapse, and a state request must never blindly fire Invoke
-/// (which could open a menu instead of collapsing it). `unconfirmed:
-/// activation needs owner permission` — implemented but never exercised
-/// by the headless parity harness.
-pub fn uia_expand_collapse(hwnd: i64, path: &str, expand: bool) -> (bool, String, Option<String>) {
+/// (which could open a menu instead of collapsing it). `expect_fp` is
+/// verified on the resolved element immediately before the call, exactly as
+/// `uia_activate` does. `unconfirmed: activation needs owner permission` —
+/// implemented but never exercised by the headless parity harness.
+pub fn uia_expand_collapse(
+    hwnd: i64,
+    path: &str,
+    expect_fp: &str,
+    expand: bool,
+) -> (bool, String, Option<String>) {
     let p = path.to_string();
+    let f = expect_fp.to_string();
     match crate::deadline::bound(
         crate::deadline::Family::Uia,
         "uia_expand_collapse",
-        move || uia_expand_collapse_inner(hwnd, &p, expand),
+        move || uia_expand_collapse_inner(hwnd, &p, &f, expand),
     ) {
         Ok(r) => r,
         // Timeout shape matches a resolve failure: no `via` was reached.
@@ -1044,6 +1089,7 @@ pub fn uia_expand_collapse(hwnd: i64, path: &str, expand: bool) -> (bool, String
 fn uia_expand_collapse_inner(
     hwnd: i64,
     path: &str,
+    expect_fp: &str,
     expand: bool,
 ) -> (bool, String, Option<String>) {
     let via = if expand { "uia-expand" } else { "uia-collapse" };
@@ -1081,6 +1127,11 @@ fn uia_expand_collapse_inner(
         Ok(e) => e,
         Err(msg) => return (false, String::new(), Some(msg)),
     };
+    // Same gate as uia_activate: the state request fires on the element whose
+    // properties were just read, never on a path resolved a second time.
+    if let Err(msg) = verify_identity(&el, expect_fp, path) {
+        return (false, String::new(), Some(msg));
+    }
     let unk = match el_get_pattern(&el, UIA_ExpandCollapsePatternId) {
         Ok(u) => u,
         Err(_) => {

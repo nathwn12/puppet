@@ -538,6 +538,41 @@ pub fn element_fp(role: &str, name: &str, auto_id: &str, invokable: bool) -> Str
     format!("{h:016x}")
 }
 
+/// Prefix of every fingerprint refusal: the control the caller verified is not
+/// the control the call reached. The pre-activation gate and the activation
+/// itself share it, so an agent reads one code for one condition.
+pub const STALE_REF: &str = "stale_ref";
+
+/// The act-time refusal: the element resolved for this call is no longer the
+/// control whose fingerprint was verified. Names both fingerprints so the
+/// retry costs one call.
+pub fn stale_ref_text(path: &str, want: &str, now: &str) -> String {
+    format!(
+        "{STALE_REF}: element at path {} is no longer the control whose fingerprint was verified \
+         (expected fp {want}, now {now}). Take a fresh `elements` snapshot and retry.",
+        crate::py_repr_str(path)
+    )
+}
+
+/// The identity fingerprint of one Win32 child, read from the window itself:
+/// the same four properties `win32_element_list` hashes. Read at click time on
+/// the control about to be clicked, so the Win32 fallback cannot click a
+/// replacement that took the old path. The handle crosses as the plain integer
+/// the activation paths already use.
+pub fn win32_identity_fp(hwnd: i64) -> String {
+    let h = hwnd as HWND;
+    let name = unsafe { win_text(h) };
+    let cls = unsafe { win_class(h) };
+    let cid = unsafe { GetDlgCtrlID(h) };
+    let aid = if cid > 0 {
+        cid.to_string()
+    } else {
+        String::new()
+    };
+    let inv = cls == "Button";
+    element_fp(role_of_class(&cls), &name, &aid, inv)
+}
+
 pub fn element_model(hwnd: HWND, max_depth: i64, offset: usize) -> ElementModel {
     // puppet.py:1253-1331: UIA first (wins iff >=1 entry), else the Win32
     // EnumChildWindows fallback. detail carries uia_available (COM loadable),

@@ -243,6 +243,55 @@ fn invoke_schema_declares_expand_state() {
     );
 }
 
+/// The contract may not claim more than the hash proves. `fp` is FNV-1a over
+/// role/name/auto_id/invokable only, so a replacement control carrying those
+/// same four properties hashes identically: an `fp` match establishes identity
+/// of those four properties, never uniqueness of the control. Both the
+/// `fp_scope` limit an agent reads first and the two tool descriptions that
+/// take an `fp` must say so, or an agent reads a match as proof it is acting
+/// on the control it saw.
+#[test]
+fn the_fingerprint_prose_states_what_the_hash_proves() {
+    let claims = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/claims.rs"))
+        .expect("claims.rs must be readable");
+    let at = claims
+        .find("\"fp_scope\"")
+        .unwrap_or_else(|| panic!("claims.rs must carry the fp_scope limit"));
+    let row = &claims[at..];
+    let line = &row[..row.find("\n    ),").unwrap_or(row.len())];
+    for named in ["role", "name", "auto_id", "invokable"] {
+        assert!(
+            line.contains(named),
+            "the fp_scope limit must name the property the hash covers ({named}): {line:?}"
+        );
+    }
+    assert!(
+        line.contains("replacement"),
+        "the fp_scope limit must say a replacement with the same properties is \
+         indistinguishable, never that a match proves the control: {line:?}"
+    );
+    let mut s = Session::spawn();
+    let tools = list_tools(&mut s);
+    for name in ["elements", "do"] {
+        let desc = tool(&tools, name)
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or_else(|| panic!("{name} must carry a description"));
+        assert!(
+            desc.contains("replacement"),
+            "{name} must say a replacement carrying the same properties has the same fp, \
+             got: {desc}"
+        );
+        for named in ["role", "name", "auto_id"] {
+            assert!(
+                desc.contains(named),
+                "{name} must name the property the hash covers ({named}), got: {desc}"
+            );
+        }
+    }
+    println!("FP_SCOPE_OK the contract states what the hash proves");
+}
+
 fn do_one(s: &mut Session, id: i64, action: Value, bg: &str) -> Value {
     let r = s.result(
         id,
@@ -709,6 +758,18 @@ fn invoke_without_expect_fp_refuses_and_the_one_call_retry_acts() {
         Some(&Value::from(true)),
         "the one-call retry must act, got: {retried}"
     );
+    // SPEC W2.1: the retry reports `effect:"changed"` - `ok` alone says the
+    // pattern call was delivered, never that the control acted.
+    assert_eq!(
+        retried.get("effect").and_then(|e| e.as_str()),
+        Some("changed"),
+        "a successful invoke must report effect:changed, got: {retried}"
+    );
+    assert_eq!(
+        retried.get("delivered").and_then(|d| d.as_str()),
+        Some("uia"),
+        "a UIA pattern activation must report delivered:uia, got: {retried}"
+    );
     assert_eq!(
         activations(&mut s, 47, &title),
         "activations=1",
@@ -796,6 +857,41 @@ fn an_element_wait_reports_the_control_that_satisfied_it() {
     // The caller's snapshot: the control that carries the name now, disabled,
     // so an `enabled` wait cannot be satisfied by it.
     let snapshot = fp_of(&mut s, 100, &title, "name", "p4c-wait");
+    // The match half of the report: the wait is satisfied by the very control
+    // the snapshot named, so `fp_matched` is true. Without this case an
+    // implementation that always reported false passed the suite.
+    let matched = do_one(
+        &mut s,
+        99,
+        serde_json::json!({
+            "type": "wait_for",
+            "kind": "element",
+            "element": "name:p4c-wait",
+            "state": "appear",
+            "window": bg.clone(),
+            "timeout_ms": 2000,
+            "expect_fp": snapshot.clone(),
+        }),
+        &bg,
+    );
+    assert_eq!(
+        matched.get("satisfied"),
+        Some(&Value::from(true)),
+        "the control the snapshot named is present, got: {matched}"
+    );
+    assert_eq!(
+        matched.get("fp_matched"),
+        Some(&Value::from(true)),
+        "a wait satisfied by the snapshotted control must report fp_matched:true, got: {matched}"
+    );
+    assert_eq!(
+        matched
+            .get("satisfied_by")
+            .and_then(|b| b.get("fp"))
+            .and_then(|v| v.as_str()),
+        Some(snapshot.as_str()),
+        "the winner must be the snapshotted control, got: {matched}"
+    );
     // A different control takes the name 200 ms into the wait.
     let swap_title = title.clone();
     let swap = std::thread::spawn(move || {

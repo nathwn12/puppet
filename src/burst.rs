@@ -2081,6 +2081,17 @@ struct FpRefusal {
     text: String,
 }
 
+/// The caller's `expect_fp` as the fingerprint an activation must verify.
+/// Empty only when the caller passed none - which the pre-activation gate
+/// refuses for every element mutation, so an activation never runs with an
+/// empty one (and an empty one would refuse, never act unverified).
+fn expect_fp_arg(a: &Map<String, Value>) -> String {
+    match a.get("expect_fp") {
+        None | Some(Value::Null) => String::new(),
+        Some(v) => py_str(v),
+    }
+}
+
 /// The re-walked entry's fingerprint must equal `expect_fp`. Returns the typed
 /// refusal when it does not, None when the gate passes. `required` refuses an
 /// absent fingerprint too: a mutation without one may act on a different
@@ -2093,10 +2104,7 @@ fn check_expect_fp(
     required: bool,
 ) -> Option<FpRefusal> {
     let got = entry_str(entry, "fp");
-    let want = match a.get("expect_fp") {
-        None | Some(Value::Null) => String::new(),
-        Some(v) => py_str(v),
-    };
+    let want = expect_fp_arg(a);
     if want.trim().is_empty() {
         if !required {
             return None;
@@ -2115,12 +2123,21 @@ fn check_expect_fp(
         return None;
     }
     Some(FpRefusal {
-        code: "stale_ref",
+        code: crate::shot::STALE_REF,
         resolution: "stale",
         text: format!(
-            "stale_ref: element \"{sel}\" changed since its snapshot (expected fp {want}, now {got}). Take a fresh `elements` snapshot and retry with the new ref/fp."
+            "{}: element \"{sel}\" changed since its snapshot (expected fp {want}, now {got}). Take a fresh `elements` snapshot and retry with the new ref/fp.",
+            crate::shot::STALE_REF
         ),
     })
+}
+
+/// A UIA activation's typed refusal when the resolved element is not the
+/// control whose fingerprint the caller verified: the act-time half of the
+/// same `stale_ref` the pre-activation gate reports.
+fn activation_stale(verr: &Option<String>) -> bool {
+    verr.as_deref()
+        .is_some_and(|e| e.starts_with(crate::shot::STALE_REF))
 }
 
 // ---------------------------------------------------------------- invoke activation (UIA patterns + Win32 extent)
@@ -2173,20 +2190,39 @@ fn win32_activate(entry: &Map<String, Value>) -> (bool, String, Option<String>) 
             Some(format!("Win32 path {} went stale", py_repr_str(&path))),
         );
     }
+    // The handle the walk saw is the identity; the path is not. Click the
+    // control itself, after re-reading its four hashed properties, so a
+    // re-render between the fingerprint check and the click cannot put a
+    // replacement under the same index.
+    let child_id = match entry.get("hwnd").and_then(|v| v.as_i64()) {
+        Some(h) if h != 0 => h,
+        _ => {
+            return (
+                false,
+                String::new(),
+                Some(format!(
+                    "win32-click failed: the entry carries no control handle for path {}",
+                    py_repr_str(&path)
+                )),
+            )
+        }
+    };
+    let want = entry_str(entry, "fp");
+    let child = child_id as HWND;
+    let now = crate::shot::win32_identity_fp(child_id);
+    if now != want {
+        return (
+            false,
+            String::new(),
+            Some(crate::shot::stale_ref_text(&path, &want, &now)),
+        );
+    }
     unsafe {
         // P1b: never wedge a worker on a hung window. SendMessageTimeoutW
         // with SMTO_ABORTIFHUNG + 2s turns a hung target into a per-action
         // error; the reader and the other workers stay alive.
         let mut _res: usize = 0;
-        let r = SendMessageTimeoutW(
-            kids[idx as usize],
-            0x00F5,
-            0,
-            0,
-            SMTO_ABORTIFHUNG,
-            2000,
-            &mut _res,
-        );
+        let r = SendMessageTimeoutW(child, 0x00F5, 0, 0, SMTO_ABORTIFHUNG, 2000, &mut _res);
         if r == 0 {
             return (
                 false,
@@ -3358,8 +3394,12 @@ pub fn do_burst(args: &DoArgs) -> String {
                 let path = entry_str(&entry, "path");
                 if model.backend == "uia" {
                     // UIA Invoke/Select/Toggle is the preferred path: the
-                    // pattern call is the app's own acknowledgement.
-                    let (ok_a, via_a, err_a) = crate::uia::uia_activate(tgt, &path);
+                    // pattern call is the app's own acknowledgement. The
+                    // fingerprint verified above is re-checked on the element
+                    // the call fires on, so a re-render between the two
+                    // refuses instead of clicking its replacement.
+                    let (ok_a, via_a, err_a) =
+                        crate::uia::uia_activate(tgt, &path, &expect_fp_arg(ad));
                     if ok_a {
                         ok_v = true;
                         via = via_a;
@@ -3376,6 +3416,17 @@ pub fn do_burst(args: &DoArgs) -> String {
                             }
                             None => "pattern-returned",
                         };
+                    } else if activation_stale(&err_a) {
+                        // The control at the path is not the one the caller
+                        // verified: no pattern fired, and the posted-click
+                        // fallback would land on that same wrong control.
+                        d.insert("ok".to_string(), Value::from(false));
+                        d.insert("code".to_string(), Value::from(crate::shot::STALE_REF));
+                        d.insert("resolution".to_string(), Value::from("stale"));
+                        d.insert("via".to_string(), Value::from("none"));
+                        d.insert("error".to_string(), Value::from(err_a.unwrap_or_default()));
+                        d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
+                        return Ok(Some(d));
                     } else {
                         verr = err_a;
                     }
@@ -4247,6 +4298,11 @@ pub fn do_burst(args: &DoArgs) -> String {
                 // puppet.py:3253-3258: UIA backend fires pattern activation,
                 // Win32 backend BM_CLICKs. Pattern calls are implemented but
                 // marked `unconfirmed: activation needs owner permission`.
+                // Both are handed the fingerprint the caller verified and
+                // re-check it against the control they actually fire on, so
+                // the act cannot land on a re-rendered replacement.
+                let expect_fp = expect_fp_arg(ad);
+                let path = entry_str(&entry, "path");
                 let (ok_v, via, verr) = if let Some(want) = expand_req {
                     if model.backend != "uia" {
                         (
@@ -4258,15 +4314,27 @@ pub fn do_burst(args: &DoArgs) -> String {
                             ),
                         )
                     } else {
-                        let (ok_e, via_e, err_e) =
-                            crate::uia::uia_expand_collapse(tgt, &entry_str(&entry, "path"), want);
-                        (ok_e, via_e, err_e)
+                        crate::uia::uia_expand_collapse(tgt, &path, &expect_fp, want)
                     }
                 } else if model.backend == "uia" {
-                    crate::uia::uia_activate(tgt, &entry_str(&entry, "path"))
+                    crate::uia::uia_activate(tgt, &path, &expect_fp)
                 } else {
                     win32_activate(&entry)
                 };
+                // The control the activation addressed is not the one the
+                // caller verified: nothing fired, and no fallback may act on
+                // the control that now sits at that path.
+                if activation_stale(&verr) {
+                    d.insert("ok".to_string(), Value::from(false));
+                    d.insert("code".to_string(), Value::from(crate::shot::STALE_REF));
+                    d.insert("resolution".to_string(), Value::from("stale"));
+                    d.insert("via".to_string(), Value::from("none"));
+                    d.insert("delivered".to_string(), Value::from("none"));
+                    d.insert("effect".to_string(), Value::from("unchanged"));
+                    d.insert("error".to_string(), Value::from(verr.unwrap_or_default()));
+                    d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
+                    return Ok(Some(d));
+                }
                 let fallback = match ad.get("fallback") {
                     None => String::new(),
                     Some(v) => py_str(v).to_lowercase(),
@@ -4286,11 +4354,38 @@ pub fn do_burst(args: &DoArgs) -> String {
                     );
                     d.insert("error".to_string(), Value::from(refusal.text()));
                     d.insert("via".to_string(), Value::from("none"));
+                    d.insert("delivered".to_string(), Value::from("none"));
+                    d.insert("effect".to_string(), Value::from("unchanged"));
                     d.insert("ms".to_string(), Value::from(elapsed_ms(&t0)));
                     return Ok(Some(d));
                 } else {
                     d.insert("ok".to_string(), Value::from(ok_v));
                 }
+                // The two readings an invoke result carried neither of: ok is
+                // delivery, effect is what the control then did (SPEC W2.1:
+                // the retry reports effect changed). A fired pattern is the
+                // app's own acknowledgement; a pattern call that failed is
+                // delivered but unproven, and a refusal delivered nothing.
+                d.insert(
+                    "delivered".to_string(),
+                    Value::from(if !ok_v {
+                        "none"
+                    } else if via.starts_with("uia-") {
+                        "uia"
+                    } else {
+                        "posted"
+                    }),
+                );
+                d.insert(
+                    "effect".to_string(),
+                    Value::from(if ok_v {
+                        "changed"
+                    } else if via.is_empty() {
+                        "unchanged"
+                    } else {
+                        "unverified"
+                    }),
+                );
                 d.insert(
                     "via".to_string(),
                     Value::from(if via.is_empty() {
@@ -7552,5 +7647,170 @@ mod tests {
         // The prefix class matches neither: gone, not a guess.
         let e = crate::target::lock(&spec).expect_err("prefix class must not match");
         assert_eq!(e.code, "target_gone", "{}", e.text());
+    }
+
+    /// The check-then-act window, closed: the fingerprint is verified against
+    /// the snapshot, but the act re-resolves the path, so a re-render between
+    /// the two used to put a different control under the pattern call.
+    ///
+    /// This test mutates the tree *between* the two halves rather than before
+    /// the check (the p4c live test re-renders first, so the pre-activation
+    /// gate catches it and the window is never exercised): the button's
+    /// fingerprint is taken, the control is then renamed in place - same hwnd,
+    /// same path, different identity - and only then is the activation asked
+    /// to fire with the fingerprint that was verified. The act must refuse,
+    /// typed, instead of firing on the control that now sits at that path.
+    #[test]
+    fn an_activation_refuses_when_the_tree_moved_after_the_fingerprint_check() {
+        if std::env::var("PUPPET_LIVE_DESKTOP").as_deref() != Ok("1") {
+            println!(
+                "SKIP: set PUPPET_LIVE_DESKTOP=1 to run (needs an interactive Windows session)"
+            );
+            return;
+        }
+        use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW;
+        let _g = crate::fixture::desktop();
+        let fx = crate::fixture::Fixture::new();
+        let hwnd = fx.hwnd_i64();
+        let entry_at = |path: Option<&str>| -> Option<(String, String)> {
+            let model = crate::shot::element_model(fx.hwnd(), 8, 0);
+            assert_eq!(
+                model.backend, "uia",
+                "this test needs the UIA backend, not the Win32 fallback"
+            );
+            model
+                .entries
+                .iter()
+                .find(|e| match path {
+                    Some(p) => e.get("path").and_then(|v| v.as_str()) == Some(p),
+                    None => e.get("auto_id").and_then(|v| v.as_str()) == Some("101"),
+                })
+                .map(|e| {
+                    (
+                        e.get("path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        e.get("fp")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                })
+        };
+        // The snapshot the caller verified: the fixture's OK button.
+        let (path, fp_before) = entry_at(None).expect("the fixture button must be in the walk");
+        assert!(
+            !path.is_empty() && fp_before.len() == 16,
+            "the walk must yield a path and a 16-hex fp, got {path:?} {fp_before:?}"
+        );
+        // The mutation, after the check and before the act.
+        let renamed: Vec<u16> = "OK-renamed"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe { SetWindowTextW(fx.button(), renamed.as_ptr()) };
+        let (_, fp_now) = entry_at(Some(&path))
+            .expect("the path must still resolve to a control after the rename");
+        assert_ne!(
+            fp_now, fp_before,
+            "the rename must move the fingerprint, or this test proves nothing"
+        );
+        // The act, with the fingerprint that was verified.
+        let (ok, via, err) = crate::uia::uia_activate(hwnd, &path, &fp_before);
+        assert!(
+            !ok,
+            "an activation must refuse when the control at the path is not the one whose \
+             fingerprint was verified, but it fired via {via:?}"
+        );
+        assert!(
+            via.is_empty(),
+            "a refused activation must reach no pattern, got via {via:?}"
+        );
+        let err = err.unwrap_or_default();
+        assert!(
+            err.contains("stale_ref") && err.contains(&fp_before) && err.contains(&fp_now),
+            "the refusal must be typed and name both fingerprints, got: {err:?}"
+        );
+        // And it is a refusal of THAT control, not a blanket one: the control
+        // actually at the path fires when its own fingerprint is passed.
+        let (ok_now, via_now, err_now) = crate::uia::uia_activate(hwnd, &path, &fp_now);
+        assert!(
+            ok_now,
+            "the control at the path must still activate with its own fp, got {via_now:?} {err_now:?}"
+        );
+        assert_eq!(
+            via_now, "uia-invoke",
+            "the fixture button is an InvokePattern control"
+        );
+    }
+
+    /// The Win32 fallback's half of the same window: `win32_activate` used to
+    /// re-enumerate children and BM_CLICK whatever sat at the entry's index.
+    /// It now clicks the handle the walk saw, after re-reading that handle's
+    /// four hashed properties - so a control renamed between the fingerprint
+    /// check and the click refuses instead of being clicked.
+    #[test]
+    fn a_win32_click_refuses_when_the_control_at_the_index_moved() {
+        if std::env::var("PUPPET_LIVE_DESKTOP").as_deref() != Ok("1") {
+            println!(
+                "SKIP: set PUPPET_LIVE_DESKTOP=1 to run (needs an interactive Windows session)"
+            );
+            return;
+        }
+        use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW;
+        let _g = crate::fixture::desktop();
+        let fx = crate::fixture::Fixture::new();
+        let mut entry = Map::new();
+        entry.insert("win".to_string(), Value::from(fx.hwnd_i64()));
+        entry.insert("hwnd".to_string(), Value::from(fx.button() as i64));
+        entry.insert("path".to_string(), Value::from("1"));
+        entry.insert("role".to_string(), Value::from("Button"));
+        entry.insert("name".to_string(), Value::from("OK"));
+        entry.insert("auto_id".to_string(), Value::from("101"));
+        entry.insert("invokable".to_string(), Value::from(true));
+        let fp_before = crate::shot::win32_identity_fp(fx.button() as i64);
+        assert_eq!(
+            fp_before,
+            crate::shot::element_fp("Button", "OK", "101", true),
+            "the click-time read must hash the same four properties the walk does"
+        );
+        entry.insert("fp".to_string(), Value::from(fp_before.clone()));
+        // The mutation, after the check and before the click.
+        let renamed: Vec<u16> = "OK-renamed"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe { SetWindowTextW(fx.button(), renamed.as_ptr()) };
+        let fp_now = crate::shot::win32_identity_fp(fx.button() as i64);
+        assert_ne!(
+            fp_now, fp_before,
+            "the rename must move the fingerprint, or this test proves nothing"
+        );
+        let (ok, via, err) = win32_activate(&entry);
+        assert!(
+            !ok,
+            "a Win32 click must refuse when the control at the index is not the one whose \
+             fingerprint was verified, but it clicked via {via:?}"
+        );
+        assert!(
+            via.is_empty(),
+            "a refused click must post nothing, got via {via:?}"
+        );
+        let err = err.unwrap_or_default();
+        assert!(
+            err.contains(crate::shot::STALE_REF)
+                && err.contains(&fp_before)
+                && err.contains(&fp_now),
+            "the refusal must be typed and name both fingerprints, got: {err:?}"
+        );
+        // The control actually at the index clicks when its own fp is passed.
+        entry.insert("fp".to_string(), Value::from(fp_now));
+        let (ok_now, via_now, err_now) = win32_activate(&entry);
+        assert!(
+            ok_now,
+            "the control at the index must still click with its own fp, got {via_now:?} {err_now:?}"
+        );
+        assert_eq!(via_now, "win32-click");
     }
 }

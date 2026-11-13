@@ -144,7 +144,7 @@ pub const LIMITS: &[(&str, &str)] = &[
     ),
     (
         "fp_scope",
-        "`fp` is identity, never state: rect, text and control state (checked, selected, expanded, range) do not participate, so an fp match means the same control, not the same control in the same condition; a state-sensitive action needs a readback (effect, satisfied_by), never a fingerprint",
+        "`fp` is identity, never state: rect, text and control state (checked, selected, expanded, range) do not participate, so an fp match means the same control properties (role, name, auto_id, invokable) and not the same condition - and not uniqueness either: a replacement control carrying those same four properties hashes the same, so a match never proves the control is the one you saw; a state-sensitive action needs a readback (effect, satisfied_by), never a fingerprint",
     ),
     (
         "wait_for",
