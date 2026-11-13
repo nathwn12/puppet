@@ -115,15 +115,9 @@ fn init_result(params: &Value) -> String {
         "{{\"protocolVersion\":{},\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}},\"serverInfo\":{{\"name\":\"puppet\",\"version\":{}}},\"instructions\":{}}}",
         serde_json::to_string(echo).unwrap(),
         serde_json::to_string(env!("CARGO_PKG_VERSION")).unwrap(),
-        serde_json::to_string(INIT_INSTRUCTIONS).unwrap()
+        serde_json::to_string(&crate::claims::instructions()).unwrap()
     )
 }
-
-/// Usage contract for a client/model that has never seen this server (gap
-/// 3): the six tools in one line each, the coordinate rule with the
-/// image-to-screen formula, batch + dry_run, and read-only-first on the
-/// owner's real desktop.
-const INIT_INSTRUCTIONS: &str = "puppet desktop-control MCP (Windows). Background-safe by default: every acting tool takes a `target` selector {hwnd?,pid?,exe?,appId?,titleContains?,className?} that resolves ONE window for the call and is revalidated before every action - no cursor movement, no keyboard injection into the owner's session, no focus stealing, no raised window, whether the target is foreground or alt-tabbed. There is no fallback to the foreground window: an ambiguous or vanished target is a typed error (ambiguous_target / target_gone). Foreground input (SendInput/SetForegroundWindow), pointer movement, and overwriting the owner's global clipboard (clipboard_set) are refused with foreground_required / cursor_move_required / clipboard_write_required unless the call passes allow_foreground:true / allow_cursor:true / allow_clipboard:true, before anything is sent or written. Control is exact and instant: clicks are one down+up at the resolved point, no interpolated pointer journey.\nTools (one line each):\n- screenshot: capture the whole virtual desktop (display=-1), one monitor, a window (window=<selector> or target={...}), or a region, without activating the window; minimized returns window_minimized, a refused frame capture_unavailable; returns the image plus source{x,y,w,h}, scale, the monitor list, the cursor, the image-to-screen formula, and foregroundUnchanged/cursorUnchanged. Coordinates are screen/virtual-desktop pixels: screen_x = source.x + round((img_x + 0.5) * source.w / image.w) (same for y).\n- list_windows: read-only visible top-level windows (hwnd/pid/exe/title/rects/elevated); never changes focus.\n- window: focus|move|resize|minimize|maximize|restore|close|topmost by selector, hwnd or target; only action=focus may touch the foreground window, every other verb is no-steal (SWP_NOACTIVATE / SW_SHOWMINNOACTIVE).\n- do: BURST tool: one call runs an ordered actions[] batch (move|click|down|up|drag|scroll|type|key|hotkey|wait|wait_for|focus_window|invoke|set_value|clipboard_set|clipboard_get) against one `target` window through UIA patterns first, then PostMessage/SendMessage with exact client coordinates; per-action ok, never aborts the rest. Under target, x/y are CLIENT-area physical pixels; without a target they are virtual-desktop pixels on the gated foreground path. dry_run=true validates and reports without injecting anything.\n- cursor: read-only cursor position plus monitor rects.\n- elements: read-only structured UI elements for a window (target/title/hwnd; zero pixels, no focus change); each entry carries ref plus fp, a stable identity fingerprint. Prefer elements over pixel guessing; pass expect_fp to invoke/set_value to refuse stale refs instead of acting on the wrong control. When text is illegible, re-request the same window with a tight region plus max_px:null (full-resolution zoom).";
 
 fn tools_list_result() -> String {
     format!("{{\"tools\":[{TOOL_SCREENSHOT},{TOOL_DIFF},{TOOL_LIST_WINDOWS},{TOOL_WINDOW},{TOOL_DO},{TOOL_CURSOR},{TOOL_ELEMENTS}]}}")
@@ -139,7 +133,7 @@ fn discover_result() -> String {
         "{{\"supportedVersions\":{},\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}},\"serverInfo\":{{\"name\":\"puppet\",\"version\":{}}},\"instructions\":{},\"resultType\":\"complete\"}}",
         serde_json::to_string(&Value::Array(supported)).unwrap(),
         serde_json::to_string(env!("CARGO_PKG_VERSION")).unwrap(),
-        serde_json::to_string(INIT_INSTRUCTIONS).unwrap()
+        serde_json::to_string(&crate::claims::instructions()).unwrap()
     )
 }
 
