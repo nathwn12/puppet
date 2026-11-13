@@ -20,7 +20,7 @@
     "type": "object"
   },
   "diff": {
-    "additionalProperties": true,
+    "type": "object",
     "properties": {
       "ok": {
         "type": "boolean"
@@ -65,6 +65,27 @@
             "type": "null"
           }
         ]
+      },
+      "bbox_space": {
+        "type": "string"
+      },
+      "image": {
+        "type": "object"
+      },
+      "scale": {
+        "type": "number"
+      },
+      "base_source": {
+        "type": [
+          "object",
+          "null"
+        ]
+      },
+      "next_source": {
+        "type": [
+          "object",
+          "null"
+        ]
       }
     },
     "required": [
@@ -76,7 +97,7 @@
       "base",
       "next"
     ],
-    "type": "object"
+    "additionalProperties": true
   },
   "do": {
     "additionalProperties": true,

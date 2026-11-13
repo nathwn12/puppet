@@ -26,12 +26,14 @@ pub struct DiffArgs {
     pub bbox: bool,
 }
 
-/// Decode one `diff` operand to RGB pixels. `{path}` reads a PNG file;
-/// anything else is captured through the screenshot path at native
-/// pixels (lossless PNG, no grid, no elements) and decoded back, so the
-/// window lock, region crop and display routing stay exactly the ones
-/// `screenshot` proves.
-fn resolve_operand(side: &str, v: &Value) -> Result<Img, String> {
+/// Decode one `diff` operand to RGB pixels and its origin. `{path}` reads a
+/// PNG file and has no origin (`null`); anything else is captured through
+/// the screenshot path at native pixels (lossless PNG, no grid, no
+/// elements) and decoded back, so the window lock, region crop and display
+/// routing stay exactly the ones `screenshot` proves, and the capture's own
+/// `source{x,y,w,h,kind}` comes back with the pixels instead of being
+/// discarded.
+fn resolve_operand(side: &str, v: &Value) -> Result<(Img, Value), String> {
     if let Value::Object(o) = v {
         if let Some(p) = o.get("path") {
             let path = p.as_str().ok_or_else(|| {
@@ -39,7 +41,8 @@ fn resolve_operand(side: &str, v: &Value) -> Result<Img, String> {
             })?;
             let bytes = std::fs::read(path)
                 .map_err(|e| format!("error: bad_diff: cannot read {side} {path}: {e}"))?;
-            return decode_png(&bytes).map_err(|e| format!("error: bad_diff: {side}: {e}"));
+            let img = decode_png(&bytes).map_err(|e| format!("error: bad_diff: {side}: {e}"))?;
+            return Ok((img, Value::Null));
         }
     }
     // Capture target: a bare string is a window selector, an object
@@ -145,7 +148,9 @@ fn resolve_operand(side: &str, v: &Value) -> Result<Img, String> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64)
         .map_err(|e| format!("error: bad_diff: {side}: capture bytes are not base64: {e}"))?;
-    decode_png(&bytes).map_err(|e| format!("error: bad_diff: {side}: {e}"))
+    let img = decode_png(&bytes).map_err(|e| format!("error: bad_diff: {side}: {e}"))?;
+    let source = reply.get("source").cloned().unwrap_or(Value::Null);
+    Ok((img, source))
 }
 
 fn err_payload(items: Vec<(&str, Value)>) -> String {
@@ -155,6 +160,25 @@ fn err_payload(items: Vec<(&str, Value)>) -> String {
         m.insert(k.to_string(), v);
     }
     crate::wrapped_text(&crate::py_dumps(&Value::Object(m)))
+}
+
+/// The `image{w,h,format,quality}` block for the bytes a diff returns, with
+/// the same shape `screenshot` uses (`quality` is null unless the format
+/// carries a quality at all).
+fn image_object(iw: i64, ih: i64, fmt: &str, quality: i64) -> Value {
+    let mut m = Map::new();
+    m.insert("w".to_string(), Value::from(iw));
+    m.insert("h".to_string(), Value::from(ih));
+    m.insert("format".to_string(), Value::from(fmt.to_string()));
+    m.insert(
+        "quality".to_string(),
+        if fmt == "jpeg" {
+            Value::from(quality)
+        } else {
+            Value::Null
+        },
+    );
+    Value::Object(m)
 }
 
 pub fn dispatch_diff(a: &DiffArgs) -> String {
@@ -168,12 +192,12 @@ pub fn dispatch_diff(a: &DiffArgs) -> String {
         )]);
     }
     let thr = a.threshold as u8;
-    let base = match resolve_operand("base", &a.base) {
-        Ok(im) => im,
+    let (base, base_source) = match resolve_operand("base", &a.base) {
+        Ok(v) => v,
         Err(e) => return err_payload(vec![("error", Value::from(e))]),
     };
-    let next = match resolve_operand("next", &a.next) {
-        Ok(im) => im,
+    let (next, next_source) = match resolve_operand("next", &a.next) {
+        Ok(v) => v,
         Err(e) => return err_payload(vec![("error", Value::from(e))]),
     };
     let d = match crate::cap::pixel_diff(&base, &next, thr) {
@@ -232,6 +256,13 @@ pub fn dispatch_diff(a: &DiffArgs) -> String {
     next_o.insert("h".to_string(), Value::from(next.h as i64));
     payload.insert("next".to_string(), Value::from(next_o));
     payload.insert("threshold".to_string(), Value::from(a.threshold));
+    // W3.1/A1: the counts and the box are native operand pixels; `image` and
+    // `scale` describe the bytes actually returned, and the operand origins
+    // say where those pixels sit on the screen (null for a file operand,
+    // which has no origin).
+    payload.insert("bbox_space".to_string(), Value::from("native"));
+    payload.insert("base_source".to_string(), base_source);
+    payload.insert("next_source".to_string(), next_source);
     if d.identical {
         // No changed pixels, no diff image: an all-dimmed file still lands
         // when `out` is set so the path contract holds on both outcomes.
@@ -257,15 +288,17 @@ pub fn dispatch_diff(a: &DiffArgs) -> String {
                     px
                 },
             };
-            let (data, _, _, _, _, _) = match finalize(flat, a.max_px, "png", None, false) {
+            let (data, iw, ih, scale, f, q) = match finalize(flat, a.max_px, "png", None, false) {
                 Ok(v) => v,
                 Err(e) => return err_payload(vec![("error", Value::from(e))]),
             };
+            payload.insert("image".to_string(), image_object(iw, ih, &f, q));
+            payload.insert("scale".to_string(), Value::from(scale));
             match crate::cap::write_bytes_out(path, &data) {
                 Ok(()) => {
                     payload.insert(
                         "diff_out".to_string(),
-                        Value::from(crate::cap::out_object(path, data.len(), "png")),
+                        Value::from(crate::cap::out_object(path, data.len(), &f)),
                     );
                 }
                 Err(e) => return err_payload(vec![("error", Value::from(e))]),
@@ -282,16 +315,18 @@ pub fn dispatch_diff(a: &DiffArgs) -> String {
         Ok(im) => im,
         Err(e) => return err_payload(vec![("error", Value::from(e))]),
     };
-    let (data, _, _, _, _, _) = match finalize(viz, a.max_px, "png", None, false) {
+    let (data, iw, ih, scale, f, q) = match finalize(viz, a.max_px, "png", None, false) {
         Ok(v) => v,
         Err(e) => return err_payload(vec![("error", Value::from(e))]),
     };
+    payload.insert("image".to_string(), image_object(iw, ih, &f, q));
+    payload.insert("scale".to_string(), Value::from(scale));
     if let Some(path) = a.out.as_deref() {
         match crate::cap::write_bytes_out(path, &data) {
             Ok(()) => {
                 payload.insert(
                     "diff_out".to_string(),
-                    Value::from(crate::cap::out_object(path, data.len(), "png")),
+                    Value::from(crate::cap::out_object(path, data.len(), &f)),
                 );
             }
             Err(e) => return err_payload(vec![("error", Value::from(e))]),
@@ -299,10 +334,15 @@ pub fn dispatch_diff(a: &DiffArgs) -> String {
     } else {
         payload.insert("diff_out".to_string(), Value::Null);
     }
+    let mime = if f == "png" {
+        "image/png"
+    } else {
+        "image/jpeg"
+    };
     let blocks = vec![
         crate::image_block(
             &base64::engine::general_purpose::STANDARD.encode(&data),
-            "image/png",
+            mime,
         ),
         crate::text_block(&crate::py_dumps(&Value::Object(payload.clone()))),
     ];
