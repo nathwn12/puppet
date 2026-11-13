@@ -1213,6 +1213,27 @@ fn wf_element_enabled(tgt: i64, backend: &str, entry: &Map<String, Value>) -> Op
     }
 }
 
+/// W2.3: is the control about to be reported still the one the selector
+/// matches, with the same identity? The enabled read and the reported entry
+/// are two separate UIA reads, so without this a control replaced between them
+/// is reported as the winner while its successor satisfied the condition. One
+/// fresh paged scan makes the report name a control that existed when it was
+/// named; the scan pages exactly like the polling loop, so a control past the
+/// first page is confirmed where it was found.
+fn wf_winner_current(hwnd: HWND, elem: &Value, winner: &Map<String, Value>) -> bool {
+    let mut offset = 0usize;
+    loop {
+        let model = element_model(hwnd, crate::UIA_DEPTH_LIMIT, offset);
+        if let Some(e) = match_element(&model.entries, Some(elem), None).0 {
+            return entry_str(&e, "fp") == entry_str(winner, "fp");
+        }
+        match model.next_offset {
+            Some(n) => offset = n,
+            None => return false,
+        }
+    }
+}
+
 fn wf_done(t0: &Instant, ok: bool, sat: bool, err: Option<String>) -> Map<String, Value> {
     let mut d = Map::new();
     d.insert("ok".to_string(), Value::from(ok));
@@ -1721,7 +1742,19 @@ fn wait_for(a: &Map<String, Value>, t0: &Instant) -> Map<String, Value> {
                             None
                         };
                         if element_wait_satisfied(&state, true, enabled) {
-                            return done(true, Some(wf_satisfied_by(&elem_s, &e)));
+                            // W2.3: the enabled read re-resolves the control
+                            // by path, so a control replaced between the walk
+                            // and that read would be named as the winner while
+                            // the condition was satisfied by its successor.
+                            // Only report a control the selector still matches
+                            // with the same fingerprint; a moved fp means the
+                            // observation is stale, so poll again rather than
+                            // name a control that is already gone.
+                            let current =
+                                enabled.is_none() || wf_winner_current(h as HWND, &elem_v, &e);
+                            if current {
+                                return done(true, Some(wf_satisfied_by(&elem_s, &e)));
+                            }
                         }
                     }
                 }
