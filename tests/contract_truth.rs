@@ -358,3 +358,42 @@ fn instructions_state_the_coordinate_rule_and_refuse_the_escalation_path() {
         );
     }
 }
+
+/// SPEC W2.2: `fp` is identity, never state. The contract names the three
+/// exclusions, the consequence, and the readback a state-sensitive action
+/// needs instead — and never claims the fingerprint catches state.
+#[test]
+fn instructions_scope_the_fingerprint_to_identity() {
+    let (instructions, _) = instructions_and_tools();
+    let line = claims_rows("LIMITS", 2)
+        .into_iter()
+        .find(|r| r[0] == "fp_scope")
+        .unwrap_or_else(|| panic!("LIMITS must carry fp_scope, got: {instructions}"));
+    for exclusion in ["rect", "text", "state"] {
+        assert!(
+            line[1].contains(exclusion),
+            "the fp_scope limit must name {exclusion}: {:?}",
+            line[1]
+        );
+    }
+    for phrase in ["same control", "readback"] {
+        assert!(
+            line[1].contains(phrase),
+            "the fp_scope limit must state the consequence ({phrase}): {:?}",
+            line[1]
+        );
+    }
+    // The opposite claim would make an agent trust the fingerprint for state.
+    let lower = instructions.to_lowercase();
+    for banned in [
+        "fp covers state",
+        "fingerprint covers state",
+        "fingerprint covers geometry",
+        "fp detects a state change",
+    ] {
+        assert!(
+            !lower.contains(banned),
+            "the contract must never claim {banned:?}"
+        );
+    }
+}

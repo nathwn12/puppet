@@ -764,3 +764,58 @@ fn elements_detail_text_and_fp_stability() {
     drop(fx);
     println!("TEXT_OK extract+truncation-flag+fp-stability green");
 }
+
+/// SPEC W2.2 live: `fp` is identity, never state. A real state change (the
+/// tree node expands, and the control reads back `Expanded`) leaves the
+/// fingerprint where it was, so the snapshot's fp still gates the next
+/// mutation: default-on `expect_fp` never refuses a toggle, and an agent
+/// learns the condition from a readback, not from a fingerprint.
+#[test]
+fn fp_is_identity_not_state_across_a_real_state_change() {
+    if !live() {
+        return;
+    }
+    kill_stale_fixtures("p4c-fp-state");
+    let fx = Fixture::spawn("p4c-fp-state", "p4c");
+    let title = fx.title.clone();
+    std::thread::sleep(Duration::from_millis(500));
+    let mut s = Session::spawn();
+    let bg = format!("title:{title}");
+    let before = fp_of(&mut s, 90, &title, "name", "p4c-root");
+    let expanded = do_one(
+        &mut s,
+        91,
+        serde_json::json!({"type": "invoke", "element": "name:p4c-root", "state": "expand", "expect_fp": before.clone()}),
+        &bg,
+    );
+    assert_eq!(
+        expanded.get("ok"),
+        Some(&Value::from(true)),
+        "expand must run, got: {expanded}"
+    );
+    assert_eq!(
+        expanded.get("expand_state").and_then(|v| v.as_str()),
+        Some("Expanded"),
+        "the state must actually move, got: {expanded}"
+    );
+    let after = fp_of(&mut s, 92, &title, "name", "p4c-root");
+    assert_eq!(
+        before, after,
+        "a state change must leave the fingerprint alone"
+    );
+    // The fingerprint the first call used still matches after the state moved:
+    // identity survived the toggle.
+    let collapsed = do_one(
+        &mut s,
+        93,
+        serde_json::json!({"type": "invoke", "element": "name:p4c-root", "state": "collapse", "expect_fp": after}),
+        &bg,
+    );
+    assert_eq!(
+        collapsed.get("ok"),
+        Some(&Value::from(true)),
+        "the snapshot fp must still match after a state change, got: {collapsed}"
+    );
+    drop(fx);
+    println!("FP_STATE_OK fp={before} unchanged across expand/collapse");
+}

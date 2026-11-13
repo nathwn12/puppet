@@ -143,6 +143,10 @@ pub const LIMITS: &[(&str, &str)] = &[
         "`ok` means the action was delivered, never that the target acted: read `effect` for what actually happened",
     ),
     (
+        "fp_scope",
+        "`fp` is identity, never state: rect, text and control state (checked, selected, expanded, range) do not participate, so an fp match means the same control, not the same control in the same condition; a state-sensitive action needs a readback (effect, satisfied_by), never a fingerprint",
+    ),
+    (
         "wait_for",
         "`satisfied` is the condition's verdict and `ok` is the action's delivery: a timed-out wait_for reports satisfied:false with ok:true",
     ),

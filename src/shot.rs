@@ -1178,4 +1178,73 @@ mod tests {
         assert!(empty.is_empty());
         assert_eq!(next_empty, None);
     }
+
+    /// SPEC W2.2: `fp` is identity, never state. Two entries that differ only
+    /// in rect, path or text carry the same fingerprint, and each identity
+    /// field that differs moves it — so an `fp` match means the same control,
+    /// not the same control in the same condition.
+    #[test]
+    fn element_fp_is_identity_and_never_state() {
+        let fp_of = |e: &Map<String, Value>| {
+            element_fp(
+                e["role"].as_str().expect("role"),
+                e["name"].as_str().expect("name"),
+                e["auto_id"].as_str().expect("auto_id"),
+                e["invokable"].as_bool().expect("invokable"),
+            )
+        };
+        // One entry, built the way the walk builds it, with the three
+        // non-identity facts varying.
+        let entry = |rect: [i64; 4], path: &str, text: &str| {
+            let mut e = Map::new();
+            e.insert("role".to_string(), Value::from("Button"));
+            e.insert("name".to_string(), Value::from("OK"));
+            e.insert("auto_id".to_string(), Value::from("101"));
+            e.insert("invokable".to_string(), Value::from(true));
+            e.insert(
+                "rect".to_string(),
+                Value::from(rect.iter().map(|v| Value::from(*v)).collect::<Vec<_>>()),
+            );
+            e.insert("path".to_string(), Value::from(path));
+            e.insert("text".to_string(), Value::from(text));
+            e
+        };
+        let base = fp_of(&entry([10, 10, 80, 24], "0/1", ""));
+        // A move, a re-enumeration address and new text change nothing.
+        assert_eq!(
+            fp_of(&entry([400, 900, 4, 4], "0/1", "")),
+            base,
+            "rect must never participate in fp"
+        );
+        assert_eq!(
+            fp_of(&entry([10, 10, 80, 24], "0/7", "")),
+            base,
+            "path must never participate in fp"
+        );
+        assert_eq!(
+            fp_of(&entry([10, 10, 80, 24], "0/1", "the button's text changed")),
+            base,
+            "text must never participate in fp"
+        );
+        // Every identity field does: role, name, auto_id, invokable.
+        for (role, name, auto_id, invokable) in [
+            ("Edit", "OK", "101", true),
+            ("Button", "Cancel", "101", true),
+            ("Button", "OK", "102", true),
+            ("Button", "OK", "101", false),
+        ] {
+            assert_ne!(
+                element_fp(role, name, auto_id, invokable),
+                base,
+                "({role}, {name}, {auto_id}, {invokable}) must be a different identity"
+            );
+        }
+        // The walk passes exactly those four: a fifth input would put geometry
+        // or state back into the identity.
+        let walk = include_str!("uia.rs");
+        assert!(
+            walk.contains("element_fp(&role, &name, &aid, inv)"),
+            "the element walk must hash exactly role/name/auto_id/invokable"
+        );
+    }
 }

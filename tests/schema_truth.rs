@@ -816,3 +816,29 @@ fn the_budget_cut_kept_every_load_bearing_claim() {
         );
     }
 }
+
+/// SPEC W2.2: both tools that take an `fp` state the three exclusions and the
+/// consequence, so an agent cannot read the fingerprint as covering geometry,
+/// text or state — and cannot skip `expect_fp` after moving a slider.
+#[test]
+fn the_fingerprint_prose_names_the_three_exclusions() {
+    let tools = list_tools();
+    for name in ["elements", "do"] {
+        let t = tool(&tools, name);
+        let desc = t
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or_else(|| panic!("{name} must carry a description"));
+        for exclusion in ["rect", "text", "state"] {
+            assert!(
+                desc.contains(exclusion),
+                "{name}'s description must name {exclusion} as excluded from fp, got: {desc}"
+            );
+        }
+        assert!(
+            desc.contains("same control"),
+            "{name}'s description must state the consequence of a match: the same control, \
+             not the same condition, got: {desc}"
+        );
+    }
+}
