@@ -128,6 +128,71 @@ fn sc_of(r: &Value, what: &str) -> Value {
         .unwrap_or_else(|| panic!("{what} must carry structuredContent, got: {r}"))
 }
 
+// ---------------------------------------------------------------- live fixture
+
+fn live() -> bool {
+    if std::env::var("PUPPET_LIVE_DESKTOP").as_deref() == Ok("1") {
+        true
+    } else {
+        println!(
+            "SKIP p3c_perception live case: set PUPPET_LIVE_DESKTOP=1 to run \
+             (needs an interactive Windows session)"
+        );
+        false
+    }
+}
+
+/// Kill leftover fixture processes from a previous (possibly panicked) run.
+/// Scoped strictly to our own fixture executable plus the exact test window
+/// title — never touches an owner app.
+fn kill_stale_fixtures(title: &str) {
+    let _ = Command::new("taskkill")
+        .args([
+            "/F",
+            "/FI",
+            "IMAGENAME eq puppet_fixture_app.exe",
+            "/FI",
+            &format!("WINDOWTITLE eq {title}"),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Owning handle for one fixture process: `Drop` kills and reaps, so a panic
+/// still leaves no window behind for the next run.
+struct Fixture {
+    child: Child,
+    title: String,
+}
+
+impl Fixture {
+    /// The baseline window (one visible EDIT) unless `mode` names another.
+    fn spawn(title: &str, mode: Option<&str>) -> Self {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_puppet_fixture_app"));
+        cmd.arg(title)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(m) = mode {
+            cmd.arg(m);
+        }
+        let child = cmd.spawn().expect("spawn fixture app");
+        Fixture {
+            child,
+            title: title.to_string(),
+        }
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// The base64 image block of a reply, if it returned one.
 fn image_block_bytes(r: &Value) -> Option<Vec<u8>> {
     r.get("content")
@@ -257,4 +322,45 @@ fn a_diff_reports_the_scale_and_image_it_returned() {
     assert_eq!(sc.get("total"), Some(&Value::from((W * H) as i64)));
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// SPEC W3.2 (D4): a default capture is lossless, so two captures of a static
+/// window are byte-identical and the reply says which format it used.
+#[test]
+fn default_captures_are_lossless() {
+    if !live() {
+        return;
+    }
+    kill_stale_fixtures("p3c-lossless");
+    let fx = Fixture::spawn("p3c-lossless", None);
+    let mut s = Session::spawn();
+    let shot = serde_json::json!({"window": fx.title});
+    let first = s.result(1, "screenshot", shot.clone());
+    let second = s.result(2, "screenshot", shot);
+    assert_ne!(
+        first.get("isError"),
+        Some(&Value::from(true)),
+        "a default capture of the fixture must succeed, got: {first}"
+    );
+    let sc = sc_of(&first, "default screenshot");
+    let image = sc.get("image").expect("image block");
+    assert_eq!(
+        image.get("format").and_then(|v| v.as_str()),
+        Some("png"),
+        "fmt must default to png, got: {image}"
+    );
+    assert_eq!(
+        image.get("quality"),
+        Some(&Value::Null),
+        "quality has no meaning for the default format, got: {image}"
+    );
+    let a = image_block_bytes(&first).expect("first capture carries its image");
+    let b = image_block_bytes(&second).expect("second capture carries its image");
+    assert_eq!(
+        a,
+        b,
+        "two captures of a static window must be byte-identical ({} vs {} bytes)",
+        a.len(),
+        b.len()
+    );
 }

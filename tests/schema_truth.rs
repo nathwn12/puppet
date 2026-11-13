@@ -433,6 +433,29 @@ fn screenshot_schema_states_real_bounds() {
     }
 }
 
+/// SPEC W3.2 and AMENDMENT-01 A3: the two capture defaults an agent inherits.
+/// Lossless by default (`fmt` is `png`), and the preview clamp stays 1280 on
+/// both capture tools — the native path is the caller's explicit
+/// `max_px:null`, never a raised default.
+#[test]
+fn capture_defaults_are_lossless_and_bounded() {
+    let tools = list_tools();
+    let shot = input_schema(tool(&tools, "screenshot"));
+    assert_eq!(
+        shot["properties"]["fmt"].get("default"),
+        Some(&Value::from("png")),
+        "screenshot.fmt must default to png (W3.2)"
+    );
+    for name in ["screenshot", "diff"] {
+        let schema = input_schema(tool(&tools, name));
+        assert_eq!(
+            schema["properties"]["max_px"].get("default"),
+            Some(&Value::from(1280)),
+            "{name}.max_px must default to 1280 (A3)"
+        );
+    }
+}
+
 #[test]
 fn elements_schema_requires_a_target() {
     let tools = list_tools();

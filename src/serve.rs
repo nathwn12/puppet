@@ -445,16 +445,10 @@ fn call_screenshot(args: &Map<String, Value>) -> String {
             }
         },
     };
-    let fmt_arg_present = !matches!(args.get("fmt"), None | Some(Value::Null));
     let out = opt_str(args, &mut errs, "out");
-    let fmt_default = if out.as_ref().is_some_and(|o| o.is_some()) && !fmt_arg_present {
-        // PNG only when `out` is set and `fmt` is omitted (a diff needs
-        // lossless pixels); otherwise the historical jpeg default stands.
-        "png"
-    } else {
-        "jpeg"
-    };
-    let fmt = req_str(args, &mut errs, "fmt", fmt_default);
+    // W3.2 (D4): every capture path is lossless by default. JPEG is an
+    // explicit request (`fmt:"jpeg"`), never a default a caller inherits.
+    let fmt = req_str(args, &mut errs, "fmt", "png");
     let quality = req_int(args, &mut errs, "quality", 80);
     let grid = req_bool(args, &mut errs, "grid");
     let allow_crop_fallback = req_bool(args, &mut errs, "allow_crop_fallback");

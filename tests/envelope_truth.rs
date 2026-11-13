@@ -869,3 +869,74 @@ fn payload_conforms_to_own_output_schema() {
         schemas.keys().collect::<Vec<_>>()
     );
 }
+
+/// AMENDMENT-01 A4 (and A3's live half): detail is a native region capture,
+/// never an upscale. `max_px:null` returns the crop at `scale:1.0`, the image
+/// is exactly the reported source, and a second identical call is
+/// byte-identical — while the resize branch in `src/cap.rs` stays guarded by
+/// the `>` test that makes an upscale impossible to introduce.
+#[test]
+fn a_native_region_capture_is_scale_one_and_byte_stable() {
+    let mut s = Session::spawn();
+    let mut next_id = {
+        let mut id = 0i64;
+        move || {
+            id += 1;
+            id
+        }
+    };
+    let args = serde_json::json!({
+        "display": -1, "region": [0, 0, 64, 64], "max_px": null, "fmt": "png",
+    });
+    let first = s.result(next_id(), "screenshot", args.clone());
+    assert_eq!(
+        first.get("isError"),
+        Some(&Value::from(false)),
+        "a native region capture must succeed, got: {first}"
+    );
+    let sc = first
+        .get("structuredContent")
+        .expect("structuredContent")
+        .clone();
+    assert_eq!(
+        sc.get("scale").and_then(|v| v.as_f64()),
+        Some(1.0),
+        "max_px:null must not resample, got: {sc}"
+    );
+    let image = sc.get("image").expect("image block");
+    let source = sc.get("source").expect("source block");
+    for k in ["w", "h"] {
+        assert_eq!(
+            image.get(k).and_then(|v| v.as_i64()),
+            source.get(k).and_then(|v| v.as_i64()),
+            "image.{k} must equal source.{k} at scale 1, got: {sc}"
+        );
+    }
+    let image_b64 = |r: &Value| {
+        r.get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|blocks| {
+                blocks
+                    .iter()
+                    .find_map(|b| b.get("data").and_then(|d| d.as_str()))
+            })
+            .map(str::to_string)
+            .expect("capture carries its image")
+    };
+    let second = s.result(next_id(), "screenshot", args);
+    assert_eq!(
+        image_b64(&first),
+        image_b64(&second),
+        "two identical native region captures must be byte-identical"
+    );
+
+    // The guard on the decision: the only resize branch refuses to enlarge.
+    let cap = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cap.rs"),
+    )
+    .expect("src/cap.rs must be readable");
+    assert!(
+        cap.contains("if sw.max(sh) as i64 > m {"),
+        "finalize's resize must stay guarded by the > test (A4: no upscale path)"
+    );
+}
