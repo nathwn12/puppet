@@ -24,6 +24,37 @@ pub struct DiffArgs {
     pub max_px: Option<i64>,
     pub out: Option<String>,
     pub bbox: bool,
+    /// `[[left,top,right,bottom],…]` in native operand pixels.
+    pub mask: Option<Value>,
+}
+
+/// Parse the `mask` input into native-pixel rects. Shape errors are typed
+/// `bad_region`, the same code the frame check uses, so a caller has one
+/// failure to handle for the whole input.
+fn parse_mask(v: &Value) -> Result<Vec<[i64; 4]>, String> {
+    let arr = v.as_array().ok_or_else(|| {
+        format!("error: bad_region: mask must be [[left,top,right,bottom],...] (got {v})")
+    })?;
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let r = item.as_array().ok_or_else(|| {
+            format!("error: bad_region: a mask rect must be [left,top,right,bottom] (got {item})")
+        })?;
+        if r.len() != 4 {
+            return Err(format!(
+                "error: bad_region: a mask rect must have 4 values, got {} in {item}",
+                r.len()
+            ));
+        }
+        let mut rect = [0i64; 4];
+        for (i, x) in r.iter().enumerate() {
+            rect[i] = x.as_i64().ok_or_else(|| {
+                format!("error: bad_region: a mask rect value must be an integer (got {x})")
+            })?;
+        }
+        out.push(rect);
+    }
+    Ok(out)
 }
 
 /// Decode one `diff` operand to RGB pixels and its origin. `{path}` reads a
@@ -200,7 +231,24 @@ pub fn dispatch_diff(a: &DiffArgs) -> String {
         Ok(v) => v,
         Err(e) => return err_payload(vec![("error", Value::from(e))]),
     };
-    let d = match crate::cap::pixel_diff(&base, &next, thr) {
+    // W3.3: the mask is validated against the operand frame — a rect that
+    // leaves it is a typed bad_region, never a silent clamp — and it is
+    // applied before anything is counted.
+    let mask = match a.mask.as_ref() {
+        None => None,
+        Some(v) => {
+            match parse_mask(v).and_then(|rects| crate::cap::Mask::new(&rects, base.w, base.h)) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    return err_payload(vec![
+                        ("code", Value::from("bad_region")),
+                        ("error", Value::from(e)),
+                    ])
+                }
+            }
+        }
+    };
+    let d = match crate::cap::pixel_diff(&base, &next, thr, mask.as_ref()) {
         Ok(d) => d,
         Err(e) => {
             // Typed refusal: both sizes named, no silent scale. The images
@@ -234,6 +282,7 @@ pub fn dispatch_diff(a: &DiffArgs) -> String {
     payload.insert("changed".to_string(), Value::from(d.changed));
     payload.insert("total".to_string(), Value::from(d.total));
     payload.insert("ratio".to_string(), Value::from(d.ratio));
+    payload.insert("masked_px".to_string(), Value::from(d.masked));
     payload.insert(
         "bbox".to_string(),
         match (a.bbox, d.bbox) {
@@ -311,7 +360,7 @@ pub fn dispatch_diff(a: &DiffArgs) -> String {
     // Changed: the red-over-dimmed visualization, long-edge clamped for
     // the wire (full-res pixels decided the counts above, never the
     // clamped ones).
-    let viz = match diff_image(&base, &next, thr) {
+    let viz = match diff_image(&base, &next, thr, mask.as_ref()) {
         Ok(im) => im,
         Err(e) => return err_payload(vec![("error", Value::from(e))]),
     };
@@ -500,6 +549,7 @@ mod tests {
             max_px: None,
             out: None,
             bbox: true,
+            mask: None,
         });
         assert_eq!(sc.get("identical"), Some(&Value::from(true)));
         assert_eq!(sc.get("changed"), Some(&Value::from(0)));
@@ -520,6 +570,7 @@ mod tests {
             max_px: None,
             out: None,
             bbox: true,
+            mask: None,
         });
         assert_eq!(sc2.get("identical"), Some(&Value::from(false)));
         assert_eq!(sc2.get("changed"), Some(&Value::from(1)));

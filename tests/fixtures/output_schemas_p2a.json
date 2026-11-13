@@ -89,6 +89,9 @@
       },
       "warnings": {
         "type": "array"
+      },
+      "masked_px": {
+        "type": "integer"
       }
     },
     "required": [

@@ -431,3 +431,126 @@ fn a_clamp_that_altered_the_request_says_so() {
         "a default capture must carry no warnings key, got: {sc}"
     );
 }
+
+/// SPEC W3.3: a diff can exclude a region, so a caret blink or a clock does
+/// not force `changed` as the default verdict. Masked pixels leave the counts,
+/// the ratio and the box, and are reported as `masked_px`.
+#[test]
+fn a_diff_can_exclude_a_region() {
+    let dir = temp_dir("diff-mask");
+    let base_p = dir.join("base.png");
+    let next_p = dir.join("next.png");
+    const W: u32 = 100;
+    const H: u32 = 100;
+    let grey = vec![90u8; (W * H * 3) as usize];
+    let mut altered = grey.clone();
+    // One 10x10 block at (20,30): the "caret".
+    for y in 30..40u32 {
+        for x in 20..30u32 {
+            let i = ((y * W + x) * 3) as usize;
+            altered[i] = 255;
+            altered[i + 1] = 255;
+            altered[i + 2] = 255;
+        }
+    }
+    write_png(&base_p, W, H, &grey);
+    write_png(&next_p, W, H, &altered);
+    let mut s = Session::spawn();
+
+    // The whole change is inside the mask: identical, nothing changed, and the
+    // exclusion is visible in the reply.
+    let r = s.result(
+        1,
+        "diff",
+        serde_json::json!({
+            "base": path_operand(&base_p), "next": path_operand(&next_p),
+            "mask": [[20, 30, 30, 40]],
+        }),
+    );
+    assert_ne!(
+        r.get("isError"),
+        Some(&Value::from(true)),
+        "a masked diff must succeed, got: {r}"
+    );
+    let sc = sc_of(&r, "masked diff");
+    assert_eq!(
+        sc.get("identical"),
+        Some(&Value::from(true)),
+        "a change only inside the mask must not count, got: {sc}"
+    );
+    assert_eq!(sc.get("changed"), Some(&Value::from(0)));
+    assert_eq!(
+        sc.get("masked_px"),
+        Some(&Value::from(100)),
+        "the rect's area is reported as masked, got: {sc}"
+    );
+    assert_eq!(
+        sc.get("total"),
+        Some(&Value::from((W * H - 100) as i64)),
+        "total is the unmasked total, got: {sc}"
+    );
+    assert_eq!(sc.get("ratio"), Some(&Value::from(0.0)));
+    assert_eq!(sc.get("bbox"), Some(&Value::Null));
+    assert!(
+        image_block_bytes(&r).is_none(),
+        "an identical diff returns no image block"
+    );
+
+    // Overlapping rects union silently: 100 + 100 - 25.
+    let r = s.result(
+        2,
+        "diff",
+        serde_json::json!({
+            "base": path_operand(&base_p), "next": path_operand(&base_p),
+            "mask": [[0, 0, 10, 10], [5, 5, 15, 15]],
+        }),
+    );
+    let sc = sc_of(&r, "overlapping mask");
+    assert_eq!(
+        sc.get("masked_px"),
+        Some(&Value::from(175)),
+        "overlapping rects must union, not sum, got: {sc}"
+    );
+    assert_eq!(sc.get("total"), Some(&Value::from((W * H - 175) as i64)));
+
+    // A change outside the mask still counts, in native pixels.
+    let r = s.result(
+        3,
+        "diff",
+        serde_json::json!({
+            "base": path_operand(&base_p), "next": path_operand(&next_p),
+            "mask": [[0, 0, 10, 10]],
+        }),
+    );
+    let sc = sc_of(&r, "masked elsewhere");
+    assert_eq!(sc.get("identical"), Some(&Value::from(false)));
+    assert_eq!(sc.get("changed"), Some(&Value::from(100)));
+    assert_eq!(
+        sc.get("bbox"),
+        Some(&serde_json::json!([20, 30, 10, 10])),
+        "the box stays native and excludes the mask, got: {sc}"
+    );
+
+    // A rect outside the frame is a typed refusal, never a silent clamp.
+    let r = s.result(
+        4,
+        "diff",
+        serde_json::json!({
+            "base": path_operand(&base_p), "next": path_operand(&next_p),
+            "mask": [[90, 90, 120, 120]],
+        }),
+    );
+    assert_eq!(
+        r.get("isError"),
+        Some(&Value::from(true)),
+        "a mask rect outside the frame must refuse, got: {r}"
+    );
+    let sc = sc_of(&r, "mask outside frame");
+    assert_eq!(
+        sc.get("code").and_then(|v| v.as_str()),
+        Some("bad_region"),
+        "the refusal must be typed bad_region, got: {sc}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

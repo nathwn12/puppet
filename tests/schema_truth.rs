@@ -689,10 +689,12 @@ fn no_description_documents_a_code_that_never_existed() {
 
 /// SPEC W1.4: each `TOOL_*` const stays under its budget, and the whole
 /// surface under their sum. Measured on the consts the server serves, not on
-/// a re-serialisation of them.
+/// a re-serialisation of them. AMENDMENT-02 raised `diff` from 2 400 to
+/// 2 800 so the W3 mask and scale contract fits without deleting a claim;
+/// the sum is unchanged.
 const TOOL_BUDGETS: [(&str, usize); 7] = [
     ("screenshot", 4000),
-    ("diff", 2400),
+    ("diff", 2800),
     ("list_windows", 1400),
     ("window", 3000),
     ("do", 12000),

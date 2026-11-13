@@ -3826,7 +3826,7 @@ pub fn do_burst(args: &DoArgs) -> String {
                     }
                 };
                 let before = before.expect("verify:true captured before");
-                match crate::cap::pixel_diff(&before, &after, 0) {
+                match crate::cap::pixel_diff(&before, &after, 0, None) {
                     Ok(diff) => {
                         d.insert(
                             "effect".to_string(),
@@ -4002,7 +4002,7 @@ pub fn do_burst(args: &DoArgs) -> String {
                     }
                 };
                 let before = before.expect("verify:true captured before");
-                match crate::cap::pixel_diff(&before, &after, 0) {
+                match crate::cap::pixel_diff(&before, &after, 0, None) {
                     Ok(diff) => {
                         d.insert(
                             "effect".to_string(),

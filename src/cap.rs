@@ -985,13 +985,75 @@ pub struct PixelDiff {
     /// Union box of changed pixels as [x,y,w,h], None when identical.
     pub bbox: Option<[i64; 4]>,
     pub identical: bool,
+    /// Pixels the mask excluded from every count above.
+    pub masked: i64,
+}
+
+/// A native-pixel exclusion mask for a diff: `[left,top,right,bottom]` rects
+/// in the operand's own pixel grid, half-open like `region`. Overlapping
+/// rects union silently; a rect that leaves the frame or has no area is a
+/// typed `bad_region`, never a silent clamp.
+pub struct Mask {
+    w: i32,
+    bits: Vec<bool>,
+    count: i64,
+}
+
+impl Mask {
+    pub fn new(rects: &[[i64; 4]], w: i32, h: i32) -> Result<Mask, String> {
+        if w <= 0 || h <= 0 {
+            return Err(format!(
+                "error: bad_region: mask needs a {w}x{h} frame to mask"
+            ));
+        }
+        let mut bits = vec![false; (w as usize) * (h as usize)];
+        let mut count = 0i64;
+        for &[l, t, r, b] in rects.iter() {
+            if l < 0 || t < 0 || r > w as i64 || b > h as i64 {
+                return Err(format!(
+                    "error: bad_region: mask rect [{l},{t},{r},{b}] is outside the {w}x{h} frame"
+                ));
+            }
+            if r <= l || b <= t {
+                return Err(format!(
+                    "error: bad_region: mask rect [{l},{t},{r},{b}] is empty (need right>left and bottom>top)"
+                ));
+            }
+            for y in t..b {
+                let row = y as usize * w as usize;
+                for x in l..r {
+                    let i = row + x as usize;
+                    if !bits[i] {
+                        bits[i] = true;
+                        count += 1;
+                    }
+                }
+            }
+        }
+        Ok(Mask { w, bits, count })
+    }
+
+    /// Pixels this mask excludes (the union, not the sum).
+    pub fn count(&self) -> i64 {
+        self.count
+    }
+
+    fn covers(&self, x: i64, y: i64) -> bool {
+        self.bits[y as usize * self.w as usize + x as usize]
+    }
 }
 
 /// Per-pixel compare: a pixel counts when its largest per-channel
 /// absolute delta exceeds `threshold` (0-255, default 0). Dimensions must
 /// already match; a mismatch is a typed refusal that names both sizes —
-/// never a silent scale.
-pub fn pixel_diff(base: &Img, next: &Img, threshold: u8) -> Result<PixelDiff, String> {
+/// never a silent scale. Masked pixels are excluded from `changed`, `total`,
+/// `ratio` and `bbox`, and reported in `masked`.
+pub fn pixel_diff(
+    base: &Img,
+    next: &Img,
+    threshold: u8,
+    mask: Option<&Mask>,
+) -> Result<PixelDiff, String> {
     if base.w != next.w || base.h != next.h {
         return Err(format!(
             "error: size_mismatch: base {}x{} vs next {}x{} (same pixel dimensions required; refusing to scale silently)",
@@ -1004,6 +1066,10 @@ pub fn pixel_diff(base: &Img, next: &Img, threshold: u8) -> Result<PixelDiff, St
     let (mut x1, mut y1) = (-1i64, -1i64);
     let w = base.w as usize;
     for p in 0..n {
+        let (x, y) = ((p % w) as i64, (p / w) as i64);
+        if mask.is_some_and(|m| m.covers(x, y)) {
+            continue;
+        }
         let mut d: u8 = 0;
         for c in 0..3 {
             let a = base.px[3 * p + c];
@@ -1015,7 +1081,6 @@ pub fn pixel_diff(base: &Img, next: &Img, threshold: u8) -> Result<PixelDiff, St
         }
         if d > threshold {
             changed += 1;
-            let (x, y) = ((p % w) as i64, (p / w) as i64);
             if x < x0 {
                 x0 = x;
             }
@@ -1030,7 +1095,8 @@ pub fn pixel_diff(base: &Img, next: &Img, threshold: u8) -> Result<PixelDiff, St
             }
         }
     }
-    let total = n as i64;
+    let masked = mask.map(Mask::count).unwrap_or(0);
+    let total = n as i64 - masked;
     let identical = changed == 0;
     Ok(PixelDiff {
         changed,
@@ -1046,13 +1112,21 @@ pub fn pixel_diff(base: &Img, next: &Img, threshold: u8) -> Result<PixelDiff, St
             Some([x0, y0, x1 - x0 + 1, y1 - y0 + 1])
         },
         identical,
+        masked,
     })
 }
 
 /// Diff visualization: changed pixels solid red over a dimmed greyscale
 /// copy of `base` (same 299/587/114 weights as `detector_verdict`'s gray,
-/// dimmed 3/5 so red reads against it). Same-dimension input only.
-pub fn diff_image(base: &Img, next: &Img, threshold: u8) -> Result<Img, String> {
+/// dimmed 3/5 so red reads against it). Same-dimension input only. A masked
+/// pixel is never painted red: the counts exclude it, so the picture must
+/// too, or the visualization would claim a change the numbers deny.
+pub fn diff_image(
+    base: &Img,
+    next: &Img,
+    threshold: u8,
+    mask: Option<&Mask>,
+) -> Result<Img, String> {
     if base.w != next.w || base.h != next.h {
         return Err(format!(
             "error: size_mismatch: base {}x{} vs next {}x{} (same pixel dimensions required; refusing to scale silently)",
@@ -1060,14 +1134,17 @@ pub fn diff_image(base: &Img, next: &Img, threshold: u8) -> Result<Img, String> 
         ));
     }
     let n = (base.w as usize) * (base.h as usize);
+    let w = base.w as usize;
     let mut px = vec![0u8; n * 3];
     for p in 0..n {
         let (r, g, b) = (base.px[3 * p], base.px[3 * p + 1], base.px[3 * p + 2]);
         let mut d: u8 = 0;
-        for c in 0..3 {
-            let dd = base.px[3 * p + c].abs_diff(next.px[3 * p + c]);
-            if dd > d {
-                d = dd;
+        if !mask.is_some_and(|m| m.covers((p % w) as i64, (p / w) as i64)) {
+            for c in 0..3 {
+                let dd = base.px[3 * p + c].abs_diff(next.px[3 * p + c]);
+                if dd > d {
+                    d = dd;
+                }
             }
         }
         if d > threshold {
@@ -1234,7 +1311,7 @@ mod tests {
         let b = solid_rgb(10, 10, 60, 120, 200);
         let da = decode_png(&encode_png(&a).expect("encode a")).expect("decode a");
         let db = decode_png(&encode_png(&b).expect("encode b")).expect("decode b");
-        let d = pixel_diff(&da, &db, 0).expect("same sizes diff");
+        let d = pixel_diff(&da, &db, 0, None).expect("same sizes diff");
         assert!(d.identical, "identical PNGs must be identical");
         assert_eq!(d.changed, 0);
         assert_eq!(d.total, 100);
@@ -1256,7 +1333,7 @@ mod tests {
         }
         let db = decode_png(&encode_png(&base).expect("encode base")).expect("decode base");
         let dn = decode_png(&encode_png(&altered).expect("encode next")).expect("decode next");
-        let d = pixel_diff(&db, &dn, 0).expect("same sizes diff");
+        let d = pixel_diff(&db, &dn, 0, None).expect("same sizes diff");
         assert!(!d.identical);
         assert_eq!(d.changed, 9);
         assert_eq!(d.bbox, Some([4, 2, 3, 3]));
@@ -1266,7 +1343,7 @@ mod tests {
     fn diff_size_mismatch_names_both_sizes() {
         let a = solid_rgb(4, 4, 1, 2, 3);
         let b = solid_rgb(5, 4, 1, 2, 3);
-        let e = pixel_diff(&a, &b, 0).expect_err("different widths must refuse");
+        let e = pixel_diff(&a, &b, 0, None).expect_err("different widths must refuse");
         assert!(
             e.contains("size_mismatch"),
             "refusal must be typed size_mismatch, got: {e}"
@@ -1276,7 +1353,7 @@ mod tests {
             "refusal must name both sizes, got: {e}"
         );
         let c = solid_rgb(4, 6, 1, 2, 3);
-        let e2 = pixel_diff(&a, &c, 0).expect_err("different heights must refuse");
+        let e2 = pixel_diff(&a, &c, 0, None).expect_err("different heights must refuse");
         assert!(e2.contains("size_mismatch"), "got: {e2}");
         assert!(e2.contains("4x4") && e2.contains("4x6"), "got: {e2}");
     }

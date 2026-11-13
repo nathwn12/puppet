@@ -484,7 +484,7 @@ fn call_diff(args: &Map<String, Value>) -> String {
     check_no_extra(
         args,
         &mut errs,
-        &["base", "next", "threshold", "max_px", "out", "bbox"],
+        &["base", "next", "threshold", "max_px", "out", "bbox", "mask"],
     );
     let base = match args.get("base") {
         None => {
@@ -543,6 +543,12 @@ fn call_diff(args: &Map<String, Value>) -> String {
         max_px: max_px.unwrap(),
         out: out.unwrap(),
         bbox: bbox.unwrap(),
+        // Validated in `diff`: a rect outside the operand frame is a typed
+        // bad_region, which needs the frame the operands resolved to.
+        mask: match args.get("mask") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(v.clone()),
+        },
     })
 }
 
