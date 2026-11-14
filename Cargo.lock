@@ -145,7 +145,7 @@ dependencies = [
 
 [[package]]
 name = "puppet"
-version = "7.0.2"
+version = "8.0.0"
 dependencies = [
  "base64",
  "jpeg-encoder",
