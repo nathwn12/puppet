@@ -7,12 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (breaking)
+- `do` element mutations now require `expect_fp`: `invoke` and `click` with an
+  element and no fingerprint refuse `expect_fp_required` (returning the fresh
+  fingerprint for a one-call retry) instead of acting, and a mismatch keeps
+  refusing `stale_ref`. A 7.0.2 call that omitted the field and succeeded now
+  fails. (`set_value` and `type` with an element still refuse
+  `background_unavailable` first, unchanged; element `scroll` stays
+  stale-only.)
+- `screenshot` captures losslessly by default: `fmt` defaults to `png` (was
+  `jpeg` unless `out` was set). Callers that omitted `fmt` and sized, stored,
+  or diffed JPEG responses now receive PNG bytes (`image.format:"png"`,
+  `quality:null`). JPEG needs an explicit `fmt:"jpeg"`.
+
+Only the two breaks above ship in 8.0.0. The effect-vocabulary rename and the
+`window:close` verification named in the frozen plan are deferred, not
+shipped, and nothing below claims them.
+
 ### Added
 - A payload-vs-schema conformance gate: one `tools/call` per listed tool, each
   `structuredContent` validated against that tool's own declared
   `outputSchema` (`scripts/conformance-check.mjs` over
   `tests/envelope_truth.rs`), so a payload that violates its own schema fails
   the build instead of shipping. `ci.yml` runs the same conformance binary.
+- The served contract is generated from a single claims source (`src/claims.rs`):
+  the seven tool lines, the coordinate rule, the refusal table, the error
+  codes, the invariants and the limits. Refusals name only recoveries that can
+  succeed, dead verbs are documented as refused, and per-tool byte budgets keep
+  `tools/list` in one page.
+- An element `wait_for` reports `satisfied_by{selector,fp,path}` for the control
+  that won (null when nothing won, never an error); the element fingerprint is
+  documented as identity, never state.
+- `diff` reports the image it compared (`image`, `scale`, `bbox_space`) and
+  accepts a `mask` excluded from the counts (`masked_px`); `screenshot` reports
+  the blank-frame measurement (`blank_check`); captures disclose a clamp that
+  altered the request.
 
 ### Changed
 - Refresh compatible locked dependencies, including crc32fast 1.5.4, flate2
@@ -52,6 +81,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Docs: `docs/GUIDE.md:3` states the real tool count (seven); the README links
   `THIRD-PARTY-NOTICES.md` and the notices file ships with it; both READMEs
   carry the house footer and signature.
+- A timed-out helper thread no longer leaks a kernel handle: the timeout arm
+  detaches instead of setting the handle aside, and a helper that later returns
+  leaves nothing behind (isolated differential test).
+- `set_value` reports `background_unavailable` whatever the flag: the verb's own
+  refusal now runs before the `allow_foreground` pre-check.
+- `do` reports a wait's winner only while the selector still matches it, so an
+  enabled wait satisfied by a same-named replacement names the actual winner.
 
 ## [7.0.1] - 2026-11-03
 
