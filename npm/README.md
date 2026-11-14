@@ -49,7 +49,7 @@ the version it is running.
 ## Overrides
 
 Use `npx puppet-mcp@latest`; a pinned version is only installable while its
-GitHub release exists; the one-release policy deletes older releases.
+GitHub release exists.
 
 Redirect the cache with `PUPPET_ENGINE_CACHE`, or inspect the pin with no
 network access (`--print-manifest` is an alias for `--doctor` above).

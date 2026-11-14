@@ -1,10 +1,8 @@
 <p align="center">
   <img src="assets/icon.svg" width="120" height="120" alt="puppet icon" />
 </p>
-
-# puppet
-
-Screenshot, list, and drive Windows windows for your agents over MCP stdio. Background-safe by default: no stolen focus, pointer, or keyboard.
+<h1 align="center">puppet</h1>
+<p align="center"><strong>Screenshot, list, and drive Windows windows over MCP stdio without stealing focus, moving the pointer, or writing the clipboard.</strong></p>
 
 ## Install
 
@@ -53,17 +51,14 @@ cargo test --locked
 
 ## Status
 
-Experimental and still moving. It works today, but it is not a finished
-product: interfaces may change, features may be improved or removed, and a
-release can break the one before it. This is maintained by one person, not a
-team. If it breaks, open an issue with the command you ran and what you saw.
+**Active** — maintained, issues welcome.
 
 ## Links
 
 - [Guide](docs/GUIDE.md)
 - [Releases](https://github.com/nathwn12/puppet/releases)
-- [MIT](LICENSE)
 - [Third-party notices](THIRD-PARTY-NOTICES.md)
+- [MIT](LICENSE)
 
 <!-- nathwn12 house footer: identical in every repo. Do not edit. -->
 <p align="center">

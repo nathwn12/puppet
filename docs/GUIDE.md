@@ -28,8 +28,7 @@ launcher, the manifest and the cached engine leaf fails closed **before** any do
 spawn — a stale cache path (for example via an override) is refused, never run. A
 mismatched hash writes nothing.
 
-The pin is one release deep: the release workflow deletes older releases, so a pinned
-version is only installable while its GitHub release still exists. `@latest` is the
+A pin is installable only while its GitHub release exists. `@latest` is the
 supported install; a pin is a reproducibility aid, not a long-term address. There is no
 fully offline fresh install — the first serve run still downloads.
 
