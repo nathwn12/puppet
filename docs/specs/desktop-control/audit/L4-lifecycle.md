@@ -2,6 +2,10 @@
 
 Repo: `Q:\PROJECTS\PERSONAL\puppet`, HEAD `8eb1c2d` (`git log --oneline -20` checked; status: only `README.md` modified + untracked `scripts/npm-passkey.mjs`). Rust `puppet` 7.0.2, Windows-only, one long-lived stdio MCP process, 4 workers (`serve.rs`), + helper threads via `deadline::bound`. No build/run performed.
 
+Historical audit: the helper-handle finding below describes that HEAD, not the
+current implementation. Commit `d7a78f3` detaches timed-out helpers without
+retaining their handles; a helper still holds resources while it remains hung.
+
 ## Verdict in one screen
 
 - Hung-window wedge is **already closed on the paths that matter**: `SendMessageTimeoutW/SMTO_ABORTIFHUNG+2s` in `burst.rs:2055`, and `deadline::bound` (helper-thread + 5 s UIA / 10 s capture) over `uia_element_list/activate/set_value/scroll/expand`, `uia_is_enabled`, `capture_window` (`uia.rs:781,820,879,1031,1125,1177,1264,1366`; `shot.rs:127`). What the agent sees is a **typed** `uia_timeout`/`capture_timeout` — not a dead turn.

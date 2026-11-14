@@ -77,7 +77,7 @@ new decision and needs a new spec.
 | Pointers to sibling servers (`gladius`, `oc-rea`) | L5/§7 | L5 is right that a hit `background_unavailable` has no first-party next step. Routing doctrine belongs to the harness that dispatches, not to a tool description that ships to every MCP client. |
 | Stale timeout string in the hidden launcher | L4/§7 adjacent | A message that says 15 s while the code waits 20 s. Cosmetic, not agent-facing, and this spec touches no claim an agent branches on. Named here so it is not rediscovered as new. |
 | `wait_for stable` region default (foreground monitor) | L2/§4 | Documented behaviour, not a defect. Changing it would silently widen every existing `stable` wait. |
-| The helper-thread stack leak per timeout | L4/§1 | Documented trade (`src/deadline.rs:28-31`) and the accepted price of keeping the worker pool alive. |
+| Resources held by a timed-out helper | L4/§1 | A still-running helper retains its stack and thread resources; detaching releases them when it returns (`src/deadline.rs`). |
 | WOW64 / 32-bit build assertion | L4/§6 | No 32-bit artifact ships; the guard would protect a build that does not exist. |
 | Retry pacing, `verify_capture` retry bound, tail latency | L4/§1 | Inside the budget by construction. |
 
