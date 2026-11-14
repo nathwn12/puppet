@@ -27,9 +27,14 @@
 //!
 //! On timeout the helper is abandoned, never joined: it stays parked inside
 //! the blocking call and unwinds its own COM objects on the thread that made
-//! them whenever (if ever) the call returns. That leaks one thread stack per
-//! timed-out call — the price of keeping the worker pool alive. Abandoning a
-//! mutation also means its effect is unverified, which the message says.
+//! them whenever (if ever) the call returns. Abandoning means *detaching*, so
+//! the timeout arm lets the thread handle fall away rather than setting it
+//! aside: while a helper is still parked it costs its thread stack and one
+//! kernel handle, and the OS releases both when it returns. Nothing outlives
+//! it. Keeping the handle instead would pin one kernel thread object (and its
+//! packet allocation) per timed-out call for the life of the process.
+//! Abandoning a mutation also means its effect is unverified, which the message
+//! says.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -194,9 +199,11 @@ where
             Ok(v)
         }
         Err(RecvTimeoutError::Timeout) => {
-            // Deliberately not joined: joining is the wedge. The thread owns
-            // every COM object it created and releases them itself.
-            std::mem::forget(handle);
+            // Deliberately not joined: joining is the wedge. Dropping the
+            // handle is what detaches (it never blocks); the thread owns every
+            // COM object it created and releases them itself, and the OS frees
+            // its stack and kernel handle when it returns.
+            drop(handle);
             Err(timeout_text(f, op, limit))
         }
         Err(RecvTimeoutError::Disconnected) => {

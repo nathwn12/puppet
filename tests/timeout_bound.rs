@@ -56,11 +56,21 @@ struct Session {
 
 impl Session {
     fn spawn() -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_puppet"))
-            .env("PUPPET_UIA_TIMEOUT_MS", UIA_DEADLINE_MS.to_string())
-            .env("PUPPET_TEST_STALL_UIA_MS", STALL_MS.to_string())
-            .env("PUPPET_CAPTURE_TIMEOUT_MS", CAPTURE_DEADLINE_MS.to_string())
-            .env("PUPPET_TEST_STALL_CAPTURE_MS", STALL_MS.to_string())
+        Self::spawn_with_stall(true)
+    }
+
+    /// The same child with the same deadlines; `stall` decides whether the
+    /// test-only stall hooks are armed. `false` is the control arm of a
+    /// differential run: identical sequence, no overrun.
+    fn spawn_with_stall(stall: bool) -> Self {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_puppet"));
+        cmd.env("PUPPET_UIA_TIMEOUT_MS", UIA_DEADLINE_MS.to_string())
+            .env("PUPPET_CAPTURE_TIMEOUT_MS", CAPTURE_DEADLINE_MS.to_string());
+        if stall {
+            cmd.env("PUPPET_TEST_STALL_UIA_MS", STALL_MS.to_string())
+                .env("PUPPET_TEST_STALL_CAPTURE_MS", STALL_MS.to_string());
+        }
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -292,6 +302,82 @@ fn capture_times_out_typed_and_the_worker_recovers() {
     assert!(
         second_elapsed < Duration::from_millis(CAPTURE_DEADLINE_MS),
         "the recovered capture must not wait for a deadline: {second_elapsed:?}"
+    );
+}
+
+// --- the abandoned helper's own bookkeeping -------------------------------
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetProcessHandleCount(process: *mut core::ffi::c_void, count: *mut u32) -> i32;
+}
+
+/// Open kernel handles in the child, read through the handle this process
+/// already holds for it: no `OpenProcess`, so sampling adds nothing to the
+/// count it reads.
+fn handle_count(child: &Child) -> i64 {
+    use std::os::windows::io::AsRawHandle;
+    let mut n: u32 = 0;
+    let ok = unsafe { GetProcessHandleCount(child.as_raw_handle() as *mut _, &mut n) };
+    assert_eq!(ok, 1, "GetProcessHandleCount failed for the child");
+    i64::from(n)
+}
+
+/// A helper abandoned on timeout, which then returns and exits, must leave no
+/// handle behind: a child that times out and a child that does not run the
+/// identical sequence, so the two must book-keep identically.
+///
+/// Same two arms rather than an absolute count: `cargo test` runs targets
+/// concurrently and every UIA call lazily initialises (tens of handles), so a
+/// lone number is noise. Both arms pay that same cost and are sampled the same
+/// way, so the only difference left is the timeout's own bookkeeping. The
+/// sampling happens after `STALL_MS` plus a margin, i.e. after the abandoned
+/// helper's stall has expired and its thread has exited.
+#[test]
+fn a_returned_helper_leaves_no_handle_behind() {
+    if !live() {
+        return;
+    }
+    let fx = Fixture::spawn("timeout-bound-handle");
+    std::thread::sleep(Duration::from_millis(600));
+    let title = fx.title.clone();
+
+    fn retained(title: &str, stall: bool) -> i64 {
+        let mut s = Session::spawn_with_stall(stall);
+        let before = handle_count(&s.child);
+        // First walk: overruns the deadline only in the stall arm.
+        let (first, _) = s.timed_call(1, "elements", serde_json::json!({"title": title}));
+        let first_text = raw_text(&first);
+        if stall {
+            assert!(
+                first_text.contains("error: uia_timeout"),
+                "the stall arm must time out, got: {first_text}"
+            );
+        } else {
+            assert!(
+                !first_text.contains("uia_timeout"),
+                "the control arm must not time out, got: {first_text}"
+            );
+        }
+        // Second walk: consumes nothing in the stall arm (the hook is one-shot)
+        // and proves the worker survived; it also warms UIA in the control arm.
+        let (second, _) = s.timed_call(2, "elements", serde_json::json!({"title": title}));
+        assert!(
+            !raw_text(&second).contains("uia_timeout"),
+            "the worker must be usable after the first walk, got: {}",
+            raw_text(&second)
+        );
+        std::thread::sleep(Duration::from_millis(STALL_MS + 2700));
+        handle_count(&s.child) - before
+    }
+
+    let timed_out = retained(&title, true);
+    let control = retained(&title, false);
+    println!("HANDLE_DIFFERENTIAL_OK stall={timed_out} control={control}");
+    assert_eq!(
+        timed_out, control,
+        "a timeout that later returns must not retain a handle: the timed-out child \
+         ended {timed_out} handles above its own baseline, the control arm {control}"
     );
 }
 
