@@ -206,6 +206,13 @@ check("publish-reads-derived-tag", () => {
   return "publish tags v${{ needs.build.outputs.version }}";
 });
 
+check("retain-historical-releases", () => {
+  const cleanup = publishSteps.find((s) => /delete outgoing releases/i.test(s.name ?? ""));
+  need(!cleanup, "publish must retain historical releases and their runtime assets");
+  need(!/gh release delete/.test(publish), "publish runs gh release delete");
+  return "historical releases and runtime assets are retained";
+});
+
 const w = (s, n) => s.padEnd(n);
 console.log(`${w("INVARIANT", 30)}${w("RESULT", 8)}DETAIL`);
 for (const [name, ok, detail] of rows) console.log(`${w(name, 30)}${w(ok, 8)}${detail}`);
