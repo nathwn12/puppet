@@ -32,3 +32,9 @@ updates:
         update-types:
           - "minor"
           - "patch"
+
+    ignore:
+      # Upstream ships branch refs that are not real Rust releases (1.120.0).
+      # Dependabot reads them as versions and rustup 404s, so the toolchain pin
+      # is held by hand against the crate MSRV instead.
+      - dependency-name: "dtolnay/rust-toolchain"
