@@ -60,7 +60,6 @@ jobs:
         if: steps.scope.outputs.code == 'true'
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: gitleaks
-        if: steps.scope.outputs.code == 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
