@@ -257,13 +257,12 @@ jobs:
           if ((Get-Content npm/engine-manifest.json -Raw) -match 'RELEASE_WORKFLOW_FILLS_THIS') { throw 'refusing to stage npm package with placeholder hashes' }
           New-Item -ItemType Directory -Path npm-stage -Force | Out-Null
           Copy-Item npm/bin npm-stage/bin -Recurse -Force
-          # npm/README.md embeds assets/signature.svg and links
-          # THIRD-PARTY-NOTICES.md, so both ride the tarball: a published
-          # README that references a file the tarball does not contain is the
-          # exact defect this stage list exists to prevent.
-          Copy-Item npm/assets npm-stage/assets -Recurse -Force
+          # npm/README.md links THIRD-PARTY-NOTICES.md, so it rides the
+          # tarball: a published README that references a file the tarball
+          # does not contain is the exact defect this stage list exists to
+          # prevent.
           Copy-Item npm/package.json, npm/engine-manifest.json, npm/LICENSE, npm/README.md, THIRD-PARTY-NOTICES.md npm-stage/ -Force
-          $stageFiles = @('package.json', 'engine-manifest.json', 'LICENSE', 'README.md', 'THIRD-PARTY-NOTICES.md', 'assets\signature.svg', 'bin\puppet-mcp.js')
+          $stageFiles = @('package.json', 'engine-manifest.json', 'LICENSE', 'README.md', 'THIRD-PARTY-NOTICES.md', 'bin\puppet-mcp.js')
           foreach ($f in $stageFiles) {
             if (-not (Test-Path -LiteralPath (Join-Path npm-stage $f))) { throw "npm package stage is missing $f" }
           }
