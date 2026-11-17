@@ -6,6 +6,7 @@
 # answer — except the single conformance binary, which is the check that
 # stops a schema-violating payload ever reaching a release. Job name
 # `build` is the required check — do not rename.
+# Docs-only change (*.md, docs/, LICEN[CS]E) keeps the required check green in seconds and runs no build.
 name: ci
 on:
   push:
@@ -23,18 +24,43 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Detect a docs-only change
+        id: scope
+        shell: bash
+        run: |
+          docs='^(.*\.md|docs/.*|LICEN[CS]E(\.md)?)$'
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+            changed=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD")
+          elif [ "${{ github.event_name }}" = "push" ] && [ -n "${{ github.event.before }}" ]; then
+            changed=$(git diff --name-only "${{ github.event.before }}" HEAD || true)
+          else
+            changed=$(git ls-files)
+          fi
+          if [ -n "$changed" ] && ! printf '%s\n' "$changed" | grep -qvE "$docs"; then
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          fi
       - uses: dtolnay/rust-toolchain@1.87.0
+        if: steps.scope.outputs.code == 'true'
         with:
           toolchain: 1.87.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        if: steps.scope.outputs.code == 'true'
         with:
           key: ci-1.87.0
       - name: fmt
+        if: steps.scope.outputs.code == 'true'
         run: cargo fmt --all --check
       - name: clippy
+        if: steps.scope.outputs.code == 'true'
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: gitleaks
+        if: steps.scope.outputs.code == 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -47,6 +73,12 @@ jobs:
           Expand-Archive -Path $Zip -DestinationPath $Dir
           & (Join-Path $Dir 'gitleaks.exe') detect --source . --config .gitleaks.toml --redact --no-banner
       - name: check (compile, no link)
+        if: steps.scope.outputs.code == 'true'
         run: cargo check --locked
       - name: conformance (payload vs own outputSchema)
+        if: steps.scope.outputs.code == 'true'
         run: cargo test --release --locked --test envelope_truth
+      - name: Scope
+        if: always()
+        run: |
+          echo "scope: ${{ steps.scope.outputs.code == 'true' && 'code changed - the full gate ran' || 'docs-only - build skipped, the check stays green' }}"
