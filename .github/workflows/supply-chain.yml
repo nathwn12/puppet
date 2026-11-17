@@ -8,6 +8,11 @@ on:
 
 permissions:
   contents: read
+  # rustsec/audit-check reports through the API rather than the exit code: a
+  # check run on workflow_dispatch, an issue on the weekly schedule. Without
+  # these the audit completes and then fails to publish its result.
+  checks: write
+  issues: write
 
 concurrency:
   group: supply-chain
@@ -18,6 +23,15 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
+      # The action compiles cargo-audit, whose own MSRV is newer than this
+      # crate's rust-toolchain.toml pin. Only the audit job moves; the crate's
+      # MSRV stays what ci.yml and rust-toolchain.toml say it is.
+      - uses: dtolnay/rust-toolchain@stable
       - uses: rustsec/audit-check@v2.0.0
+        env:
+          # rust-toolchain.toml outranks the default toolchain, and this
+          # outranks the file, so cargo install and cargo audit both use
+          # stable instead of the pinned channel.
+          RUSTUP_TOOLCHAIN: stable
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
