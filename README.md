@@ -85,6 +85,8 @@ cargo test --locked
 
 The toolchain is pinned by `rust-toolchain.toml`. `cargo fmt --all --check` and `cargo clippy --all-targets --locked -- -D warnings` are the static gate. `PUPPET_LIVE_DESKTOP=1` enables the live-gated tests, which skip cleanly without it. The `do` burst is in [docs/GUIDE.md](docs/GUIDE.md), the hidden-desktop mode in [docs/HEADLESS.md](docs/HEADLESS.md), and the release lane in [docs/PUBLISHING.md](docs/PUBLISHING.md).
 
+CI runs `fmt`, `clippy`, `gitleaks`, `cargo check` and the single conformance binary. A change that only touches Markdown, `docs/` or `LICEN[CS]E` skips everything but `gitleaks`, because a secret pasted into documentation is still a secret.
+
 ## Status
 
 **Active** — maintained, issues welcome.
