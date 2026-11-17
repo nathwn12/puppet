@@ -159,7 +159,7 @@ jobs:
           }
           if ($env:RELEASE_TAG -ne "v$ver") { throw "RELEASE_TAG '$env:RELEASE_TAG' is not v$ver" }
           Write-Host "version $ver (ref $env:GITHUB_REF_NAME)"
-      - uses: dtolnay/rust-toolchain@1.87.0
+      - uses: dtolnay/rust-toolchain@1.120.0
       - name: build
         run: cargo build --release --locked
       - name: test
