@@ -1,4 +1,3 @@
-//! JSON-RPC stdio loop + per-tool validation (pydantic-shaped) + dispatch.
 
 use crate::burst::do_burst;
 use crate::schemas::{
@@ -20,25 +19,11 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-/// P1b worker pool: four workers drain `tools/call` jobs so one long call
-/// (a 60s `wait`, a 300s `wait_for`, a 60s settle) never blocks `ping`,
-/// `initialize`, `tools/list`, or a `notifications/cancelled`.
 const WORKER_COUNT: usize = 4;
-/// P1b queue cap: more than 8 tool calls in flight gets -32603
-/// ("Server busy") instead of unbounded thread growth.
 const MAX_IN_FLIGHT: usize = 8;
 
-/// P1b input serialization: only mutating desktop tools (`do`, `window`)
-/// hold this. Read-only `screenshot`, `list_windows`, `cursor`, `elements`
-/// never take it, so a screenshot can run while a `do wait` sleeps. A waiter
-/// polls with `try_lock` + 20ms sleeps so a cancel wakes it instead of
-/// wedging on a hung holder.
 static INPUT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-/// Acquire the shared input lock, polling so a cancelled call wakes instead
-/// of blocking forever on a hung holder. `None` = cancelled while waiting.
-/// A poisoned lock is recovered (`into_inner`): a panicked holder must not
-/// read as "held forever" to every future waiter.
 fn lock_input_cancellable() -> Option<std::sync::MutexGuard<'static, ()>> {
     loop {
         match INPUT_LOCK.try_lock() {
@@ -54,17 +39,12 @@ fn lock_input_cancellable() -> Option<std::sync::MutexGuard<'static, ()>> {
     }
 }
 
-/// One `writeln!` + flush under the sink lock: frames never interleave.
-/// Poison is recovered: a panicked writer must not silence the server.
 fn emit_line<W: Write>(sink: &Mutex<W>, line: String) -> std::io::Result<()> {
     let mut g = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     writeln!(g, "{line}")?;
     g.flush()
 }
 
-/// Frame builders, shared by the inline path and the worker's locked
-/// check+write emission (DEFECT 3: the last cancel check and the write
-/// happen under the same sink lock).
 fn result_line(id: &Value, result: &str) -> String {
     let ids = serde_json::to_string(id).unwrap();
     format!("{{\"jsonrpc\":\"2.0\",\"id\":{ids},\"result\":{result}}}")
@@ -123,10 +103,6 @@ fn tools_list_result() -> String {
     format!("{{\"tools\":[{TOOL_SCREENSHOT},{TOOL_DIFF},{TOOL_LIST_WINDOWS},{TOOL_WINDOW},{TOOL_DO},{TOOL_CURSOR},{TOOL_ELEMENTS}]}}")
 }
 
-/// `server/discover` (2026-07-28 discovery path): the full known-version
-/// list, the tools-only capabilities, this crate's version, and the same
-/// usage contract `initialize` carries. Discovery itself is a modern
-/// surface, so its result always carries `resultType: complete`.
 fn discover_result() -> String {
     let supported: Vec<Value> = ALL_VERSIONS.iter().map(|v| Value::from(*v)).collect();
     format!(
@@ -137,11 +113,6 @@ fn discover_result() -> String {
     )
 }
 
-/// Per-request modern version from
-/// `params._meta["io.modelcontextprotocol/protocolVersion"]` (2026-07-28
-/// discovery path). `None` when params is not an object or carries no such
-/// key (legacy peer); otherwise the raw value so unsupported versions can
-/// be echoed back in the -32022 data.
 fn meta_version(v: &Value) -> Option<Value> {
     v.get("params")?
         .as_object()?
@@ -151,8 +122,6 @@ fn meta_version(v: &Value) -> Option<Value> {
         .cloned()
 }
 
-/// Additive modern marker for 2026-07-28 peers: `result` is already a JSON
-/// object string, so splice one more top-level key before the final `}`.
 fn with_result_type(result: &str) -> String {
     let t = result.trim_end();
     match t.strip_suffix('}') {
@@ -231,9 +200,6 @@ fn call_window(args: &Map<String, Value>) -> String {
     })
 }
 
-/// Zero-pixel structured enumeration: resolve the window selector, then reuse
-/// the screenshot element walk (`shot::element_model`, the same object as
-/// `shot::elements_block`) and return it as structured JSON.
 fn call_elements(args: &Map<String, Value>) -> String {
     let mut errs = Vec::new();
     let fg_before =
@@ -281,9 +247,6 @@ fn call_elements(args: &Map<String, Value>) -> String {
         );
         return wrapped_text(&py_dumps(&Value::Object(payload)));
     }
-    // Target lock wins; the legacy title/hwnd pair stays for compatibility.
-    // The LOCK is kept (not just its hwnd) so the identity is revalidated
-    // immediately before the walk.
     let mut locked: Option<crate::target::TargetLock> = None;
     let (hwnd_r, err, cands) = match tg {
         Some(v) => match crate::target::TargetSpec::parse(&v) {
@@ -318,8 +281,6 @@ fn call_elements(args: &Map<String, Value>) -> String {
         }
         return wrapped_text(&py_dumps(&Value::Object(payload)));
     }
-    // Revalidate immediately before enumerating: a closed or recycled
-    // handle must be a typed target_gone, not a walk of another window.
     if let Err(e) = crate::screen::revalidate_locked(&locked) {
         let mut payload = Map::new();
         payload.insert("ok".to_string(), Value::from(false));
@@ -328,11 +289,6 @@ fn call_elements(args: &Map<String, Value>) -> String {
         return wrapped_text(&py_dumps(&Value::Object(payload)));
     }
     let model = element_model(hwnd_r.unwrap(), md, off as usize);
-    // P4c text read: detail listings on the UIA backend carry each entry's
-    // TextPattern text (capped at ELEMENT_TEXT_CAP chars with a
-    // `text_truncated` flag). Best-effort per entry: a missing pattern or
-    // failed read omits the keys instead of failing the listing. Identity
-    // (`fp`) never covers text, so extraction cannot invalidate refs.
     let entries: Vec<Value> = if d {
         model
             .entries
@@ -359,10 +315,6 @@ fn call_elements(args: &Map<String, Value>) -> String {
             .map(Value::Object)
             .collect()
     };
-    // Same top-level object as `shot::elements_block`, as structured JSON
-    // (both assemble through `shot::elements_object`; only the entries
-    // slice differs: full walk entries under detail=true, compact
-    // projections by default).
     let o = elements_object(
         &model.backend,
         model.truncated,
@@ -371,8 +323,6 @@ fn call_elements(args: &Map<String, Value>) -> String {
         model.next_offset,
     );
     let mut o = o;
-    // Invariant telemetry: this walk is read-only and must leave the owner's
-    // foreground window and pointer exactly where it found them.
     let mut cur_after = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
     let cur_ok2 =
         unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut cur_after) != 0 };
@@ -446,12 +396,7 @@ fn call_screenshot(args: &Map<String, Value>) -> String {
         },
     };
     let out = opt_str(args, &mut errs, "out");
-    // W3.2 (D4): every capture path is lossless by default. JPEG is an
-    // explicit request (`fmt:"jpeg"`), never a default a caller inherits.
     let fmt = req_str(args, &mut errs, "fmt", "png");
-    // AMENDMENT-01 A2: only a `quality` the caller named can be a request the
-    // server altered, so it is passed as Some only when it was supplied;
-    // `finalize` still defaults the applied value to 80.
     let quality_supplied = !matches!(args.get("quality"), None | Some(Value::Null));
     let quality = req_int(args, &mut errs, "quality", 80);
     let grid = req_bool(args, &mut errs, "grid");
@@ -543,8 +488,6 @@ fn call_diff(args: &Map<String, Value>) -> String {
         max_px: max_px.unwrap(),
         out: out.unwrap(),
         bbox: bbox.unwrap(),
-        // Validated in `diff`: a rect outside the operand frame is a typed
-        // bad_region, which needs the frame the operands resolved to.
         mask: match args.get("mask") {
             None | Some(Value::Null) => None,
             Some(v) => Some(v.clone()),
@@ -588,8 +531,6 @@ fn call_do(args: &Map<String, Value>) -> String {
             None
         }
     };
-    // background is `str | None`: strict pydantic string, no numeric
-    // coercion (probed: int/float/bool all fail string_type).
     let background: Option<Option<String>> = match args.get("background") {
         None | Some(Value::Null) => Some(None),
         Some(Value::String(s)) => Some(Some(s.clone())),
@@ -607,9 +548,6 @@ fn call_do(args: &Map<String, Value>) -> String {
     let focus_guard = do_bool(args, &mut errs, "focus_guard");
     let settle_ms = req_int(args, &mut errs, "settle_ms", 0);
     let dry_run = do_bool(args, &mut errs, "dry_run");
-    // background_args is `list[str] | None`, hidden-launch only: strict
-    // strings, no coercion (mirrors background's strict string_type).
-    // Ignored without desktop:"hidden"; validated whenever present.
     let background_args: Option<Option<Vec<String>>> = match args.get("background_args") {
         None | Some(Value::Null) => Some(None),
         Some(Value::Array(a)) => {
@@ -649,9 +587,6 @@ fn call_do(args: &Map<String, Value>) -> String {
             None
         }
     };
-    // desktop is `str | None`, opt-in only: the sole accepted value is
-    // "hidden" (case-insensitive). Plain `do` omits it and keeps its exact
-    // behaviour.
     let desktop: Option<Option<String>> = opt_str(args, &mut errs, "desktop");
     if let Some(Some(d)) = desktop.as_ref() {
         if !d.trim().eq_ignore_ascii_case("hidden") {
@@ -686,9 +621,6 @@ fn call_do(args: &Map<String, Value>) -> String {
     })
 }
 
-/// `target`: object | selector string | null. The SHAPE is validated here
-/// (non-object/string is a type error); the window is resolved in the
-/// handler, where a vanished or ambiguous target is a typed result.
 fn opt_target(args: &Map<String, Value>, errs: &mut Vec<crate::VErr>) -> Option<Option<Value>> {
     match args.get("target") {
         None | Some(Value::Null) => Some(None),
@@ -706,10 +638,6 @@ fn opt_target(args: &Map<String, Value>, errs: &mut Vec<crate::VErr>) -> Option<
     }
 }
 
-/// Pydantic v2 lax bool, probed verbatim against the live python server:
-/// 0/1 and 0.0/1.0 coerce; other ints/whole floats fail bool_parsing;
-/// fractional floats fail bool_type; the true/false word sets coerce;
-/// other strings fail bool_parsing; null fails bool_type.
 fn do_bool(args: &Map<String, Value>, errs: &mut Vec<crate::VErr>, name: &str) -> Option<bool> {
     let parsing = |v: &Value| crate::VErr {
         loc: name.to_string(),
@@ -821,9 +749,6 @@ fn tools_call(params: &Value) -> String {
     }
 }
 
-/// A dispatched `tools/call` job. `id_key` is the canonical registry key
-/// (`serde_json::to_string(&id)`); `modern` marks 2026-07-28 peers whose
-/// result carries `resultType: complete`.
 struct ToolJob {
     id: Value,
     id_key: String,
@@ -831,18 +756,6 @@ struct ToolJob {
     modern: bool,
 }
 
-/// Admission guard: releases `in_flight` and clears the worker's
-/// thread-local token on drop, including panic unwind. It deliberately does
-/// NOT touch the cancel registry: the token stays registered until the
-/// outer `run_tool_job` removes it AFTER the emit decision, so a cancel
-/// racing a panic is still observed — no -32603 after a processed cancel.
-///
-/// Lifetime (DEFECT 1 fix): the guard is created in `run_tool_job` BEFORE
-/// `catch_unwind` and dropped AFTER the emit decision + token removal, so
-/// admission covers the whole job — body, unwind, sink-locked emit, and
-/// cleanup. The EOF drain (which waits on `in_flight`) therefore cannot
-/// finish before the final response is written and the token removed. The
-/// inner never owns or drops the guard.
 struct AdmissionGuard {
     in_flight: Arc<AtomicUsize>,
 }
@@ -862,23 +775,16 @@ impl Drop for AdmissionGuard {
     }
 }
 
-/// What a job's execution produced. The inner builds it but never writes;
-/// the outer emits (or drops) under the sink lock, then removes the token.
 enum Action {
     Result(String),
     InvalidParams,
 }
 
-/// Outcome of the fallible job body: either a response line is ready or
-/// there is nothing to send.
 enum JobOutcome {
     Emit(String),
     Drop,
 }
 
-/// The production executor: validates arguments and runs the tool.
-/// Passed as a closure so tests can substitute panicking bodies while
-/// exercising the real containment, ordering, and cleanup paths.
 fn production_execute(job: &ToolJob) -> Action {
     match job.params.get("arguments") {
         None | Some(Value::Null) | Some(Value::Object(_)) => {
@@ -889,17 +795,6 @@ fn production_execute(job: &ToolJob) -> Action {
     }
 }
 
-/// Worker entry: panic containment boundary. The admission guard is
-/// created BEFORE `catch_unwind` and dropped AFTER the emit decision +
-/// token removal, so `in_flight` covers the whole job and the EOF drain
-/// cannot overtake the final response. The fallible body runs inside
-/// `catch_unwind`; on unwind the guard stays alive while the outer emits
-/// -32603, and this worker stays alive for the next job. A panic never
-/// aborts the process. Token removal happens here, AFTER the emit decision,
-/// never in the guard or the inner: either the cancel is ordered before the
-/// check under the sink lock (token set → silence) or the frame is written
-/// first (valid race). A cancelled call — including a panic after a
-/// processed cancel — stays silent.
 fn run_tool_job<W, F>(
     job: ToolJob,
     sink: &Mutex<W>,
@@ -912,22 +807,13 @@ fn run_tool_job<W, F>(
 {
     let id = job.id.clone();
     let id_key = job.id_key.clone();
-    // Snapshot the token outside the unwind boundary so the panic branch
-    // can still tell "cancelled, stay silent" from "died, report".
     let token = crate::cancel::get(&id_key);
-    // Admission covers body + unwind + sink-locked emit + token removal.
     let _admission = AdmissionGuard::new(&in_flight);
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_tool_job_inner(&job, token.clone(), execute)
     }));
     match outcome {
         Ok(JobOutcome::Emit(line)) => {
-            // Ordered with `notifications/cancelled` under the sink lock:
-            // the cancel handler takes this lock before setting the token,
-            // so either the cancel lands first (silent drop) or this frame
-            // is fully written first (client may ignore the racy late
-            // response). The lock is held only across check+write, never
-            // across tool execution.
             let mut g = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let cancelled = token.as_ref().is_some_and(|t| t.load(Ordering::SeqCst));
             if !cancelled && writeln!(g, "{line}").and_then(|_| g.flush()).is_err() {
@@ -939,10 +825,6 @@ fn run_tool_job<W, F>(
             crate::cancel::remove(&id_key);
         }
         Err(_) => {
-            // Contained panic: the guard is still alive (admission held,
-            // thread-local intact for the check below); the token stayed
-            // registered, so this check observes any cancel ordered first.
-            // The guard drops at fn end, after the emit + removal.
             let mut g = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let cancelled = token.as_ref().is_some_and(|t| t.load(Ordering::SeqCst));
             if !cancelled && token.is_some() {
@@ -951,8 +833,6 @@ fn run_tool_job<W, F>(
                     client_dead.store(true, Ordering::SeqCst);
                 }
             }
-            // `token: None` means the registry never held this id; nothing
-            // to emit or remove.
             if token.is_some() {
                 crate::cancel::remove(&id_key);
             }
@@ -964,8 +844,6 @@ fn run_tool_job_inner<F>(job: &ToolJob, token: Option<Arc<AtomicBool>>, execute:
 where
     F: FnOnce(&ToolJob) -> Action,
 {
-    // No admission handling here: the outer's guard covers the whole job.
-    // A `None` token means the registry never held this id; drop silently.
     let Some(token) = token else {
         return JobOutcome::Drop;
     };
@@ -978,7 +856,6 @@ where
         .get("name")
         .and_then(|n| n.as_str())
         .unwrap_or("");
-    // Only mutating desktop tools serialize; read-only tools run free.
     let _input = if matches!(name, "do" | "window") {
         match lock_input_cancellable() {
             Some(g) => Some(g),
@@ -993,7 +870,6 @@ where
         return JobOutcome::Drop;
     }
     let action = execute(job);
-    // Advisory only: the outer re-checks under the sink lock.
     if token.load(Ordering::SeqCst) {
         return JobOutcome::Drop;
     }
@@ -1008,8 +884,6 @@ where
     JobOutcome::Emit(line)
 }
 
-/// Inline fast frame: everything except `tools/call`. Returns true when the
-/// caller should stop the pump with code 1 (dead client).
 fn handle_fast<W: Write>(
     v: &Value,
     sink: &Mutex<W>,
@@ -1020,8 +894,6 @@ fn handle_fast<W: Write>(
     let method_ok = v.get("method").and_then(|m| m.as_str()).is_some();
     let jsonrpc_ok = v.get("jsonrpc").and_then(|j| j.as_str()) == Some("2.0");
     if !method_ok || !jsonrpc_ok {
-        // Strict JSON-RPC: a frame with an id but no valid method/jsonrpc
-        // is Invalid Request (-32600); a notification (no id) stays silent.
         return match id {
             None => false,
             Some(id) => write_error(sink, &id, -32600, "Invalid Request").is_err(),
@@ -1029,13 +901,6 @@ fn handle_fast<W: Write>(
     }
     let m = v.get("method").and_then(|m| m.as_str()).unwrap();
     let Some(id) = id else {
-        // Notification: valid method but no id gets no response.
-        // `notifications/cancelled` flips the matching token; unknown or
-        // already-completed ids are ignored. The sink lock is taken before
-        // setting the token — the same lock the worker holds across its
-        // last cancel check + write — so a cancel is either ordered before
-        // the response (silent drop) or processed after it was fully
-        // written (client may ignore the racy late response).
         if m == "notifications/cancelled" {
             if let Some(rid) = v.get("params").and_then(|p| p.get("requestId")) {
                 let key = serde_json::to_string(rid).unwrap();
@@ -1045,9 +910,6 @@ fn handle_fast<W: Write>(
         }
         return false;
     };
-    // Modern per-request negotiation (2026-07-28 discovery path): an
-    // explicit per-request version outside the known set is rejected with
-    // -32022 before dispatch.
     if let Some(req) = meta_version(v) {
         let known = req.as_str().is_some_and(|s| ALL_VERSIONS.contains(&s));
         if !known {
@@ -1089,9 +951,6 @@ fn handle_fast<W: Write>(
                 modern,
             };
             if tx.send(job).is_err() {
-                // Workers are gone; unwind the registration so the id does
-                // not leak a token and the admission slot is released.
-                // (Unreachable in practice: workers outlive the reader.)
                 crate::cancel::remove(&id_key);
                 in_flight.fetch_sub(1, Ordering::SeqCst);
             }
@@ -1136,8 +995,6 @@ fn pump<R: BufRead + Send + 'static, W: Write + Send + 'static>(
         let sink = sink.clone();
         let in_flight = in_flight.clone();
         let client_dead = client_dead.clone();
-        // The loop survives a contained worker panic (run_tool_job catches
-        // it); the receiver lock is poison-recovered so capacity persists.
         std::thread::spawn(move || loop {
             let job = {
                 rx.lock()
@@ -1167,15 +1024,12 @@ fn pump<R: BufRead + Send + 'static, W: Write + Send + 'static>(
     });
     let sink_ref: &Mutex<W> = &sink;
     loop {
-        // A worker that could not write its tool response raises this flag;
-        // exit even while the reader is still open (blocked, no EOF).
         if client_dead.load(Ordering::SeqCst) {
             return 0;
         }
         let line = match line_rx.recv_timeout(Duration::from_millis(20)) {
             Ok(line) => line,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            // Reader thread ended (EOF) or the read failed: drain and exit.
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         let line = match line {
@@ -1202,7 +1056,6 @@ fn pump<R: BufRead + Send + 'static, W: Write + Send + 'static>(
             continue;
         }
         if !v.is_object() {
-            // A valid JSON scalar is well-formed but never a request frame.
             if write_error(sink_ref, &Value::Null, -32600, "Invalid Request").is_err() {
                 return 1;
             }
@@ -1212,15 +1065,11 @@ fn pump<R: BufRead + Send + 'static, W: Write + Send + 'static>(
             return 1;
         }
     }
-    // Stdin EOF: stop accepting, wait up to 2s for in-flight calls, then
-    // exit 0. Never hang forever on a wedged worker.
     drop(tx);
     let deadline = Instant::now() + Duration::from_secs(2);
     while in_flight.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
-    // A hung PrintWindow/UIA call occupies one worker at most; the reader
-    // and ping stayed alive throughout, so EOF still exits here.
     0
 }
 
@@ -1304,9 +1153,6 @@ mod tests {
         assert_eq!(code, 1, "broken stdout must stop the pump with code 1");
     }
 
-    /// Mirrors production dispatch (register + admission increment) so test
-    /// accounting is exact: every dispatched test job starts at the same
-    /// counter state a worker would see.
     fn dispatch_test_job(in_flight: &Arc<AtomicUsize>, id: i64, tool: &str) -> ToolJob {
         in_flight.fetch_add(1, Ordering::SeqCst);
         let idv = Value::from(id);
@@ -1320,10 +1166,6 @@ mod tests {
         }
     }
 
-    /// DEFECT 1 (pivot) proof: the token stays registered across a panic so
-    /// the outer — not the guard — decides emit vs silence after the unwind.
-    /// Fails if token removal is reverted into the guard/inner (registry
-    /// lookup finds nothing).
     #[test]
     fn panic_keeps_token_releases_admission() {
         let in_flight = Arc::new(AtomicUsize::new(0));
@@ -1338,16 +1180,11 @@ mod tests {
             crate::cancel::get(&id_key).is_some(),
             "token must survive the panic for the outer emit decision"
         );
-        // The inner never touches admission: the outer guard owns it.
         assert_eq!(in_flight.load(Ordering::SeqCst), 1);
         crate::cancel::remove(&id_key);
         in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 
-    /// Production containment through the real `run_tool_job` path with a
-    /// panicking executor: -32603 for the id, admission released, token
-    /// removed — and the same worker (thread) processes a subsequent normal
-    /// job, proving survival.
     #[test]
     fn panic_emits_internal_error_and_worker_survives() {
         let sink: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1372,8 +1209,6 @@ mod tests {
             crate::cancel::get(&id_key).is_none(),
             "token must be removed after the panic emit decision"
         );
-        // Same thread processes a subsequent normal job: the worker lives.
-        // Exact accounting: every dispatched job increments first.
         let job2 = dispatch_test_job(&in_flight, 5003, "cursor");
         let id_key2 = job2.id_key.clone();
         run_tool_job(job2, &sink, in_flight.clone(), &client_dead, |_| {
@@ -1395,9 +1230,6 @@ mod tests {
         );
     }
 
-    /// A cancel processed before the panic emit suppresses the -32603:
-    /// the executor cancels through the registry, then panics; the outer
-    /// observes the set token under the sink lock and stays silent.
     #[test]
     fn panic_after_processed_cancel_sends_no_response() {
         let sink: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1425,11 +1257,6 @@ mod tests {
         );
     }
 
-    /// DEFECT 2 (pivot) proof through production dispatch: the input lock is
-    /// held here, so the `do` job must wait on it; it is cancelled while
-    /// waiting. The observing executor must never run, no frame is emitted,
-    /// and admission + token are cleaned up. This exercises the real
-    /// `run_tool_job` path, not the lock helper in isolation.
     #[test]
     fn cancelled_waiter_never_executes_through_dispatch() {
         let _held = INPUT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -1448,8 +1275,6 @@ mod tests {
                 Action::Result("{}".to_string())
             });
         });
-        // The worker is either at an entry check or in the lock wait; the
-        // lock is held here, so the body cannot run before the cancel below.
         std::thread::sleep(Duration::from_millis(300));
         crate::cancel::cancel(&id_key);
         h.join().expect("worker thread survives");
@@ -1472,11 +1297,6 @@ mod tests {
         );
     }
 
-    /// DEFECT 1 proof: admission covers the whole job including the
-    /// sink-locked emit. The sink blocks mid-write; while it is blocked,
-    /// `in_flight` must still be >0 (the EOF-drain condition: EOF must not
-    /// overtake the response), and only after the response lands is it 0.
-    /// Fails if the guard is dropped before the emit decision.
     struct GateWriter {
         entered: Arc<AtomicBool>,
         open: Arc<AtomicBool>,
@@ -1517,7 +1337,6 @@ mod tests {
                 Action::Result("{}".to_string())
             });
         });
-        // Wait until the worker is blocked inside the emit write.
         let t0 = Instant::now();
         while !entered.load(Ordering::SeqCst) {
             assert!(
@@ -1526,7 +1345,6 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
-        // EOF-drain condition: admission still held while emitting.
         assert_eq!(
             in_flight.load(Ordering::SeqCst),
             1,
@@ -1550,8 +1368,6 @@ mod tests {
         );
     }
 
-    /// DEFECT 4 proof: when the worker queue is gone, dispatch unwinds the
-    /// registration (token removed) as well as the admission slot.
     #[test]
     fn dispatch_send_failure_releases_token_and_admission() {
         let (tx, rx) = mpsc::channel::<ToolJob>();
@@ -1578,11 +1394,8 @@ mod tests {
         );
     }
 
-    /// DEFECT 2 proof: a tool-response write failure is surfaced through the
-    /// shared dead-client flag (not discarded), and cleanup still runs.
     #[test]
     fn failing_tool_writer_sets_client_dead_with_cleanup() {
-        // Read-only `cursor`: no desktop mutation, exercises the emit path.
         let in_flight = Arc::new(AtomicUsize::new(0));
         let job = dispatch_test_job(&in_flight, 4242, "cursor");
         let id_key = job.id_key.clone();
@@ -1610,9 +1423,6 @@ mod tests {
         );
     }
 
-    /// DEFECT 2 exit behavior: the reader is still open (blocked, no EOF)
-    /// when the worker observes the dead client, so exit 0 can only come
-    /// from the `client_dead` flag — the EOF path is unreachable here.
     struct OneFrameThenBlock {
         sent: bool,
     }
@@ -1627,7 +1437,6 @@ mod tests {
                 buf[..n].copy_from_slice(&full[..n]);
                 return Ok(n);
             }
-            // Block forever without EOF: the pump must not wait for us.
             loop {
                 std::thread::park();
             }
@@ -1647,10 +1456,6 @@ mod tests {
         );
     }
 
-    /// Gap-3 proof (fails before the fix, passes after): the initialize
-    /// result must carry an `instructions` string with the usage contract --
-    /// the six tools, the coordinate rule, batch + dry_run, read-only first.
-    /// Essentials are asserted, never a byte-exact string.
     #[test]
     fn init_result_carries_usage_instructions() {
         let params = serde_json::json!({"protocolVersion": "2025-11-25"});
@@ -1714,8 +1519,6 @@ mod tests {
 
     #[test]
     fn screenshot_region_i64_extremes_typed_error() {
-        // Verifier repro: MIN/MAX coords must be a typed error, never a
-        // debug panic (subtraction overflow) or release bypass.
         let mut m = Map::new();
         m.insert("display".to_string(), Value::from(0));
         m.insert(
@@ -1736,8 +1539,6 @@ mod tests {
 
     #[test]
     fn screenshot_region_grabbed_directly() {
-        // Direct-rect grab: the image matches the region exactly and the
-        // capture note says no full-frame grab happened.
         let mut m = Map::new();
         m.insert("display".to_string(), Value::from(0));
         m.insert(
@@ -1788,8 +1589,6 @@ mod tests {
         );
     }
 
-    /// `elements`' legacy hwnd argument is the target lock, so a dead handle
-    /// is the typed target_gone rather than a bare IsWindow bad_window.
     #[test]
     fn elements_legacy_hwnd_uses_the_target_lock() {
         let _g = crate::fixture::desktop();
@@ -1821,9 +1620,6 @@ mod tests {
         );
     }
 
-    /// The `do` schema declares the element fields the `type` action already
-    /// accepts (a UIA ValuePattern.SetValue path exists at runtime), and the
-    /// 256-action cap. Runtime behaviour is unchanged by this declaration.
     #[test]
     fn do_type_action_schema_declares_element_index_and_expect_fp() {
         let t: Value = serde_json::from_str(crate::schemas::TOOL_DO).expect("TOOL_DO JSON");
@@ -1851,8 +1647,6 @@ mod tests {
         }
     }
 
-    /// SPEC W2.3: an element wait may carry the caller's fingerprint, which is
-    /// reported (`fp_matched`) and never enforced, so the schema declares it.
     #[test]
     fn do_wait_for_action_schema_declares_expect_fp() {
         let t: Value = serde_json::from_str(crate::schemas::TOOL_DO).expect("TOOL_DO JSON");
@@ -1874,8 +1668,6 @@ mod tests {
         );
     }
 
-    /// The elements/screenshot descriptions must describe what the runtime
-    /// actually emits: `offscreen`, `moved_during_capture`, `elements_window`.
     #[test]
     fn tool_descriptions_declare_the_new_payload_fields() {
         let el: Value = serde_json::from_str(crate::schemas::TOOL_ELEMENTS).expect("elements");
@@ -1936,17 +1728,9 @@ mod tests {
     #[test]
     fn elements_live_offscreen_fixture_lists_edit_and_ok() {
         let _g = crate::fixture::desktop();
-        // Live resolve path against a real HWND the test owns (offscreen,
-        // never activated): proves `elements` beyond unit/schema assertions.
-        // Foreground contract is environment-independent: record BEFORE any
-        // fixture work; a zero-pixel read must not CHANGE it (skips with
-        // FG_SKIP when the environment has no foreground session).
         let fg_before = crate::fixture::foreground_now();
         let f = crate::fixture::Fixture::new();
         let hwnd = f.hwnd() as i64;
-        // The fixture constructor waited for the first composited frame and a
-        // UIA walk that serves the window's children, so the walk below is
-        // read once: no per-test poll for the startup race.
         let payload = elements_payload(&elements_args(&[("hwnd", Value::from(hwnd))]));
         assert_eq!(payload.get("uia_available"), Some(&Value::from(true)));
         let els = payload
@@ -1998,18 +1782,10 @@ mod tests {
             backend == "uia" || backend == "win32",
             "backend must be uia or the deterministic win32 fallback, got: {backend} in {payload}"
         );
-        // Foreground untouched by a zero-pixel read: owned-foreground after
-        // settle is reported (FG_OWN_CHURN), never failed — a read cannot
-        // activate (skips with FG_SKIP when the environment provides no
-        // foreground session, e.g. headless CI).
         crate::fixture::check_foreground_left_clean(hwnd, fg_before, "elements");
-        // Evidence for the report (captured with -- --nocapture).
         println!("ELEMENTS_COMPACT_FIXTURE_JSON={payload}");
     }
 
-    /// A matched control with no on-screen rectangle is reported as
-    /// `offscreen:true` instead of geometry a caller could aim at. On the
-    /// pre-fix tree the entry carried `[0,0,0,0]` and no flag.
     #[test]
     fn elements_marks_a_control_without_a_rect_offscreen() {
         let _g = crate::fixture::desktop();

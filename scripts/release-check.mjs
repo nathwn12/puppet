@@ -1,10 +1,4 @@
 #!/usr/bin/env node
-// Local release preflight: pack the npm package and assert it is publishable.
-// Usage: node scripts/release-check.mjs [--allow-placeholders] [--compare <release-manifest.json>]
-// --compare asserts the tarball's runtime.archive.sha256 and
-// runtime.server.sha256 equal the given release manifest's (the class of
-// bug where a stale manifest ships inside a good-looking tarball).
-// No dependencies beyond Node stdlib.
 import { execFileSync, execSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -15,9 +9,6 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const npmDir = join(root, "npm");
 const allowPlaceholders = process.argv.includes("--allow-placeholders");
 
-// Fail closed: tar missing or non-zero exit is a hard FAIL, never "nothing found".
-// Uses the system `tar` so PAX/GNU extended-name headers resolve to the real
-// (long) path; a hand-rolled header parser sees only the truncated prefix.
 function tarList(tarball) {
   try {
     const out = execFileSync("tar", ["-tzf", tarball], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
@@ -43,8 +34,6 @@ const pass = (check, detail) => rows.push([check, "PASS", detail]);
 
 let tarballPath = null;
 const tmp = mkdtempSync(join(tmpdir(), "release-check-"));
-// Test hook: positional <tarball> (or RELEASE_CHECK_TARBALL) validates a fixture
-// tarball instead of npm-packing the tree.
 const compareAt = process.argv.indexOf("--compare");
 const compareVal = compareAt !== -1 ? process.argv[compareAt + 1] : null;
 const positional = process.argv.slice(2).filter((a) => a !== "--allow-placeholders" && a !== "--compare" && a !== compareVal && !a.startsWith("--"))[0] ?? null;

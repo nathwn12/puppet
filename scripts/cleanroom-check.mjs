@@ -1,27 +1,4 @@
 #!/usr/bin/env node
-// Clean-room gate: install the package the way a stranger does — scrubbed
-// profile, empty caches — then prove the engine provisions and the server boots.
-//
-//   node scripts/cleanroom-check.mjs --tarball <path.tgz> [--bundle <path.zip>] [--keep]
-//   node scripts/cleanroom-check.mjs --registry --version <semver> [--keep]
-//   node scripts/cleanroom-check.mjs --self-check
-//
-// --self-check builds the scrubbed world twice and asserts each one is
-// complete, independent and unaffected by the other's cleanup. It is the
-// re-entrancy control for this script's scratch lifecycle; it touches the
-// registry and boots nothing.
-//
-// --bundle points the launcher (PUPPET_ENGINE_BUNDLE) at a locally built
-// runtime archive instead of the Release download, so the gate can run BEFORE
-// that Release exists. It applies to --tarball mode only; the launcher still
-// checks the archive's size and sha256 against the installed manifest, so a
-// wrong zip fails this gate exactly like a bad download would. --registry mode
-// scrubs the override, so the public gate can never be bypassed.
-//
-// Windows-only; Node stdlib only. Prints a PASS/FAIL table, exits 1 on any
-// FAIL. Cleans its temp dir in a finally unless --keep is passed. Never
-// downloads outside <tmp>: every writeable profile/cache path is redirected
-// under <tmp> in the scrubbed child env.
 import { spawn, spawnSync } from "node:child_process";
 import {
   copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync,
@@ -64,25 +41,8 @@ function dieUsage(msg) {
 const rows = [];
 const pass = (check, detail) => rows.push([check, "PASS", detail]);
 const fail = (check, detail) => rows.push([check, "FAIL", detail]);
-// Quote one argv element for cmd.exe. Paths here never contain `"`, so plain
-// wrapping suffices; the command travels as ONE string with shell:true (Node
-// passes it verbatim), never as an args array (libuv would backslash-escape
-// the quotes and npm would receive them literally).
 const q = (s) => `"${s}"`;
 
-// Every invocation owns a brand-new root (mkdtemp) AND creates every path it
-// redirects the child into, BEFORE the first npm call. Both halves matter:
-//
-//   - Fresh root: no invocation can see, inherit or clean up another's
-//     scratch, so a retry starts from exactly the state a first try gets.
-//   - Existing dirs: npm's exec path (libnpmexec -> @npmcli/arborist
-//     load-actual.js) lstat()s the resolved project dir, and because the
-//     child runs in <root> (no package.json in sight) that dir IS the
-//     configured prefix, <root>/npm-prefix. A prefix that has not been
-//     created yet is a hard ENOENT (errno -4058), never a lazily created
-//     dir. npm 10.8.2 — what node 20 ships on the CI runner — fails there;
-//     npm 12 happens not to look, which is why the gate only ever went red
-//     on CI.
 const SCRATCH_DIRS = ["home", "localAppData", "roaming", "scratchTmp", "npmCache", "npmPrefix", "appDir"];
 
 function createScratchWorld() {
@@ -101,24 +61,16 @@ function createScratchWorld() {
   return world;
 }
 
-// The redirected paths a world is missing. Empty means the world is sound.
 function missingScratchDirs(world) {
   return SCRATCH_DIRS.filter((key) => !existsSync(world[key]));
 }
 
 function destroyScratchWorld(world) {
-  // maxRetries: a just-exited child can still hold a handle for a moment on
-  // Windows and one rmSync would leave debris. The root is unique per run
-  // either way, so even a failed cleanup cannot strand the next run.
   try {
     rmSync(world.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   } catch { /* ignore */ }
 }
 
-// Re-entrancy control: build the scrubbed world twice, then assert that each
-// world is complete, that they are different roots, and that tearing one down
-// leaves the other intact. Red the moment a world stops creating a path it
-// hands to the child.
 function runSelfCheck() {
   const check = (name, ok, detail) => (ok ? pass(name, detail) : fail(name, detail));
   const first = createScratchWorld();
@@ -154,8 +106,6 @@ function runSelfCheck() {
   process.exit(rows.some((row) => row[1] === "FAIL") ? 1 : 0);
 }
 
-// --self-check builds and tears down its own worlds: run it before any real
-// scratch dir exists, and before either install mode is required.
 if (argv.includes("--self-check")) runSelfCheck();
 
 if (tarballArg && registry) dieUsage("pick one mode: --tarball or --registry");
@@ -166,8 +116,6 @@ if (tarballArg && tarballArg.startsWith("--")) dieUsage("--tarball needs a <path
 if (tarballArg && (!existsSync(resolve(tarballArg)) || statSync(resolve(tarballArg)).isDirectory())) {
   dieUsage(`tarball not found: ${tarballArg}`);
 }
-// --bundle is a tarball-mode input only: in --registry mode the launcher must
-// provision from the public Release, so an override there would fake the gate.
 if (bi !== -1 && !bundleArg) dieUsage("--bundle needs a <path.zip> value");
 if (bundleArg && bundleArg.startsWith("--")) dieUsage("--bundle needs a <path.zip> value");
 if (bundleArg && registry) dieUsage("--bundle applies to --tarball mode only; --registry must download from the public Release");
@@ -175,11 +123,6 @@ if (bundleArg && (!existsSync(resolve(bundleArg)) || statSync(resolve(bundleArg)
   dieUsage(`bundle not found: ${bundleArg}`);
 }
 
-// ---- scrubbed child env -------------------------------------------------
-// Every location the child could write to is redirected under one world
-// root. Inherited npm location pins are dropped FIRST: a runner-set value
-// would point outside the clean room (or at a previous run's root) before
-// ours lands, which is exactly the leak this script exists to prevent.
 function buildChildEnv(world) {
   const env = { ...process.env };
   for (const key of Object.keys(env)) {
@@ -193,11 +136,7 @@ function buildChildEnv(world) {
   env.TMP = world.scratchTmp;
   env.npm_config_cache = world.npmCache;
   env.npm_config_prefix = world.npmPrefix;
-  // A stale engine pin in the parent env would bypass the clean room; scrub it.
   delete env.PUPPET_ENGINE_CACHE;
-  // A local-bundle override is only ever supplied by this script, and only for
-  // the pre-publish tarball gate. Scrubbing it here means --registry can never
-  // inherit one and skip the real download.
   delete env.PUPPET_ENGINE_BUNDLE;
   return env;
 }
@@ -218,10 +157,6 @@ const listNames = (dir) => {
 };
 const realBefore = realEngineDir ? listNames(realEngineDir) : [];
 
-// Tarball mode + --bundle: hand the child a copy inside <root> so the gate
-// still touches nothing outside its scratch dir. The launcher verifies the
-// copy's size and sha256 against the installed manifest, so a wrong zip is
-// refused.
 if (tarballArg && bundleArg) {
   const stagedBundle = join(world.root, "bundle", basename(resolve(bundleArg)));
   mkdirSync(dirname(stagedBundle), { recursive: true });
@@ -230,9 +165,6 @@ if (tarballArg && bundleArg) {
 }
 
 function sh(command, { timeout = STEP_TIMEOUT_MS } = {}) {
-  // Single command string + shell:true: Node hands it to cmd.exe verbatim,
-  // so our own quoting above is what cmd parses. (An args array here would
-  // either warn DEP0190 or get libuv-escaped into literal quotes.)
   const r = spawnSync(command, {
     env: childEnv, cwd: world.root, encoding: "utf8", timeout, shell: true, windowsHide: true,
   });
@@ -291,9 +223,6 @@ try {
   let expected; // expected version string
   let manifest; // { runtime: { archive, server: { name, sha256, size } }, serverVersion }
 
-  // Guard the scratch world BEFORE npm touches it: a redirected path that is
-  // missing here is the ENOENT npm would otherwise surface as an unrelated
-  // install failure (see createScratchWorld).
   const missing = missingScratchDirs(world);
   if (missing.length > 0) {
     fail("scratch", `redirected path missing before npm runs: ${missing.map((k) => world[k]).join(", ")}`);
@@ -311,7 +240,6 @@ try {
       exitCode = 1;
       return;
     }
-    // Resolve the installed package dir (normally node_modules/<PKG>).
     let pkgDir = join(appDir, "node_modules", PKG);
     if (!existsSync(join(pkgDir, "package.json"))) {
       pkgDir = null;
@@ -374,17 +302,14 @@ try {
     }
   }
 
-  // 1. --version output contains the expected version.
   const ver = sh(`${binCommand} --version`);
   if (ver.code === 0 && ver.out.includes(expected)) pass("version", `--version reports ${ver.out.trim().split(/\r?\n/)[0]}`);
   else fail("version", `exit ${ver.code}, output missing ${expected}: ${(ver.out || ver.err).trim().split(/\r?\n/).slice(-2).join(" | ")}`);
 
-  // 2. --doctor exits 0.
   const doc = sh(`${binCommand} --doctor`);
   if (doc.code === 0) pass("doctor", "--doctor exit 0");
   else fail("doctor", `--doctor exit ${doc.code}: ${doc.tail}`);
 
-  // 3. Real boot: spawn the bin, stdin closed, timeout 300 s.
   const b = await boot(binCommand);
   bootMs = b.ms;
   bootCode = b.code;
@@ -397,7 +322,6 @@ try {
     fail("boot", `exit ${b.code}, stderr tail: ${b.stderr.trim().split(/\r?\n/).slice(-3).join(" | ")}`);
   }
 
-  // 4. Temp engine path holds the manifest-sized exe plus .ready.
   const engRoot = join(localAppData, "puppet", "engine");
   const leaves = listNames(engRoot).filter((n) => n.startsWith(`${expected}-`));
   const wantSize = manifest?.runtime?.server?.size;
@@ -417,13 +341,11 @@ try {
     else pass("engine", `${exe} size ${exeSize} == manifest, .ready present`);
   }
 
-  // 5. The real %LOCALAPPDATA%\puppet\engine listing is identical before/after.
   const realAfter = realEngineDir ? listNames(realEngineDir) : [];
   const same = realBefore.join("\0") === realAfter.join("\0");
   if (same) pass("real-cache", `unchanged (${realAfter.length} dirs)`);
   else fail("real-cache", `before [${realBefore.join(",")}] != after [${realAfter.join(",")}]`);
 
-  // 6. The npm cache was written under <tmp>.
   if (treeHasFile(npmCache)) pass("npm-cache", `written under ${npmCache}`);
   else fail("npm-cache", `empty: ${npmCache}`);
 

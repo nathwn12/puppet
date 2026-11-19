@@ -1,27 +1,6 @@
-//! W1.2 advice truth: a refusal may not recommend a door that is bricked.
-//!
-//! A refusal that ends "pass allow_foreground:true" sends the agent into a
-//! loop: that flag is refused too, by policy, before anything is sent. The
-//! same holds for a pixel fallback, which needs the pointer this server
-//! never moves.
-//!
-//! The scan reads every `.rs` file under `src/` and requires each
-//! recommendation of one of those doors to sit inside a refusal clause:
-//! within 120 characters of `refus`, `no flag` or `no pixel fallback`.
-//!
-//! Two things are not recommendations, and the scan skips them the way
-//! `tests/no_steal.rs` skips prose when it hunts call sites:
-//!
-//! - a comment line (`//`, `///`, `//!`), which no agent ever reads;
-//! - code that names the flag without quoting it (`allow_cursor: true` in a
-//!   struct literal), and a bare quoted needle (`"allow_cursor:true"` used
-//!   by a test to assert the flag is *absent*), which are not advice.
-//!
-//! Fails on the pre-W1.2 tree: five refusals recommend a bricked door.
 
 use std::path::{Path, PathBuf};
 
-/// The forms that recommend a door, in source text.
 const RECOMMENDATIONS: &[&str] = &[
     "allow_foreground:true",
     "allow_foreground: true",
@@ -33,7 +12,6 @@ const RECOMMENDATIONS: &[&str] = &[
     "fallback\":\"click",
 ];
 
-/// The clauses that make a mention a refusal rather than advice.
 const REFUSAL_MARKERS: &[&str] = &["refus", "no flag", "no pixel fallback"];
 
 const WINDOW: usize = 120;
@@ -56,14 +34,10 @@ fn line_of(text: &str, at: usize) -> usize {
     text[..at].bytes().filter(|b| *b == b'\n').count() + 1
 }
 
-/// True when the byte at `at` sits inside a Rust string literal, raw or
-/// escaped, so a wrapped string (`"… \` continued on the next line) counts
-/// as prose. Comments are skipped: a quote in a comment opens nothing.
 fn inside_string(text: &str, at: usize) -> bool {
     let b = text.as_bytes();
     let mut i = 0;
     let mut in_string = false;
-    // Inside a raw string: how many `#` close it.
     let mut raw: Option<usize> = None;
     while i < at {
         if let Some(hashes) = raw {
@@ -86,7 +60,6 @@ fn inside_string(text: &str, at: usize) -> bool {
         }
         if b[i] == b'"' {
             if !in_string {
-                // `r"`, `r#"`, `r##"` … open a raw string.
                 let mut j = i;
                 let mut hashes = 0;
                 while j > 0 && b[j - 1] == b'#' {
@@ -99,7 +72,6 @@ fn inside_string(text: &str, at: usize) -> bool {
                     continue;
                 }
             }
-            // An escaped quote does not close an escaped literal.
             let mut backslashes = 0;
             let mut j = i;
             while j > 0 && b[j - 1] == b'\\' {
@@ -115,9 +87,6 @@ fn inside_string(text: &str, at: usize) -> bool {
     in_string || raw.is_some()
 }
 
-/// True when the token on this line is a bare quoted needle — the whole
-/// literal, `"allow_cursor:true"` — which is a test asserting absence, not
-/// a sentence telling a caller to pass it.
 fn is_bare_needle(line: &str, token: &str) -> bool {
     let quoted = format!("\"{token}\"");
     line.contains(&quoted)

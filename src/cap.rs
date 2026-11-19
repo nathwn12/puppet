@@ -1,4 +1,3 @@
-//! Window-selector resolution + screen capture (desktop + PrintWindow paths).
 
 use crate::target::{TargetError, TargetLock, TargetSpec};
 use crate::{cand_public, candidates, py_repr_str, py_round_half_even, py_round_n, Cand};
@@ -465,7 +464,6 @@ fn gray(r: u8, g: u8, b: u8) -> u8 {
     ((r as u32 * 299 + g as u32 * 587 + b as u32 * 114 + 500) / 1000) as u8
 }
 
-/// The detector grey for external visualizers (same weights).
 pub(crate) fn gray_of(r: u8, g: u8, b: u8) -> u8 {
     gray(r, g, b)
 }
@@ -511,7 +509,6 @@ pub fn detector_verdict(img: &Img) -> Verdict {
         var += *c as f64 * d * d;
     }
     var /= nf;
-    // 64x64 BICUBIC thumbnail (Pillow default resample), black = R,G,B all < 8.
     let thumb = pillow_resample(img, 64, 64, ResF::Bicubic);
     let mut black = 0u32;
     for i in 0..64 * 64 {
@@ -566,8 +563,6 @@ pub fn detector_tag(v: &Verdict) -> String {
     )
 }
 
-/// One `{k=v,k=v}` tag body, in insertion order, for the refusal text a
-/// caller can assert on.
 fn tag_of(m: &Map<String, Value>) -> String {
     let body: Vec<String> = m
         .iter()
@@ -579,12 +574,6 @@ fn tag_of(m: &Map<String, Value>) -> String {
     format!("{{{}}}", body.join(","))
 }
 
-//
-// Faithful port of Pillow's Resample.c two-pass fixed-point path (8-bit):
-// separable coeffs, weight normalization, INT32 rounding with a 1<<21 bias,
-// arithmetic-shift clip. Used for BILINEAR main resizes and the BICUBIC
-// 64x64 detector thumbnail. The ybox row-crop optimization is skipped (it
-// only skips rows the vertical pass never reads); values are identical.
 
 const PREC_BITS: i64 = 22;
 
@@ -634,7 +623,6 @@ fn kernel_fn(f: ResF, x: f64) -> f64 {
     }
 }
 
-/// (bounds[(xmin,count)], flat normalized coeffs, ksize)
 fn precompute(in_size: i32, out_size: i32, f: ResF) -> (Vec<(i32, i32)>, Vec<i32>, usize) {
     let scale = in_size as f64 / out_size as f64;
     let filterscale = if scale < 1.0 { 1.0 } else { scale };
@@ -683,11 +671,6 @@ fn clip8(ss: i64) -> u8 {
     (ss >> PREC_BITS).clamp(0, 255) as u8
 }
 
-/// Row-parallel driver for the resample passes below. Rows are independent
-/// (each output byte is a function of its own row's inputs only), so
-/// disjoint row chunks processed on scoped threads yield bit-identical
-/// bytes. Small images run inline to avoid spawn overhead (this keeps the
-/// window-path detector thumbnail and small crops on the old timing).
 fn par_rows(dst: &mut [u8], rows: usize, stride: usize, f: impl Fn(&mut [u8], usize) + Sync) {
     let nt = if rows < 256 { 1 } else { 8.min(rows) };
     if nt == 1 {
@@ -718,12 +701,7 @@ pub fn pillow_resample(src: &Img, dw: i32, dh: i32, f: ResF) -> Img {
             px: src.px.clone(),
         };
     }
-    // Hot-loop optimization (identical arithmetic to the Pillow port above):
-    // per-channel accumulation order is unchanged, so every i64 partial sum
-    // and every clipped byte is bit-identical; only the bounds checks are
-    // elided (all indices derive from precompute() bounds, verified safe).
     let horizontal_first = !((sh - dh > 0) && (sh - dh) > (sw - dw) * 2);
-    // Horizontal pass -> intermediate (full width when horizontal_first).
     let tmp: Img;
     let src_h: &Img;
     if horizontal_first {
@@ -939,14 +917,6 @@ pub fn encode_jpeg(img: &Img, q: u8) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
-//
-// Ported from `Q:\PROJECTS\PERSONAL\gladius\src\visual.rs`
-// (`png_diff`/`DiffOpts`): per-channel absolute delta above `threshold`
-// counts, union bbox, ratio. Gladius runs that rule inside a headless
-// engine over canvas ImageData; puppet runs the same rule natively on
-// `Img` pixels so a `diff` needs no browser, no window and no input.
-// There is no anti-aliasing rule here: the per-channel threshold is the
-// only tolerance, 0 by default (a diff needs lossless PNG pixels).
 
 /// Decode PNG bytes to RGB pixels. RGB and RGBA (alpha dropped) plus
 /// 8-bit grayscale decode; anything else is a typed refusal, never a
@@ -1250,8 +1220,6 @@ pub fn out_object(path: &str, bytes_len: usize, fmt: &str) -> Map<String, Value>
     o.insert("fmt".to_string(), Value::from(fmt.to_string()));
     o
 }
-/// Finalize output: encoded bytes, image w/h, applied scale, resolved
-/// format, clamped quality.
 type Finalized = (Vec<u8>, i64, i64, f64, String, i64);
 
 /// Shared long-edge clamp + grid + encode. Returns (data, iw, ih, scale, f, q).
@@ -1358,9 +1326,6 @@ mod tests {
         Img { w, h, px }
     }
 
-    /// Two generated PNGs, round-tripped through encode/decode: identical
-    /// bytes diff to identical, and one 3x3 block change reports its exact
-    /// bbox and count.
     #[test]
     fn diff_identical_pngs_are_identical() {
         let a = solid_rgb(10, 10, 60, 120, 200);
@@ -1378,7 +1343,6 @@ mod tests {
     fn diff_three_by_three_block_reports_exact_bbox_and_count() {
         let base = solid_rgb(10, 10, 60, 120, 200);
         let mut altered = solid_rgb(10, 10, 60, 120, 200);
-        // Paint a 3x3 block at x=4..6, y=2..4 solid red.
         for y in 2..5 {
             for x in 4..7 {
                 let p = (y * 10 + x) as usize;
@@ -1414,10 +1378,6 @@ mod tests {
         assert!(e2.contains("4x4") && e2.contains("4x6"), "got: {e2}");
     }
 
-    /// The legacy `hwnd`/`title` arguments are the target lock, not a bare
-    /// IsWindow check: the lock carries pid + creation time + image + class,
-    /// and a forged recycled creation time is refused with the same typed
-    /// `target_gone` the `target:` path produces.
     #[test]
     fn legacy_selectors_share_the_target_lock() {
         let _g = crate::fixture::desktop();
@@ -1429,14 +1389,12 @@ mod tests {
         assert_ne!(by_hwnd.created, 0, "the lock carries the creation time");
         by_hwnd.revalidate().expect("a fresh legacy lock validates");
 
-        // title -> {titleContains}: the fixture title is unique per pid+seq.
         let title = unsafe { crate::win_text(f.hwnd()) };
         let by_title = lock_legacy(None, Some(title.as_str())).expect("legacy title locks");
         assert_eq!(by_title.hwnd, top);
         assert_eq!(by_title.class, by_hwnd.class);
         assert_eq!(by_title.created, by_hwnd.created);
 
-        // A forged creation time is a recycled PID: the SAME typed refusal.
         let mut forged = by_hwnd.clone();
         forged.created = by_hwnd.created.wrapping_add(1);
         let e = forged
@@ -1449,7 +1407,6 @@ mod tests {
             e.text()
         );
 
-        // Empty legacy arguments stay a typed bad_target, never a guess.
         let e = lock_legacy(None, None).expect_err("no selector is an error");
         assert_eq!(e.code, crate::target::BAD);
     }

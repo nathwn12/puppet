@@ -1,4 +1,3 @@
-//! window ops + list_windows + cursor tools.
 
 use crate::{display_monitors, enum_windows, window_info, wrapped_text};
 use serde_json::{Map, Value};
@@ -21,16 +20,6 @@ pub struct WinArgs {
     pub allow_foreground: bool,
 }
 
-/// Pre-maximize geometry remembered per window, so `restore` can return to
-/// the EXACT rect even when Windows clamps an offscreen rcNormalPosition
-/// during maximize.
-///
-/// Keyed by `(hwnd, pid, creation_time)`: an HWND alone is recyclable, and a
-/// recycled handle with a new owner must never inherit another process's
-/// saved geometry. The creation time (`GetProcessTimes`) closes the case a
-/// recycled PID would otherwise pass.
-/// Tiny bounded map (64 entries), cleared wholesale when it fills; removal is
-/// by the matching key only, never by evicting unrelated windows.
 type WindowKey = (i64, u32, u64);
 
 static NORMAL_RECTS: std::sync::LazyLock<
@@ -39,26 +28,19 @@ static NORMAL_RECTS: std::sync::LazyLock<
 
 fn window_key(hwnd: HWND) -> WindowKey {
     let pid = crate::pid_of(hwnd);
-    // 0 when unreadable: still better than hwnd+pid, and never matches a
-    // process whose creation time we can read.
     (hwnd as i64, pid, crate::process_created(pid).unwrap_or(0))
 }
 
-/// Peek the saved rect WITHOUT consuming it: recovery state must survive a
-/// failed restore so the caller can retry.
 fn saved_normal(hwnd: HWND) -> Option<[i32; 4]> {
     let m = NORMAL_RECTS.lock().unwrap_or_else(|e| e.into_inner());
     m.get(&window_key(hwnd)).copied()
 }
 
-/// Drop the saved rect for THIS window only, after a successful restore.
 fn clear_normal(hwnd: HWND) {
     let mut m = NORMAL_RECTS.lock().unwrap_or_else(|e| e.into_inner());
     m.remove(&window_key(hwnd));
 }
 
-/// Typed code carried by a window-verb failure, so a refusal exposes the
-/// machine-readable kind next to its prose.
 fn win_code_of(msg: &str) -> Option<&'static str> {
     [
         crate::gate::NO_FOREGROUND_POLICY,
@@ -70,9 +52,6 @@ fn win_code_of(msg: &str) -> Option<&'static str> {
     .find(|code| msg.starts_with(code))
 }
 
-/// Shared range gate for every i64 coordinate routed to `SetWindowPos`
-/// (which takes `i32`). Rejects anything outside `i32` instead of letting
-/// `as i32` wrap (e.g. 2^40 wraps to 0 and teleports the window).
 pub(crate) fn checked_i32(v: i64, name: &str) -> Result<i32, String> {
     if v < i32::MIN as i64 || v > i32::MAX as i64 {
         Err(format!("{name} out of range for SetWindowPos (got {v})"))
@@ -91,14 +70,9 @@ pub fn do_window(a: &WinArgs) -> String {
             (-1, -1)
         }
     };
-    // Target lock first: one window, resolved once, revalidated before the
-    // action. A vanished/ambiguous target is typed, never a foreground
-    // fallback.
     let mut locked: Option<crate::target::TargetLock> = None;
     let (hwnd_r, err, cands) = match a.target.as_ref() {
         None | Some(Value::Null) => {
-            // Legacy title/hwnd are the SAME lock as target: hwnd -> {hwnd},
-            // title -> {titleContains}. Never a bare IsWindow handle.
             match crate::cap::lock_legacy(a.hwnd, a.title.as_deref()) {
                 Ok(l) => {
                     let h = l.hwnd as HWND;
@@ -141,8 +115,6 @@ pub fn do_window(a: &WinArgs) -> String {
     let hi = h as i64;
     let out = (|| -> Result<String, String> {
         let act = a.action.to_lowercase();
-        // Background-only policy: the flag refuses the whole call — no flag
-        // buys the foreground, the cursor or the clipboard.
         if a.allow_foreground {
             let e = crate::gate::no_foreground_policy(&format!("window action:{}", act));
             let mut o = Map::new();
@@ -155,8 +127,6 @@ pub fn do_window(a: &WinArgs) -> String {
         }
         unsafe {
             if act == "focus" {
-                // Focusing IS taking the foreground: refused under the
-                // background-only policy, always.
                 let e = crate::gate::no_foreground_policy("window action:focus");
                 let mut o = Map::new();
                 o.insert("ok".to_string(), Value::from(false));
@@ -277,9 +247,6 @@ pub fn do_window(a: &WinArgs) -> String {
                 }
             }
             if act == "minimize" {
-                // SW_SHOWMINNOACTIVE minimizes WITHOUT activating the next
-                // window in the z-order (SW_MINIMIZE would move focus away
-                // from the owner's current window).
                 ShowWindow(h, SW_SHOWMINNOACTIVE);
                 let mut o = Map::new();
                 o.insert("ok".to_string(), Value::from(true));
@@ -288,9 +255,6 @@ pub fn do_window(a: &WinArgs) -> String {
                 return Ok(crate::py_dumps(&Value::Object(o)));
             }
             if act == "maximize" {
-                // A maximized window covers its monitor: refused under the
-                // background-only policy, always (maximizing is a foreground
-                // act, and Win32 documents no no-activate form).
                 let e = crate::gate::no_foreground_policy("window action:maximize");
                 let mut o = Map::new();
                 o.insert("ok".to_string(), Value::from(false));
@@ -301,17 +265,11 @@ pub fn do_window(a: &WinArgs) -> String {
                 return Ok(crate::py_dumps(&Value::Object(o)));
             }
             if act == "restore" {
-                // Restore to the normal placement WITHOUT activating:
-                // SetWindowPlacement with SW_SHOWNOACTIVATE un-maximizes /
-                // un-minimizes to the remembered pre-maximize rect (else
-                // rcNormalPosition), where SW_RESTORE would activate.
                 let mut wp: WINDOWPLACEMENT = std::mem::zeroed();
                 wp.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
                 if GetWindowPlacement(h, &mut wp) == 0 {
                     return Err(crate::win32_text(GetLastError()));
                 }
-                // Peek, do not consume: recovery state must survive a
-                // failed restore so the caller can retry.
                 let remembered = saved_normal(h);
                 let normal: [i64; 4] = match remembered {
                     Some(r) => {
@@ -332,18 +290,12 @@ pub fn do_window(a: &WinArgs) -> String {
                 };
                 wp.showCmd = SW_SHOWNOACTIVATE as u32;
                 if SetWindowPlacement(h, &wp) == 0 {
-                    // Recovery state is kept: a retry can still restore it.
                     return Err(format!(
                         "restore_failed: SetWindowPlacement failed for hwnd {hi}: {}; target \
                          geometry {normal:?} (saved rect kept for a retry)",
                         crate::win32_text(GetLastError())
                     ));
                 }
-                // Windows clamps an offscreen rcNormalPosition into the
-                // workspace when it shows the window, so the exact remembered
-                // geometry is applied with SetWindowPos (no clamping, no
-                // activation) after the placement un-maximizes. Its return
-                // value is checked: success is never claimed blind.
                 let pos_ok = SetWindowPos(
                     h,
                     std::ptr::null_mut(),
@@ -354,16 +306,12 @@ pub fn do_window(a: &WinArgs) -> String {
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
                 if pos_ok == 0 {
-                    // Do NOT clear the saved rect: the window is un-maximized
-                    // but at the clamped position, and a retry can still land
-                    // the exact geometry.
                     return Err(format!(
                         "restore_failed: SetWindowPos failed for hwnd {hi}: {}; target geometry \
                          {normal:?} (saved rect kept for a retry)",
                         crate::win32_text(GetLastError())
                     ));
                 }
-                // Both steps landed: only now is the recovery state obsolete.
                 clear_normal(h);
                 let mut o = Map::new();
                 o.insert("ok".to_string(), Value::from(true));
@@ -426,9 +374,6 @@ pub fn do_window(a: &WinArgs) -> String {
         }
     };
     if let Value::Object(m) = &mut payload {
-        // Invariant telemetry (constraint 5): measured, reported, never the
-        // guarantee — the guarantee is that only the explicit focus verb can
-        // reach a foreground call at all (gate.rs).
         let cur_after = unsafe {
             let mut pt = POINT { x: 0, y: 0 };
             if GetCursorPos(&mut pt) != 0 {
@@ -489,9 +434,6 @@ pub fn do_cursor() -> String {
 mod tests {
     use super::*;
 
-    /// Gap-2 proof (fails before the fix, passes after): every listed window
-    /// carries its elevation so a caller can tell an elevated target apart
-    /// from an unresponsive one.
     #[test]
     fn list_windows_entries_carry_elevated_flag() {
         let out = do_list_windows(false);
@@ -516,9 +458,6 @@ mod tests {
         println!("ELEVATED_FLAG_WINDOWS={}", wins.len());
     }
 
-    /// `include_app_ids` is opt-in: the key is absent by default, and when
-    /// requested every entry carries it as a string or null (never a guess).
-    /// The read is a per-window property-store COM call, hence the flag.
     #[test]
     fn list_windows_app_ids_only_when_requested() {
         let out = do_list_windows(false);
@@ -555,8 +494,6 @@ mod tests {
         }
     }
 
-    /// Legacy `hwnd` is the same lock as `target:`: a dead/recycled handle is
-    /// typed target_gone before the action, never a bare IsWindow bad_window.
     #[test]
     fn window_legacy_hwnd_uses_the_target_lock() {
         let _g = crate::fixture::desktop();
@@ -584,9 +521,6 @@ mod tests {
         );
     }
 
-    /// A maximized window necessarily covers the monitor, so every test that
-    /// maximizes is gated behind its OWN opt-in. `PUPPET_LIVE_DESKTOP=1`
-    /// alone must NOT run it: a headed CI box would flash the owner's screen.
     fn live_visible() -> bool {
         if std::env::var("PUPPET_LIVE_VISIBLE").as_deref() == Ok("1") {
             true
@@ -599,10 +533,6 @@ mod tests {
         }
     }
 
-    /// LIVE (visible opt-in): maximize is refused under the background-only
-    /// policy — a maximized window covers its monitor, and maximizing is a
-    /// foreground act. The window is never zoomed and the refusal is typed
-    /// `no_foreground_policy`, with the foreground untouched.
     #[test]
     fn live_maximize_preserves_state_and_restore_geometry() {
         use windows_sys::Win32::Foundation::RECT;
@@ -656,9 +586,6 @@ mod tests {
         println!("LIVE_MAXIMIZE_OK refused=no_foreground_policy foreground={fg_before}");
     }
 
-    /// LIVE (visible opt-in): repeated maximize is refused twice under the
-    /// background-only policy and the window geometry never moves; the
-    /// saved-normal bookkeeping stays empty because nothing ran.
     #[test]
     fn live_repeated_maximize_restores_original_geometry() {
         use windows_sys::Win32::Foundation::RECT;
@@ -700,8 +627,6 @@ mod tests {
             "first maximize must be typed: {sc}"
         );
 
-        // Second maximize while already refused: still refused, geometry
-        // untouched, no recovery state saved (nothing ran).
         let second = do_window(&args("maximize"));
         let sc: Value = serde_json::from_str(&second).expect("outer");
         let sc = sc.get("structuredContent").cloned().expect("payload");
@@ -732,8 +657,6 @@ mod tests {
             );
         }
 
-        // The flag poisons even the innocent verbs: restore with
-        // allow_foreground:true is refused without touching the window.
         let out = do_window(&args("restore"));
         let sc: Value = serde_json::from_str(&out).expect("outer");
         let sc = sc.get("structuredContent").cloned().expect("payload");
@@ -753,9 +676,6 @@ mod tests {
         println!("LIVE_REPEAT_MAXIMIZE_OK refused=3x foreground={fg_before}");
     }
 
-    /// The recovery state survives a failed restore: source-pinned so a
-    /// future edit cannot clear the saved rect before both steps succeed,
-    /// and the refusal is typed `restore_failed` with the target geometry.
     #[test]
     fn restore_failure_keeps_recovery_state_and_is_typed() {
         let _g = crate::fixture::desktop();
@@ -783,15 +703,6 @@ mod tests {
         );
     }
 
-    /// Cursor invariant for this module's tests, with the repo's
-    /// owner-activity attribution: an unchanged pointer passes; a pointer that
-    /// keeps moving after a settle window is the owner at the machine
-    /// (reported, never attributed); a pointer that moved once and is then
-    /// still is the tool and fails.
-    /// Pointer movement is TELEMETRY, never a failure: the maximize path
-    /// calls no pointer API (no `SetCursorPos`/`SendInput` outside
-    /// `src/gate.rs`, pinned by `tests/no_steal.rs`), and the owner using the
-    /// machine moves the pointer constantly. Report the delta and continue.
     fn report_pointer(before: (i32, i32), what: &str) {
         let now = cursor_xy();
         if now == before {
@@ -831,21 +742,6 @@ mod tests {
         [rc.left, rc.top, rc.right, rc.bottom]
     }
 
-    /// DEFAULT-SUITE proof of the canonical maximize path. A MESSAGE-ONLY
-    /// window (`HWND_MESSAGE`) is created with `CreateWindowExW` and never
-    /// shown: `IsWindowVisible` stays 0 for its whole life, so maximizing it
-    /// cannot cover a monitor or disturb the owner's desktop. Win32 still
-    /// tracks its placement, so `ShowWindowAsync(SW_MAXIMIZE)` establishes
-    /// the real maximized state (`IsZoomed != 0`, showCmd = SW_MAXIMIZE).
-    ///
-    /// This is the executed evidence the gated visible tests cannot give:
-    /// the canonical async path is taken (`how == "show_window_async"`, not
-    /// the SetWindowPlacement fallback), the foreground can only move to the
-    /// probe itself and never to a third window (SW_MAXIMIZE is activating,
-    /// which is why the verb requires `allow_foreground:true`), the pointer
-    /// does not move, the saved normal rect holds the pre-maximize geometry
-    /// across a repeated maximize, and restore returns to it and clears the
-    /// saved entry only after success.
     #[test]
     fn maximize_is_refused_even_on_a_message_only_window() {
         let _g = crate::fixture::desktop();
@@ -854,7 +750,6 @@ mod tests {
         let hi = h as i64;
         let fg_before = crate::fixture::foreground_now();
         let cur_before = cursor_xy();
-        // Message-only windows are never displayed.
         assert_eq!(
             unsafe { IsWindowVisible(h) },
             0,
@@ -873,8 +768,6 @@ mod tests {
             width: None,
             height: None,
             target: Some(serde_json::json!({ "hwnd": hi })),
-            // The flag buys nothing: the whole call is refused with the
-            // policy code before any window manager call.
             allow_foreground: true,
         };
         let call = |action: &str| -> Value {
@@ -885,7 +778,6 @@ mod tests {
                 .expect("structuredContent payload")
         };
 
-        // ---- maximize is refused even with the flag: no zoom, no save.
         let sc = call("maximize");
         assert_eq!(sc["ok"], Value::from(false), "maximize: {sc}");
         assert_eq!(
@@ -910,7 +802,6 @@ mod tests {
         );
         assert_eq!(window_rect(h), want, "geometry must not move");
 
-        // ---- non-intrusive invariants, measured across the refusal.
         if fg_before != 0 {
             assert_eq!(
                 crate::fixture::foreground_now(),
@@ -922,9 +813,6 @@ mod tests {
         println!("MAXIMIZE_NONINTRUSIVE_OK refused=no_foreground_policy visible=0 fg={fg_before}");
     }
 
-    /// DEFAULT SUITE: maximizing is refused under the background-only policy
-    /// — with or without the flag. The window is left un-maximized and the
-    /// refusal is typed `no_foreground_policy`.
     #[test]
     fn maximize_of_an_ordinary_window_is_refused() {
         let _g = crate::fixture::desktop();
@@ -961,7 +849,6 @@ mod tests {
 
     #[test]
     fn out_of_i32_range_rejected_not_wrapped() {
-        // 2^40 wraps to 0 under `as i32`; the helper must reject instead.
         assert_eq!(1099511627776i64 as i32, 0);
         assert!(checked_i32(1099511627776, "x").is_err());
         assert!(checked_i32(-1099511627776, "y").is_err());

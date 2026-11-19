@@ -225,7 +225,6 @@ fn schema_declares_p4b_fields() {
             })
             .unwrap_or_else(|| panic!("{typ} variant present"))
     };
-    // move: absolute or relative, never both, never neither.
     let mv = variant("move");
     let props = mv
         .get("properties")
@@ -234,7 +233,6 @@ fn schema_declares_p4b_fields() {
     for k in ["dx", "dy"] {
         assert!(props.contains_key(k), "move must declare {k}");
     }
-    // key: hold/repeat/gap.
     let key = variant("key");
     let props = key
         .get("properties")
@@ -243,14 +241,12 @@ fn schema_declares_p4b_fields() {
     for k in ["hold_ms", "repeat", "gap_ms"] {
         assert!(props.contains_key(k), "key must declare {k}");
     }
-    // scroll: element target.
     let sc = variant("scroll");
     let props = sc
         .get("properties")
         .and_then(|v| v.as_object())
         .expect("scroll properties");
     assert!(props.contains_key("element"), "scroll must declare element");
-    // No new action type was added.
     assert_eq!(
         variants.len(),
         16,
@@ -260,8 +256,6 @@ fn schema_declares_p4b_fields() {
 
 #[test]
 fn scroll_element_drives_uia_pattern_live() {
-    // Element scroll on the fixture's own scrollable multiline edit: UIA
-    // ScrollPattern, no mouse, no owner input.
     if !live() {
         return;
     }
@@ -293,8 +287,6 @@ fn scroll_element_drives_uia_pattern_live() {
 
 #[test]
 fn scroll_element_rejects_xy_live() {
-    // Element scroll is UIA-only live too: x/y alongside element is a
-    // typed error, never a queued mouse move.
     if !live() {
         return;
     }

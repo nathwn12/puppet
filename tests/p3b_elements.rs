@@ -1,14 +1,3 @@
-//! P3b elements continuation + element wait: paging (`max_depth`/`offset`/
-//! `next_offset`) and `wait_for` kind `element`.
-//!
-//! The schema assertions run everywhere (no desktop touch). The live tests
-//! are gated by PUPPET_LIVE_DESKTOP=1 and drive only the dedicated fixture
-//! app (`src/bin/puppet_fixture_app`): a window with one EDIT plus, in
-//! paging mode, 250 named buttons. No Notepad, no owner data, no input —
-//! `elements` and `wait_for` are read-only paths.
-//!
-//! These tests fail on the pre-P3b tree (no max_depth/offset, no element
-//! kind) and pass after.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -93,7 +82,6 @@ impl Session {
         self.stdin.flush().expect("flush frame");
     }
 
-    /// Drain every response that arrives within `wait`, returning them all.
     fn drain(&self, wait: Duration) -> Vec<Value> {
         let deadline = Instant::now() + wait;
         let mut out = Vec::new();
@@ -230,7 +218,6 @@ fn wait_for_schema_declares_element_kind() {
 
 #[test]
 fn elements_args_rejected_before_any_walk() {
-    // Type/shape validation happens in serve with no desktop touch.
     let mut s = Session::spawn();
     for (id, args, want) in [
         (
@@ -276,12 +263,7 @@ fn elements_args_rejected_before_any_walk() {
     }
 }
 
-/// Kill leftover fixture processes from a previous (possibly panicked) run.
-/// Scoped strictly to our own fixture executable plus the exact test window
-/// title — never touches owner apps.
 fn kill_stale_fixtures(title: &str) {
-    // Exact title, no wildcard: combined with the IMAGENAME filter this can
-    // only hit our fixture binary showing exactly this test window.
     let _ = Command::new("taskkill")
         .args([
             "/F",
@@ -296,17 +278,12 @@ fn kill_stale_fixtures(title: &str) {
         .status();
 }
 
-/// Owning handle for one fixture process. `Drop` kills and reaps, so a
-/// panic anywhere in the test still cleans up (no leaked windows to
-/// contaminate reruns).
 struct Fixture {
     child: Child,
     title: String,
 }
 
 impl Fixture {
-    /// Spawn the fixture app (`argv[1]` = window title, `argv[2]` = extra
-    /// button count or absent).
     fn spawn(title: &str, extra: Option<u32>) -> Self {
         let exe = env!("CARGO_BIN_EXE_puppet_fixture_app");
         let mut cmd = Command::new(exe);
@@ -352,10 +329,8 @@ fn elements_paging_covers_different_controls() {
     kill_stale_fixtures("p3b-paging-live");
     let fx = Fixture::spawn("p3b-paging-live", Some(250));
     let title = fx.title.clone();
-    // Give the process a beat to create its window before the first walk.
     std::thread::sleep(Duration::from_millis(500));
     let mut s = Session::spawn();
-    // Page 1: the first 200 accepted entries.
     let r1 = s.result(
         20,
         "elements",
@@ -383,7 +358,6 @@ fn elements_paging_covers_different_controls() {
         Some(&Value::from(8)),
         "depth_limit must echo the applied max_depth"
     );
-    // Page 2: the remainder, disjoint from page 1.
     let r2 = s.result(
         21,
         "elements",
@@ -418,7 +392,6 @@ fn elements_paging_covers_different_controls() {
         fp1.union(&fp2).count(),
         "union of pages must not duplicate controls"
     );
-    // Depth clamp still reported truthfully at a shallow limit.
     let r3 = s.result(
         22,
         "elements",
@@ -435,7 +408,6 @@ fn elements_paging_covers_different_controls() {
         e1.len(),
         e2.len()
     );
-    // Fixture guard drops here and reaps the process.
     drop(fx);
 }
 
@@ -451,7 +423,6 @@ fn wait_for_element_states() {
     std::thread::sleep(Duration::from_millis(500));
     let mut s = Session::spawn();
     let win = serde_json::json!("title:p3b-wait-live");
-    // appear: the single EDIT (path 0) is already there.
     let r = s.result(
         30,
         "do",
@@ -468,7 +439,6 @@ fn wait_for_element_states() {
         Some(&Value::from(true)),
         "existing control must satisfy appear, got: {first}"
     );
-    // enabled: the EDIT is enabled.
     let r = s.result(
         31,
         "do",
@@ -480,7 +450,6 @@ fn wait_for_element_states() {
         Some(&Value::from(true)),
         "enabled EDIT must satisfy enabled, got: {first}"
     );
-    // disabled on an enabled control: polls to timeout, not an error.
     let t1 = Instant::now();
     let r = s.result(
         32,
@@ -503,8 +472,6 @@ fn wait_for_element_states() {
         "disabled wait must poll to timeout, took {:?}",
         t1.elapsed()
     );
-    // disappear: close the window mid-wait from the test side; the wait must
-    // observe the transition and satisfy.
     let mut fx2 = Fixture::spawn("p3b-wait-gone", None);
     let title2 = fx2.title.clone();
     std::thread::sleep(Duration::from_millis(500));
@@ -542,10 +509,6 @@ fn wait_for_element_states() {
 
 #[test]
 fn wait_for_element_finds_control_past_first_page() {
-    // Defect-1 regression: the wait must scan the whole tree, not just
-    // offset 0. `p3b-btn-249` sits on page 2 of the 251-control fixture
-    // tail, so appear/enabled can only succeed with a full paged scan;
-    // after the fixture closes, disappear must succeed the same way.
     if !live() {
         return;
     }
@@ -554,7 +517,6 @@ fn wait_for_element_finds_control_past_first_page() {
     std::thread::sleep(Duration::from_millis(500));
     let mut s = Session::spawn();
     let win = serde_json::json!("title:p3b-wait-page2");
-    // appear on a page-2 control.
     let r = s.result(
         50,
         "do",
@@ -566,7 +528,6 @@ fn wait_for_element_finds_control_past_first_page() {
         Some(&Value::from(true)),
         "page-2 control must satisfy appear via paged scan, got: {first}"
     );
-    // enabled on the same page-2 control (fixture buttons are enabled).
     let r = s.result(
         51,
         "do",
@@ -578,7 +539,6 @@ fn wait_for_element_finds_control_past_first_page() {
         Some(&Value::from(true)),
         "page-2 control must satisfy enabled via paged scan, got: {first}"
     );
-    // disappear after the fixture closes: the full scan must find nothing.
     fx.kill_and_reap();
     std::thread::sleep(Duration::from_millis(500));
     let r = s.result(
@@ -597,10 +557,6 @@ fn wait_for_element_finds_control_past_first_page() {
 
 #[test]
 fn wait_for_element_cross_page_ambiguity_is_an_error() {
-    // Cross-page ambiguity: `p3b-dup` names two buttons, one on page 1 and
-    // one past the 200-entry cap. The wait must scan every page, count both
-    // hits, and fail fast with an ambiguous per-action error — never report
-    // satisfied from the first page alone, never spin to timeout.
     if !live() {
         return;
     }

@@ -1,24 +1,3 @@
-//! Target lock: resolve ONE window from a structured selector, snapshot its
-//! identity, and revalidate it before every action.
-//!
-//! Owner contract this module exists for: control must be exact and
-//! background-safe. A call names its window once (`target`), the lock keeps
-//! `hwnd` + `pid` + image name + class (+ AppUserModelID when asked for), and
-//! every action revalidates that identity first. There is NO fallback to the
-//! foreground window: an ambiguous or vanished target is a typed error
-//! (`ambiguous_target` / `target_gone`) and the call does nothing.
-//!
-//! Coordinate convention (documented in README + tool descriptions):
-//! 1. a `target` call takes `x`/`y` as CLIENT-AREA PHYSICAL PIXELS of the
-//!    locked window (`GetClientRect` space, origin at the client top-left);
-//! 2. a call without a target takes `x`/`y` as virtual-desktop screen pixels
-//!    (the legacy SendInput path, still gated behind `allow_cursor`);
-//! 3. window/element rects reported by the tools stay in SCREEN pixels, so an
-//!    element centre is converted here with `screen_point_to_client`.
-//!
-//! This process is per-monitor DPI aware (main.rs), so client pixels are
-//! physical device pixels on every monitor; `dpi` is reported for callers
-//! that want logical units, and `scale_at_dpi` is the one conversion used.
 
 use serde_json::{Map, Value};
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
@@ -123,7 +102,6 @@ impl TargetSpec {
             "title" => spec.title_contains = Some(val),
             "class" => spec.class_name = Some(val),
             _ => {
-                // Bare text: the legacy grammar treats bare digits as hwnd.
                 match crate::parse_int_loose(t) {
                     Some(h) => spec.hwnd = Some(h),
                     None => spec.title_contains = Some(t.to_string()),
@@ -392,11 +370,6 @@ impl TargetLock {
                 ),
             ));
         }
-        // PID alone is not identity: Windows recycles PIDs, so a reused pid
-        // would otherwise pass every check below. `GetProcessTimes` gives the
-        // creation time, which cannot be reused while the old process lives.
-        // Unreadable at lock time (0) fails open, and an unreadable NOW is a
-        // gone process (the window check above already caught the rest).
         if self.created != 0 {
             let now = crate::process_created(pid).unwrap_or(0);
             if now != self.created {
@@ -534,7 +507,6 @@ pub fn lock(spec: &TargetSpec) -> Result<TargetLock, TargetError> {
     })
 }
 
-/// `PKEY_AppUserModel_ID`: fmtid {9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}, pid 5.
 fn app_user_model_pkey() -> windows::Win32::Foundation::PROPERTYKEY {
     windows::Win32::Foundation::PROPERTYKEY {
         fmtid: windows::core::GUID::from_u128(0x9f4c_2855_9f79_4b39_a8d0_e1d4_2de1_d5f3),
@@ -554,9 +526,6 @@ pub fn app_id_of(hwnd: i64) -> Option<String> {
         return None;
     }
     unsafe {
-        // Best-effort COM init on whatever worker thread serves this call;
-        // RPC_E_CHANGED_MODE (already MTA/STA) is fine — the call below does
-        // not care which apartment the store marshals through.
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let store: IPropertyStore = SHGetPropertyStoreForWindow::<IPropertyStore>(
             windows::Win32::Foundation::HWND(hwnd as *mut core::ffi::c_void),
@@ -565,8 +534,6 @@ pub fn app_id_of(hwnd: i64) -> Option<String> {
         let key = app_user_model_pkey();
         let mut pv: PROPVARIANT = store.GetValue(&key).ok()?;
         let vt = pv.Anonymous.Anonymous.vt;
-        // VT_LPWSTR (31) is what PKEY_AppUserModel_ID stores; anything else
-        // is reported as absent rather than guessed.
         let out = if vt == windows::Win32::System::Variant::VT_LPWSTR {
             let p = pv.Anonymous.Anonymous.Anonymous.pwszVal;
             if p.is_null() {
@@ -759,8 +726,6 @@ mod tests {
 
     #[test]
     fn ambiguity_reports_candidates_and_never_picks_one() {
-        // Two fabricated rows share an image name: the resolver must refuse
-        // with both candidates, never pick the first/foreground one.
         let rows = vec![row(1, 2, "a.exe", "A", "C1"), row(3, 4, "a.exe", "B", "C2")];
         let mut spec = TargetSpec {
             exe: Some("a.exe".to_string()),
@@ -774,7 +739,6 @@ mod tests {
         assert_eq!(m["code"], json!(AMBIGUOUS));
         assert_eq!(m["candidates"].as_array().map(|a| a.len()), Some(2));
 
-        // Zero hits is `target_gone`, one hit is the answer.
         spec.exe = Some("nope.exe".to_string());
         assert_eq!(resolve_from(&spec, rows.clone()).unwrap_err().code, GONE);
         spec.exe = Some("a.exe".to_string());
@@ -791,8 +755,6 @@ mod tests {
 
     #[test]
     fn coordinate_math_matches_the_documented_convention() {
-        // Screen = client origin + client point; the live assertion lives in
-        // the fixture test, which compares this to ClientToScreen.
         assert_eq!(offset_point((100, 50), (10, 20)), (110, 70));
         assert_eq!(offset_point((-1920, -10), (0, 0)), (-1920, -10));
         assert_eq!(scale_at_dpi(96), 1.0);
@@ -800,8 +762,6 @@ mod tests {
         assert_eq!(scale_at_dpi(192), 2.0);
     }
 
-    /// The PID alone is not identity: the same hwnd + pid with a different
-    /// process creation time is a recycled PID and must be refused.
     #[test]
     fn pid_reuse_with_a_different_creation_time_is_rejected() {
         let _g = crate::fixture::desktop();
@@ -814,7 +774,6 @@ mod tests {
         let l = lock(&spec).expect("hwnd lock resolves");
         assert!(l.created != 0, "GetProcessTimes must yield a creation time");
         l.revalidate().expect("the real lock validates");
-        // Same hwnd, same pid, different creation time: a forged recycled PID.
         let mut forged = l.clone();
         forged.created = l.created.wrapping_add(1);
         let e = forged
@@ -829,8 +788,6 @@ mod tests {
         println!("PID_REUSE_OK created={} refusal={}", l.created, e.text());
     }
 
-    /// LIVE: the lock is identity, not foreground state — it stays valid
-    /// while the target is NOT the foreground window (the alt-tab case).
     #[test]
     fn live_lock_survives_the_target_being_backgrounded() {
         let _g = crate::fixture::desktop();
@@ -851,9 +808,6 @@ mod tests {
         println!("LOCK_BACKGROUND_OK target={top} foreground={fg}");
     }
 
-    /// Live: the AppUserModelID property store is read, and an appId selector
-    /// resolves through it. Tolerant by design — a machine with no packaged
-    /// windows reports the skip instead of pretending.
     #[test]
     fn live_app_id_resolves_through_the_property_store() {
         let mut sample: Option<(String, i64)> = None;
@@ -883,8 +837,6 @@ mod tests {
                 println!("APPID_OK appId={app_id} hwnd={}", l.hwnd);
             }
             Err(e) => {
-                // Several windows of the same packaged app share the id:
-                // ambiguity is the correct typed answer, never a guess.
                 assert_eq!(e.code, AMBIGUOUS, "{}", e.text());
                 assert!(e.candidates.is_some());
                 println!(
@@ -895,9 +847,6 @@ mod tests {
         }
     }
 
-    /// Live: a real (offscreen, never-activated) fixture window. Proves the
-    /// OS agrees with the documented conversion and that resolution by
-    /// hwnd/pid/class finds the same window without touching the foreground.
     #[test]
     fn live_lock_resolves_and_revalidates_the_fixture() {
         let _g = crate::fixture::desktop();
@@ -913,7 +862,6 @@ mod tests {
         assert_eq!(l.pid, std::process::id());
         l.revalidate().expect("fresh lock revalidates");
 
-        // pid + class describe the same single window.
         let by_class = TargetSpec {
             pid: Some(std::process::id()),
             class_name: Some(l.class.clone()),
@@ -922,7 +870,6 @@ mod tests {
         let again = lock(&by_class).expect("pid + exact class resolves the fixture");
         assert_eq!(again.hwnd, top);
 
-        // Disagreement inside an hwnd target is refused, not retargeted.
         let bad = TargetSpec {
             hwnd: Some(top),
             pid: Some(std::process::id() + 1),
@@ -931,7 +878,6 @@ mod tests {
         let e = lock(&bad).expect_err("hwnd + wrong pid must not resolve");
         assert_eq!(e.code, GONE, "{}", e.text());
 
-        // Gone: a destroyed window handle.
         drop(f);
         let e = lock(&TargetSpec {
             hwnd: Some(top),
@@ -949,7 +895,6 @@ mod tests {
         }
     }
 
-    /// Live: the coordinate conversion is the OS's, not an approximation.
     #[test]
     fn live_client_conversion_matches_client_to_screen() {
         let _g = crate::fixture::desktop();

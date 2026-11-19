@@ -1,16 +1,3 @@
-//! W6.2 fixture capabilities: the live fixture can now prove "ignored",
-//! `routed_to`, double-click spacing and `settle_ms` ordering.
-//!
-//! The live tests are gated by PUPPET_LIVE_DESKTOP=1 and drive only the
-//! dedicated fixture app (`src/bin/puppet_fixture_app` in `caps` mode): a
-//! window with a frame hosting a child button at a known client rect, a
-//! message-swallowing control, a checkbox, a listbox, a grid, a tree, a
-//! trackbar, and a stamped message log readable through `elements`
-//! detail:text. No owner data, no input beyond the fixture window itself.
-//!
-//! These tests fail on the pre-W6.2 tree (the `caps` mode, its controls and
-//! its log do not exist) and pass after. Existing fixture modes are
-//! untouched, so every other live suite keeps its exact window.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -103,9 +90,6 @@ impl Drop for Session {
     }
 }
 
-/// Kill leftover fixture processes from a previous (possibly panicked) run.
-/// Scoped strictly to our own fixture executable plus the exact test window
-/// title — never touches owner apps.
 fn kill_stale_fixtures(title: &str) {
     let _ = Command::new("taskkill")
         .args([
@@ -121,16 +105,12 @@ fn kill_stale_fixtures(title: &str) {
         .status();
 }
 
-/// Owning handle for one fixture process. `Drop` kills and reaps, so a
-/// panic anywhere in the test still cleans up (no leaked windows to
-/// contaminate reruns).
 struct Fixture {
     child: Child,
     title: String,
 }
 
 impl Fixture {
-    /// Spawn the fixture app in the W6.2 `caps` mode.
     fn spawn_caps(title: &str) -> Self {
         let exe = env!("CARGO_BIN_EXE_puppet_fixture_app");
         let child = Command::new(exe)
@@ -186,27 +166,16 @@ fn find_auto<'a>(els: &'a [Value], auto_id: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("elements must list auto_id:{auto_id}"))
 }
 
-/// The fixture's stamped message log, read the same way an agent would:
-/// `elements` detail:text on the log control (auto_id 4000).
 fn log_text(s: &mut Session, id: i64, title: &str) -> String {
     let els = elements_detail(s, id, title);
     let log = find_auto(&els, "4000");
     log.get("text")
         .and_then(|v| v.as_str())
         .unwrap_or_else(|| panic!("log control must carry readable text, got: {log}"))
-        // RichEdit stores line breaks as CR; normalize so the log parses
-        // like any other text.
         .replace("\r\n", "\n")
         .replace('\r', "\n")
 }
 
-/// Wait for the fixture's own readiness signal.
-///
-/// A freshly spawned fixture window reads all-black until its first `WM_PAINT`
-/// has been composited, and the capture refuses that frame; its children also
-/// appear in the UIA tree a moment later. The caps window writes `painted`
-/// into its stamped log on that first paint, so the log is evidence rather
-/// than a guess: a fixed sleep is how this suite flaked once mid-run.
 fn wait_painted(s: &mut Session, title: &str) {
     static NEXT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(900);
     let t0 = std::time::Instant::now();
@@ -239,8 +208,6 @@ fn wait_painted(s: &mut Session, title: &str) {
     panic!("the caps fixture never reported a painted frame: {last}");
 }
 
-/// One `layout <name> cx=<n> cy=<n> w=<n> h=<n>` line the fixture writes at/// boot, in the top-level's client coordinates — the "known client rect" a
-/// coordinate click can aim at.
 fn layout_of(log: &str, name: &str) -> (i64, i64, i64, i64) {
     let key = format!("layout {name} ");
     let line = log
@@ -282,9 +249,6 @@ fn msg_count(log: &str, msg: &str) -> usize {
     log.lines().filter(|l| l.contains(msg)).count()
 }
 
-/// Every capability SPEC.md W6.2 requires, in one window: the frame's child
-/// button, the swallowing control, the checkbox, the listbox, the grid, the
-/// tree/trackbar the state object reads, and the stamped log.
 #[test]
 fn caps_fixture_exposes_every_control_and_a_stamped_log() {
     if !live() {
@@ -294,12 +258,9 @@ fn caps_fixture_exposes_every_control_and_a_stamped_log() {
     let fx = Fixture::spawn_caps("caps-controls");
     let title = fx.title.clone();
     let mut s = Session::spawn();
-    // The fixture reports when its first frame exists; the 600 ms sleep this
-    // replaces was a guess that lost once mid-run.
     wait_painted(&mut s, &title);
 
     let els = elements_detail(&mut s, 1, &title);
-    // Controls whose UIA name is their window text.
     for name in [
         "dc-frame-btn",
         "dc-swallow",
@@ -313,9 +274,6 @@ fn caps_fixture_exposes_every_control_and_a_stamped_log() {
             "every fixture control must carry an fp, got: {e}"
         );
     }
-    // Controls with no accessible name (listbox, grid, log) and the
-    // trackbar are addressable by auto_id, which is how the later items
-    // select them.
     for auto_id in ["4000", "4002", "4003", "4006"] {
         find_auto(&els, auto_id);
     }
@@ -325,7 +283,6 @@ fn caps_fixture_exposes_every_control_and_a_stamped_log() {
         log.contains("boot"),
         "the log must open with a boot line, got: {log:?}"
     );
-    // Known client rects for the coordinate clicks the later items need.
     for name in ["dc-frame-btn", "dc-swallow", "dc-toggle"] {
         let (cx, cy, w, h) = layout_of(&log, name);
         assert!(
@@ -337,9 +294,6 @@ fn caps_fixture_exposes_every_control_and_a_stamped_log() {
     println!("CAPS_OK every W6.2 control and the stamped log are present");
 }
 
-/// The two observations W4.1 and W4.2 need: a posted click at a known client
-/// point is recorded with its coordinates, and neither the frame's button nor
-/// the swallowing control activates.
 #[test]
 fn caps_fixture_records_posted_clicks_and_never_activates() {
     if !live() {
@@ -349,8 +303,6 @@ fn caps_fixture_records_posted_clicks_and_never_activates() {
     let fx = Fixture::spawn_caps("caps-posted");
     let title = fx.title.clone();
     let mut s = Session::spawn();
-    // The fixture reports when its first frame exists; the 600 ms sleep this
-    // replaces was a guess that lost once mid-run.
     wait_painted(&mut s, &title);
 
     let log = log_text(&mut s, 10, &title);
@@ -393,9 +345,6 @@ fn caps_fixture_records_posted_clicks_and_never_activates() {
     println!("CAPS_POSTED_OK posted clicks are stamped and nothing activates");
 }
 
-/// The two timing observations W4.4 and W4.5 need: both clicks of a burst
-/// land before the trailing `settle_ms` pause, and a `count:2` click leaves
-/// two stamped button-downs whose gap is computable from the log.
 #[test]
 fn caps_fixture_log_orders_a_burst_before_the_settle_pause() {
     if !live() {
@@ -405,8 +354,6 @@ fn caps_fixture_log_orders_a_burst_before_the_settle_pause() {
     let fx = Fixture::spawn_caps("caps-timing");
     let title = fx.title.clone();
     let mut s = Session::spawn();
-    // The fixture reports when its first frame exists; the 600 ms sleep this
-    // replaces was a guess that lost once mid-run.
     wait_painted(&mut s, &title);
 
     let log = log_text(&mut s, 20, &title);
@@ -450,8 +397,6 @@ fn caps_fixture_log_orders_a_burst_before_the_settle_pause() {
         "both clicks must land before the 200 ms trailing pause, got stamps {downs:?}"
     );
 
-    // `count:2` in one action: two stamped downs, so the gap between them is
-    // observable (the W4.5 assertion reads exactly this).
     let before = downs.len();
     let r = s.result(
         23,

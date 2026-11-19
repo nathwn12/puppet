@@ -1,14 +1,3 @@
-//! W1.1 contract truth: the text an agent reads first must describe this
-//! server and no other.
-//!
-//! These tests fail on the pre-W1.1 tree: `instructions()` names six tools,
-//! there is no claims source, and the `allow_*` clause reads as an
-//! escalation path. Only `initialize` and `tools/list` run — no desktop
-//! touch, no injection.
-//!
-//! The claims source is parsed, not duplicated: rows are read as the quoted
-//! strings between brackets, so a claims string may not contain a double
-//! quote.
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
@@ -112,12 +101,9 @@ fn instructions_and_tools() -> (String, Vec<Value>) {
     (instructions, tools)
 }
 
-/// The claims source as the crate sees it, so the test pins the consts the
-/// code actually uses rather than a copy.
 const CLAIMS: &str = include_str!("../src/claims.rs");
 const GATE: &str = include_str!("../src/gate.rs");
 
-/// The bracketed body of one `pub const NAME … = [ … ];` declaration.
 fn table_body(name: &str) -> &'static str {
     let at = CLAIMS
         .find(&format!("pub const {name}:"))
@@ -138,7 +124,6 @@ fn table_body(name: &str) -> &'static str {
     &rest[open..close]
 }
 
-/// Every double-quoted string in a fragment, in order.
 fn quoted(fragment: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = fragment;
@@ -151,14 +136,10 @@ fn quoted(fragment: &str) -> Vec<String> {
     out
 }
 
-/// A flat string list, e.g. `ERROR_CODES`.
 fn claims_list(name: &str) -> Vec<String> {
     quoted(table_body(name))
 }
 
-/// A table of `arity`-field tuples, e.g. `TOOL_LINES` (2), `REFUSALS` (3).
-/// Rows are grouped by arity, so prose punctuation inside a claim cannot
-/// move a row boundary.
 fn claims_rows(name: &str, arity: usize) -> Vec<Vec<String>> {
     let values = quoted(table_body(name));
     assert_eq!(
@@ -169,7 +150,6 @@ fn claims_rows(name: &str, arity: usize) -> Vec<Vec<String>> {
     values.chunks(arity).map(|c| c.to_vec()).collect()
 }
 
-/// One `pub const NAME: &str = "value";` claim.
 fn claims_const(name: &str) -> String {
     let at = CLAIMS
         .find(&format!("pub const {name}:"))
@@ -180,8 +160,6 @@ fn claims_const(name: &str) -> String {
         .unwrap_or_else(|| panic!("{name} must carry a string value"))
 }
 
-/// Every `.rs` file under `src/`, except the claims source itself: the
-/// surface a code has to appear on to be a real code.
 fn src_files_without_claims() -> Vec<String> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -208,7 +186,6 @@ fn src_files_without_claims() -> Vec<String> {
         .collect()
 }
 
-/// `pub const NAME: &str = "value";` values from a source file.
 fn string_consts(src: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for line in src.lines() {
@@ -255,7 +232,6 @@ fn every_error_code_is_a_real_code_and_every_real_code_is_listed() {
     let codes = claims_list("ERROR_CODES");
     assert!(!codes.is_empty(), "ERROR_CODES must not be empty");
 
-    // (b) every refusing const in the gate is listed.
     let gate_codes: Vec<(String, String)> = string_consts(GATE)
         .into_iter()
         .filter(|(n, _)| n.ends_with("_POLICY") || n.ends_with("_UNAVAILABLE"))
@@ -271,7 +247,6 @@ fn every_error_code_is_a_real_code_and_every_real_code_is_listed() {
         );
     }
 
-    // (b, second half) every listed code is documented in the contract.
     for code in &codes {
         assert!(
             instructions.contains(code.as_str()),
@@ -279,7 +254,6 @@ fn every_error_code_is_a_real_code_and_every_real_code_is_listed() {
         );
     }
 
-    // (c) every listed code exists as a literal outside claims.rs.
     let haystack = src_files_without_claims().join("\n");
     for code in &codes {
         assert!(
@@ -288,7 +262,6 @@ fn every_error_code_is_a_real_code_and_every_real_code_is_listed() {
         );
     }
 
-    // The refusal table may only name codes the server can emit.
     let mut refusal_codes: BTreeSet<String> = BTreeSet::new();
     for row in claims_rows("REFUSALS", 3) {
         if let Some(code) = row.get(2).filter(|c| !c.is_empty()) {
@@ -306,7 +279,6 @@ fn every_error_code_is_a_real_code_and_every_real_code_is_listed() {
 #[test]
 fn instructions_state_the_coordinate_rule_and_refuse_the_escalation_path() {
     let (instructions, _) = instructions_and_tools();
-    // (d) the client-vs-screen rule, in the words the claims source uses.
     let coord_rule = claims_const("COORD_RULE");
     assert!(
         instructions.contains(&coord_rule),
@@ -317,7 +289,6 @@ fn instructions_state_the_coordinate_rule_and_refuse_the_escalation_path() {
         lowered.contains("client") && lowered.contains("screen"),
         "the coordinate rule must distinguish client from screen pixels, got: {coord_rule:?}"
     );
-    // No `allow_*:true` outside a refusal clause (W1.2's rule).
     for token in [
         "allow_foreground:true",
         "allow_cursor:true",
@@ -338,7 +309,6 @@ fn instructions_state_the_coordinate_rule_and_refuse_the_escalation_path() {
             from = at + token.len();
         }
     }
-    // The six invariants and every limit are readable in the contract.
     for row in claims_rows("INVARIANTS", 2) {
         assert_eq!(row.len(), 2, "INVARIANTS rows are (id, line): {row:?}");
         assert!(
@@ -359,9 +329,6 @@ fn instructions_state_the_coordinate_rule_and_refuse_the_escalation_path() {
     }
 }
 
-/// SPEC W2.2: `fp` is identity, never state. The contract names the three
-/// exclusions, the consequence, and the readback a state-sensitive action
-/// needs instead — and never claims the fingerprint catches state.
 #[test]
 fn instructions_scope_the_fingerprint_to_identity() {
     let (instructions, _) = instructions_and_tools();
@@ -383,7 +350,6 @@ fn instructions_scope_the_fingerprint_to_identity() {
             line[1]
         );
     }
-    // The opposite claim would make an agent trust the fingerprint for state.
     let lower = instructions.to_lowercase();
     for banned in [
         "fp covers state",
@@ -398,9 +364,6 @@ fn instructions_scope_the_fingerprint_to_identity() {
     }
 }
 
-/// SPEC W3.5: neither backend composites the cursor into the pixels, and the
-/// contract says so in both texts an agent reads before it goes looking for a
-/// pointer in an image. A claim that the cursor can be seen is a defect.
 #[test]
 fn the_contract_says_the_pointer_is_not_in_the_pixels() {
     let (instructions, tools) = instructions_and_tools();

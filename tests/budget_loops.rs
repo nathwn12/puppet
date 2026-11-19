@@ -1,16 +1,3 @@
-//! The `do` budget must bound the SLEEPS, not only the action loop.
-//!
-//! The defect this pins: the 300 s budget was checked before each action and
-//! used to clamp `wait`/`wait_for`, but the trailing `settle_ms`, the chunked
-//! `type` pacing (`chunk_chars`/`chunk_ms`) and the `key` hold/repeat pacing
-//! (`hold_ms`/`gap_ms` x `repeat` 1..100) slept without consulting it. A
-//! single action could therefore hold the global input lock for hours - the
-//! budget was decorative for exactly the sleeps that are longest.
-//!
-//! Deterministic without a five-minute run: the server child is started with
-//! `PUPPET_TEST_BURST_BUDGET_MS` (test-only, can only SHORTEN the budget,
-//! clamped to 500 ms..300 s), so a 60 s settle is observable in seconds. The
-//! second call in the file proves the input lock came back.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -102,12 +89,6 @@ fn sc_of(r: &Value) -> Value {
         .unwrap_or_else(|| panic!("must carry structuredContent, got: {r}"))
 }
 
-/// A 60 s settle requested behind a wait that already spent the budget must be
-/// clamped to the remainder, and the input lock must be free afterwards.
-///
-/// Pre-fix this call slept the full 60 s (the settle never consulted the
-/// budget), so the elapsed assertion and the lock-free follow-up call both
-/// fail.
 #[test]
 fn settle_is_clamped_to_the_remaining_budget_and_frees_the_input_lock() {
     let mut s = Session::spawn();
@@ -141,7 +122,6 @@ fn settle_is_clamped_to_the_remaining_budget_and_frees_the_input_lock() {
         "the settle must be clamped, not honoured, got {applied}ms"
     );
 
-    // The lock was released: the next burst answers in a normal time.
     let (green, second) = s.call(
         2,
         serde_json::json!({"actions": [{"type": "wait", "ms": 0}]}),
@@ -158,9 +138,6 @@ fn settle_is_clamped_to_the_remaining_budget_and_frees_the_input_lock() {
     );
 }
 
-/// The budget itself is still checked before every action, and the typed code
-/// names what is left unrun (unchanged behaviour, re-pinned here because the
-/// clamp now shares its arithmetic).
 #[test]
 fn action_loop_still_refuses_past_the_budget_with_the_typed_code() {
     let mut s = Session::spawn();

@@ -1,5 +1,3 @@
-//! P1a conformance: handshake, capabilities, version truth, 2026-07-28
-//! discovery path, and strict JSON-RPC framing over stdio.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -144,7 +142,6 @@ fn assert_instructions(result: &Value, what: &str) {
 #[test]
 fn initialize_version_matrix() {
     let mut s = Session::spawn();
-    // (requested, expected echo)
     for (n, req, echo) in [
         (1, "2025-06-18", "2025-06-18"),
         (2, "2025-11-25", "2025-11-25"),
@@ -175,7 +172,6 @@ fn initialize_version_matrix() {
         "initialize",
     );
 
-    // Legacy tools/list carries no modern marker.
     let resp = s.send(&frame(6, "tools/list", serde_json::json!({})));
     let result = resp.get("result").expect("tools/list has result");
     assert!(
@@ -242,7 +238,6 @@ fn tools_list_modern_carries_result_type() {
 #[test]
 fn tools_call_result_type_modern_only() {
     let mut s = Session::spawn();
-    // Legacy peer (no _meta): no marker.
     let resp = s.send(&frame(
         2,
         "tools/call",
@@ -253,7 +248,6 @@ fn tools_call_result_type_modern_only() {
         result.get("resultType").is_none(),
         "legacy tools/call must not carry resultType, got: {result}"
     );
-    // Modern peer: marker plus content.
     let params = meta_params(serde_json::json!({
         "name": "list_windows",
         "arguments": {},
@@ -329,17 +323,13 @@ fn assert_invalid_request(resp: &Value, what: &str) {
 #[test]
 fn strict_framing_rejects_batch_bad_jsonrpc_and_scalar() {
     let mut s = Session::spawn();
-    // Batch array -> single -32600 with null id.
     let resp = s.send_raw(r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#);
     assert_invalid_request(&resp, "batch array");
     assert_eq!(resp.get("id"), Some(&Value::Null));
-    // Wrong jsonrpc version -> -32600.
     let resp = s.send_raw(r#"{"jsonrpc":"1.0","id":21,"method":"ping"}"#);
     assert_invalid_request(&resp, "jsonrpc 1.0 frame");
-    // Valid JSON scalar -> -32600, not a parse error.
     let resp = s.send_raw("42");
     assert_invalid_request(&resp, "scalar frame");
-    // Malformed JSON stays -32700.
     let resp = s.send_raw("{bad json");
     assert_eq!(
         resp.get("error")
@@ -353,13 +343,11 @@ fn strict_framing_rejects_batch_bad_jsonrpc_and_scalar() {
 #[test]
 fn strict_framing_method_shape_never_dropped() {
     let mut s = Session::spawn();
-    // Id but no method -> -32600, fast (bounded wait, never silent).
     s.write_line(r#"{"jsonrpc":"2.0","id":9}"#);
     let resp = s
         .recv(SHORT)
         .expect("method-less frame with id must get a reply, not silence");
     assert_invalid_request(&resp, "method-less frame");
-    // Non-string method -> -32600.
     s.write_line(r#"{"jsonrpc":"2.0","id":22,"method":5}"#);
     let resp = s
         .recv(SHORT)
@@ -370,8 +358,6 @@ fn strict_framing_method_shape_never_dropped() {
 #[test]
 fn notification_gets_no_response() {
     let mut s = Session::spawn();
-    // Valid notification (no id): must stay silent; the following ping is
-    // the only line the server may emit.
     s.write_line(r#"{"jsonrpc":"2.0","method":"ping"}"#);
     s.write_line(r#"{"jsonrpc":"2.0","id":30,"method":"ping"}"#);
     let resp = s.recv(TIMEOUT).expect("ping after notification replies");

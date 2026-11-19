@@ -1,11 +1,3 @@
-//! P1b concurrency: the stdio server stays non-blocking while a long tool
-//! call runs. A `do` with a 5s `wait` must not block `ping`; a
-//! `notifications/cancelled` must drop the call with no response; two `do`
-//! bursts must serialize on the input lock; EOF with a call in flight must
-//! exit promptly.
-//!
-//! These tests fail on the pre-P1b tree (ping blocked, cancel ignored) and
-//! pass after.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -68,7 +60,6 @@ impl Session {
         self.write_line(&serde_json::to_string(frame).unwrap());
     }
 
-    /// Drain every response that arrives within `wait`, returning them all.
     fn drain(&self, wait: Duration) -> Vec<Value> {
         let deadline = Instant::now() + wait;
         let mut out = Vec::new();
@@ -138,10 +129,8 @@ fn cancel_note(request_id: i64) -> Value {
 #[test]
 fn ping_during_long_call() {
     let mut s = Session::spawn();
-    // Long `do` (real 5s wait, no desktop touch) occupies one worker.
     s.send(&do_wait_frame(1, 5000));
     std::thread::sleep(Duration::from_millis(300));
-    // Ping must answer in <1s while the do call is still in flight.
     let t0 = Instant::now();
     s.send(&ping_frame(2));
     let mut ping_resp: Option<Value> = None;
@@ -158,7 +147,6 @@ fn ping_during_long_call() {
     }
     let ping = ping_resp.expect("ping must respond during long call");
     let lat = Instant::now().duration_since(t0);
-    // (Arrival was just observed; the 200ms drain quantum bounds the error.)
     assert!(
         lat < Duration::from_millis(1200),
         "ping must return in <1s during a long call, took {lat:?}"
@@ -169,7 +157,6 @@ fn ping_during_long_call() {
         "ping result must be empty object, got: {ping}"
     );
     assert!(!saw_do, "do call must still be in flight when ping answers");
-    // Let the do call finish (or cancel it); it must eventually respond.
     let rest = s.drain(Duration::from_secs(10));
     assert!(
         Session::by_id(&rest, 1).is_some(),
@@ -183,20 +170,17 @@ fn cancelled_call_sends_no_response() {
     s.send(&do_wait_frame(11, 5000));
     std::thread::sleep(Duration::from_millis(300));
     s.send(&cancel_note(11));
-    // No response for the cancelled id within 2s.
     let resps = s.drain(Duration::from_secs(2));
     assert!(
         Session::by_id(&resps, 11).is_none(),
         "cancelled call must send no response, got: {resps:?}"
     );
-    // The server is still alive: ping responds.
     s.send(&ping_frame(12));
     let more = s.drain(Duration::from_secs(5));
     assert!(
         Session::by_id(&more, 12).is_some(),
         "ping must respond after a cancellation, got: {more:?}"
     );
-    // No late do response after another 1s.
     let late = s.drain(Duration::from_secs(1));
     assert!(
         Session::by_id(&late, 11).is_none() && Session::by_id(&more, 11).is_none(),
@@ -208,7 +192,6 @@ fn cancelled_call_sends_no_response() {
 fn pre_start_cancel_drops_call() {
     let mut s = Session::spawn();
     s.send(&do_wait_frame(21, 3000));
-    // Cancel immediately, before the worker plausibly starts.
     s.send(&cancel_note(21));
     let resps = s.drain(Duration::from_secs(4));
     assert!(
@@ -225,10 +208,6 @@ fn pre_start_cancel_drops_call() {
 
 #[test]
 fn cancelled_waiter_never_executes() {
-    // Deterministic waiter cancel: A holds the input lock with a long wait;
-    // B is dispatched while A holds it, so B blocks in the cancellable lock
-    // wait. Cancelling B there must drop it without executing, while A
-    // still completes. (A racy pre-start cancel is covered separately.)
     let mut s = Session::spawn();
     s.send(&do_wait_frame(51, 4000));
     std::thread::sleep(Duration::from_millis(500));
@@ -249,7 +228,6 @@ fn cancelled_waiter_never_executes() {
     }
     assert!(got51, "un-cancelled A must still complete");
     assert!(!got52, "cancelled waiter B must never respond");
-    // No late B response after another 1s.
     let late = s.drain(Duration::from_secs(1));
     assert!(
         Session::by_id(&late, 52).is_none(),
@@ -261,7 +239,6 @@ fn cancelled_waiter_never_executes() {
 fn two_do_bursts_serialize() {
     let mut s = Session::spawn();
     let t0 = Instant::now();
-    // Two long waits; both hold the input lock, so they must serialize.
     s.send(&do_wait_frame(31, 1500));
     s.send(&do_wait_frame(32, 1500));
     let mut got31 = false;
@@ -278,7 +255,6 @@ fn two_do_bursts_serialize() {
         }
     }
     assert!(got31 && got32, "both do calls must respond");
-    // Serialized: ~3s total. Concurrent would be ~1.5s; allow wide margin.
     assert!(
         t0.elapsed() >= Duration::from_millis(2500),
         "two 1500ms do calls must serialize (>=2500ms), took {:?}",
@@ -289,8 +265,6 @@ fn two_do_bursts_serialize() {
 #[test]
 fn eof_with_call_in_flight_exits_promptly() {
     let mut s = Session::spawn();
-    // A 300s `wait_for` stays in flight far past the 2s EOF drain: the pump
-    // must still exit on stdin close, not hang on the wedged worker.
     s.send(&do_wait_for_frame(41, 300000));
     std::thread::sleep(Duration::from_millis(500));
     s.stdin.take();

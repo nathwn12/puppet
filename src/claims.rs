@@ -1,13 +1,3 @@
-//! The claims source (D1).
-//!
-//! Every load-bearing claim an agent can act on is written here exactly once:
-//! the tool lines, the coordinate rule, the refusal table, the authoritative
-//! code list, the invariants and the named limits. `instructions()` is
-//! assembled from these consts, and `tests/contract_truth.rs` pins them to
-//! `tools/list` and to the source that emits them.
-//!
-//! Nothing in this module talks to Windows. A claim is a string; the code
-//! that honours it lives in `gate`, `burst`, `uia`, `shot`, `cap`, `winop`.
 
 /// The seven tools, one line each, in `tools_list_result` order.
 pub const TOOL_LINES: [(&str, &str); 7] = [
@@ -210,17 +200,12 @@ pub fn instructions() -> String {
 
     s.push_str(&format!("\nCoordinates: {COORD_RULE}.\n"));
 
-    // The verb matrix, grouped by class. Refused verbs name the code that
-    // refuses them, so a caller never has to guess which door is bricked.
     s.push_str("\nVerbs by delivery class:\n");
     for class in ["posted", "pattern", "read", "refused"] {
         let verbs: Vec<String> = REFUSALS
             .iter()
             .filter(|(_, c, _)| *c == class)
             .map(|(verb, c, code)| {
-                // The element form is the qualified one: a pattern row is
-                // always element-driven, and a refused row of a verb that
-                // also has a delivered row is that verb's element form.
                 let element_form = *c == "pattern"
                     || (*c == "refused"
                         && REFUSALS

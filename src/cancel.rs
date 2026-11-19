@@ -1,15 +1,3 @@
-//! Cancellation registry for in-flight `tools/call` requests (P1b).
-//!
-//! The stdio reader owns no blocking work: each `tools/call` is dispatched
-//! to a worker with a canonical request-id key
-//! (`serde_json::to_string(&id)`). A `notifications/cancelled` frame carrying
-//! `params.requestId` flips the matching token; the worker drops the
-//! response when the token is set. A cancel that arrives before the worker
-//! starts, or while it waits on the input lock, also drops the call.
-//!
-//! The current token is thread-local so `burst` waits can poll
-//! `cancelled()` without plumbing ids through every helper. Tokens are
-//! removed on completion so a late cancel never kills a finished call.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -23,9 +11,6 @@ thread_local! {
     static CURRENT: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
 }
 
-/// Poison-recovering registry lock: a panicked holder must never deny
-/// future register/cancel/remove calls (the map itself stays valid; only
-/// the panic payload is discarded).
 fn reg() -> MutexGuard<'static, HashMap<String, Arc<AtomicBool>>> {
     REGISTRY
         .lock()

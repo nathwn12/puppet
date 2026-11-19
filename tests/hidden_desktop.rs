@@ -1,13 +1,3 @@
-//! P3a hidden-desktop proof with a dedicated fixture app: `desktop:"hidden"`
-//! launches `puppet_fixture_app` (a single window + one EDIT control, no
-//! persistence, no session restore, no tabs) with `background_args`, drives
-//! it through the PostMessage path, and tears the desktop down with proof —
-//! without touching the owner's desktop or any owner app state.
-//!
-//! Live-only: needs an interactive Windows session (hidden desktops).
-//! Gated by PUPPET_LIVE_DESKTOP=1; without it the tests print a skip line
-//! and pass so CI stays green. No owner files are read, referenced, or
-//! modified anywhere in this file.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -138,8 +128,6 @@ fn hidden_fixture_typing_with_teardown_proof() {
     if !live() {
         return;
     }
-    // The dedicated fixture app: title comes from argv[1], so the title
-    // assert proves the argv reached the hidden launch.
     let fixture = env!("CARGO_BIN_EXE_puppet_fixture_app");
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -183,7 +171,6 @@ fn hidden_fixture_typing_with_teardown_proof() {
         (r, hd)
     };
 
-    // Baseline: dry_run launch opens the fixture and reads it back.
     let (_, hd0) = hidden(&mut s, 10, false);
     let base = hd0
         .get("text_readback")
@@ -199,7 +186,6 @@ fn hidden_fixture_typing_with_teardown_proof() {
         "baseline readback must be marker-free, got: {base:?}"
     );
 
-    // Live: type the unique marker into the fixture's edit control.
     let (r, hd) = hidden(&mut s, 11, true);
     let sc = r
         .get("structuredContent")
@@ -231,8 +217,6 @@ fn hidden_fixture_typing_with_teardown_proof() {
         readback.contains(&marker),
         "live readback must contain the typed marker, got: {readback:?} (full: {hd})"
     );
-    // The PrintWindow capture rides as a real MCP image block next to the
-    // text JSON — not only base64 inside it.
     let capture_ok = hd
         .get("capture")
         .and_then(|c| c.get("ok"))
@@ -256,12 +240,6 @@ fn hidden_fixture_typing_with_teardown_proof() {
             .map(|b| b.get("type").cloned().unwrap_or(Value::Null))
             .collect::<Vec<_>>()
     );
-    // The hidden path must not activate anything on the owner's desktop.
-    // The box may be in active use (cursor and foreground move under owner
-    // activity, which PostMessage/WM_CLOSE to a hidden window cannot cause),
-    // so plain unchanged-ness is reported, not failed — while the actual
-    // safety property IS asserted: the hidden window never became the
-    // owner's foreground window and the launched pid never owned it.
     let fg_after = fg_now();
     let hidden_hwnd = hd.get("window_hwnd").and_then(|v| v.as_i64()).unwrap_or(0);
     if fg_before == 0 {
@@ -286,8 +264,6 @@ fn hidden_fixture_typing_with_teardown_proof() {
             );
         }
     }
-    // Isolation cross-check from the owner's side: the launched pid owns
-    // no window visible to the owner after teardown.
     if let Some(pid) = hd.get("launched_pid").and_then(|v| v.as_i64()) {
         let lw = s.result(12, "list_windows", serde_json::json!({}));
         let wins = lw
@@ -302,11 +278,6 @@ fn hidden_fixture_typing_with_teardown_proof() {
             "launched pid {pid} must own no owner-desktop window after teardown"
         );
     }
-    // Revert proof, same fixture: pre_drive_text is the target text
-    // before any driven input, post_revert_text is read after the revert
-    // in the same teardown, and reverted is their equality. A cross-launch
-    // comparison could not prove the restore ran (every launch initializes
-    // the same content); this one fails if the revert is removed.
     let pre = hd
         .get("pre_drive_text")
         .and_then(|v| v.as_str())
@@ -342,8 +313,6 @@ fn hidden_fixture_typing_with_teardown_proof() {
         readback, post,
         "typed readback must differ from the reverted text, got both: {readback:?}"
     );
-    // background_args must be a list of strings. These fail in serve
-    // validation before any launch, so they are deterministic.
     for (id, bad_args, want) in [
         (20, serde_json::json!("notalist"), "valid list"),
         (21, serde_json::json!([123]), "valid string"),

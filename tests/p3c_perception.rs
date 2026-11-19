@@ -1,8 +1,3 @@
-//! W3 perception truth: what a reply says about the pixels it returned.
-//!
-//! The synthetic-PNG cases need no desktop and run everywhere; the capture
-//! cases are gated by `PUPPET_LIVE_DESKTOP=1` and drive only the dedicated
-//! fixture app, never an owner window.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -85,7 +80,6 @@ impl Drop for Session {
 }
 
 
-/// One RGB8 PNG written with the same colour type the server decodes.
 fn write_png(path: &Path, w: u32, h: u32, px: &[u8]) {
     let file = std::fs::File::create(path).expect("create png");
     let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
@@ -140,9 +134,6 @@ fn live() -> bool {
     }
 }
 
-/// Kill leftover fixture processes from a previous (possibly panicked) run.
-/// Scoped strictly to our own fixture executable plus the exact test window
-/// title — never touches an owner app.
 fn kill_stale_fixtures(title: &str) {
     let _ = Command::new("taskkill")
         .args([
@@ -158,15 +149,12 @@ fn kill_stale_fixtures(title: &str) {
         .status();
 }
 
-/// Owning handle for one fixture process: `Drop` kills and reaps, so a panic
-/// still leaves no window behind for the next run.
 struct Fixture {
     child: Child,
     title: String,
 }
 
 impl Fixture {
-    /// The baseline window (one visible EDIT) unless `mode` names another.
     fn spawn(title: &str, mode: Option<&str>) -> Self {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_puppet_fixture_app"));
         cmd.arg(title)
@@ -191,8 +179,6 @@ impl Drop for Fixture {
     }
 }
 
-/// The joined text of a tool result's text blocks (a refusal carries its
-/// detail there).
 fn result_text(r: &Value) -> String {
     r.get("content")
         .and_then(|c| c.as_array())
@@ -206,11 +192,6 @@ fn result_text(r: &Value) -> String {
         .unwrap_or_default()
 }
 
-/// Capture through the server, waiting out the all-black first-frame refusal
-/// a freshly spawned window produces before it composites — the same startup
-/// race `src/fixture.rs`'s readiness wait exists for, seen from outside the
-/// process. Bounded at 5 s; every assertion that follows is about a capture
-/// that actually produced a frame.
 fn shot_waited(s: &mut Session, mut id: i64, args: &Value) -> Value {
     let t0 = std::time::Instant::now();
     loop {
@@ -225,7 +206,6 @@ fn shot_waited(s: &mut Session, mut id: i64, args: &Value) -> Value {
     }
 }
 
-/// The base64 image block of a reply, if it returned one.
 fn image_block_bytes(r: &Value) -> Option<Vec<u8>> {
     r.get("content")
         .and_then(|c| c.as_array())
@@ -241,9 +221,6 @@ fn image_block_bytes(r: &Value) -> Option<Vec<u8>> {
         })
 }
 
-/// SPEC W3.1 + AMENDMENT-01 A1/A5: a diff reports the image it returned, the
-/// scale that produced it, and that its box is native — so a caller can put
-/// the box on the image and read the changed pixel there.
 #[test]
 fn a_diff_reports_the_scale_and_image_it_returned() {
     let dir = temp_dir("diff-scale");
@@ -253,7 +230,6 @@ fn a_diff_reports_the_scale_and_image_it_returned() {
     const H: u32 = 2000;
     let grey = vec![128u8; (W * H * 3) as usize];
     let mut altered = grey.clone();
-    // One 4x4 block at (1000,1200), solid red.
     for y in 1200..1204u32 {
         for x in 1000..1004u32 {
             let i = ((y * W + x) * 3) as usize;
@@ -315,11 +291,9 @@ fn a_diff_reports_the_scale_and_image_it_returned() {
         Some(&Value::Null),
         "quality has no meaning for a png diff image"
     );
-    // A file operand has no origin on the screen: null, never an invented one.
     assert_eq!(sc.get("base_source"), Some(&Value::Null));
     assert_eq!(sc.get("next_source"), Some(&Value::Null));
 
-    // The mapped read: native box * scale lands on the returned image.
     let bytes = image_block_bytes(&r).expect("a changed diff returns its image");
     let (pw, ph, px) = read_png(&bytes);
     assert_eq!((pw as i64, ph as i64), (iw, ih), "the block is image.w/h");
@@ -331,7 +305,6 @@ fn a_diff_reports_the_scale_and_image_it_returned() {
         "the pixel at floor(bbox*scale) = ({mx},{my}) must be red, got ({r0},{g0},{b0})"
     );
 
-    // Identical: no image is returned, so no image and no scale are claimed.
     let r = s.result(
         2,
         "diff",
@@ -356,8 +329,6 @@ fn a_diff_reports_the_scale_and_image_it_returned() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// SPEC W3.2 (D4): a default capture is lossless, so two captures of a static
-/// window are byte-identical and the reply says which format it used.
 #[test]
 fn default_captures_are_lossless() {
     if !live() {
@@ -365,9 +336,6 @@ fn default_captures_are_lossless() {
     }
     kill_stale_fixtures("p3c-lossless");
     let fx = Fixture::spawn("p3c-lossless", None);
-    // The fixture's first composited frame is a startup race the harness
-    // waits out (src/fixture.rs `await_ready`), and a spawned app has the
-    // same race from outside: let it paint before the pair is measured.
     std::thread::sleep(Duration::from_millis(500));
     let mut s = Session::spawn();
     let shot = serde_json::json!({"window": fx.title});
@@ -401,9 +369,6 @@ fn default_captures_are_lossless() {
     );
 }
 
-/// AMENDMENT-01 A2: a request that was altered announces itself, and a
-/// default call carries no `warnings` key at all — the channel is for
-/// requests the server changed, not for every reply.
 #[test]
 fn a_clamp_that_altered_the_request_says_so() {
     if !live() {
@@ -455,7 +420,6 @@ fn a_clamp_that_altered_the_request_says_so() {
     assert_eq!(w[0].get("requested"), Some(&Value::from(50)));
     assert_eq!(w[0].get("applied"), Some(&Value::Null));
 
-    // The default path is silent: no key, not an empty array.
     let r = shot_waited(&mut s, 3, &serde_json::json!({"window": fx.title}));
     let sc = sc_of(&r, "default screenshot");
     assert!(
@@ -464,9 +428,6 @@ fn a_clamp_that_altered_the_request_says_so() {
     );
 }
 
-/// SPEC W3.3: a diff can exclude a region, so a caret blink or a clock does
-/// not force `changed` as the default verdict. Masked pixels leave the counts,
-/// the ratio and the box, and are reported as `masked_px`.
 #[test]
 fn a_diff_can_exclude_a_region() {
     let dir = temp_dir("diff-mask");
@@ -476,7 +437,6 @@ fn a_diff_can_exclude_a_region() {
     const H: u32 = 100;
     let grey = vec![90u8; (W * H * 3) as usize];
     let mut altered = grey.clone();
-    // One 10x10 block at (20,30): the "caret".
     for y in 30..40u32 {
         for x in 20..30u32 {
             let i = ((y * W + x) * 3) as usize;
@@ -489,8 +449,6 @@ fn a_diff_can_exclude_a_region() {
     write_png(&next_p, W, H, &altered);
     let mut s = Session::spawn();
 
-    // The whole change is inside the mask: identical, nothing changed, and the
-    // exclusion is visible in the reply.
     let r = s.result(
         1,
         "diff",
@@ -528,7 +486,6 @@ fn a_diff_can_exclude_a_region() {
         "an identical diff returns no image block"
     );
 
-    // Overlapping rects union silently: 100 + 100 - 25.
     let r = s.result(
         2,
         "diff",
@@ -545,7 +502,6 @@ fn a_diff_can_exclude_a_region() {
     );
     assert_eq!(sc.get("total"), Some(&Value::from((W * H - 175) as i64)));
 
-    // A change outside the mask still counts, in native pixels.
     let r = s.result(
         3,
         "diff",
@@ -563,7 +519,6 @@ fn a_diff_can_exclude_a_region() {
         "the box stays native and excludes the mask, got: {sc}"
     );
 
-    // A rect outside the frame is a typed refusal, never a silent clamp.
     let r = s.result(
         4,
         "diff",
@@ -587,9 +542,6 @@ fn a_diff_can_exclude_a_region() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// SPEC W3.4: a successful capture reports the blank-frame measurement, so a
-/// frame with a black region is visibly measured content; a fully blank frame
-/// still refuses, and the refusal carries the measurement that refused it.
 #[test]
 fn a_capture_reports_the_blank_frame_measurement() {
     if !live() {
@@ -627,8 +579,6 @@ fn a_capture_reports_the_blank_frame_measurement() {
         "the threshold is reported with the measurement, got: {bc}"
     );
 
-    // A window that paints nothing at all still refuses, and says what it
-    // measured.
     kill_stale_fixtures("p3c-blank");
     let blank = Fixture::spawn("p3c-blank", Some("blank"));
     std::thread::sleep(Duration::from_millis(500));
@@ -648,8 +598,6 @@ fn a_capture_reports_the_blank_frame_measurement() {
         "the refusal must carry the measurement that refused it, got: {text}"
     );
 
-    // The desktop path reports the measurement too: every successful capture
-    // does, whichever backend produced the frame.
     let r = s.result(
         3,
         "screenshot",

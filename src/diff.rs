@@ -1,16 +1,3 @@
-//! Pixel-diff tool: turn "looks right" into "only the intended pixels
-//! changed" by comparing two captures pixel by pixel.
-//!
-//! Each side is either a PNG file (`{path:"<png>"}`) or a live capture
-//! target (`{target|window, display, region}` with the same selector
-//! grammar as `screenshot`, captured side-effect-free at native pixels).
-//! Both sides must land on the SAME pixel dimensions: a mismatch is a
-//! typed `size_mismatch` naming both sizes, never a silent scale. The
-//! per-pixel rule is the port of
-//! `Q:\PROJECTS\PERSONAL\gladius\src\visual.rs` (`png_diff`/`DiffOpts`)
-//! in `crate::cap` (per-channel delta above `threshold` counts, union
-//! bbox, ratio); the returned image marks changed pixels solid red over a
-//! dimmed greyscale copy of `base`. Read-only: no activation, no input.
 
 use crate::cap::{decode_png, diff_image, finalize, Img};
 use crate::screen::{dispatch_screenshot, ShotArgs};
@@ -28,9 +15,6 @@ pub struct DiffArgs {
     pub mask: Option<Value>,
 }
 
-/// Parse the `mask` input into native-pixel rects. Shape errors are typed
-/// `bad_region`, the same code the frame check uses, so a caller has one
-/// failure to handle for the whole input.
 fn parse_mask(v: &Value) -> Result<Vec<[i64; 4]>, String> {
     let arr = v.as_array().ok_or_else(|| {
         format!("error: bad_region: mask must be [[left,top,right,bottom],...] (got {v})")
@@ -57,13 +41,6 @@ fn parse_mask(v: &Value) -> Result<Vec<[i64; 4]>, String> {
     Ok(out)
 }
 
-/// Decode one `diff` operand to RGB pixels and its origin. `{path}` reads a
-/// PNG file and has no origin (`null`); anything else is captured through
-/// the screenshot path at native pixels (lossless PNG, no grid, no
-/// elements) and decoded back, so the window lock, region crop and display
-/// routing stay exactly the ones `screenshot` proves, and the capture's own
-/// `source{x,y,w,h,kind}` comes back with the pixels instead of being
-/// discarded.
 fn resolve_operand(side: &str, v: &Value) -> Result<(Img, Value), String> {
     if let Value::Object(o) = v {
         if let Some(p) = o.get("path") {
@@ -76,8 +53,6 @@ fn resolve_operand(side: &str, v: &Value) -> Result<(Img, Value), String> {
             return Ok((img, Value::Null));
         }
     }
-    // Capture target: a bare string is a window selector, an object
-    // carries {target|window, display, region} like screenshot.
     let shot = match v {
         Value::String(s) => ShotArgs {
             display: -1,
@@ -193,9 +168,6 @@ fn err_payload(items: Vec<(&str, Value)>) -> String {
     crate::wrapped_text(&crate::py_dumps(&Value::Object(m)))
 }
 
-/// The `image{w,h,format,quality}` block for the bytes a diff returns, with
-/// the same shape `screenshot` uses (`quality` is null unless the format
-/// carries a quality at all).
 fn image_object(iw: i64, ih: i64, fmt: &str, quality: i64) -> Value {
     let mut m = Map::new();
     m.insert("w".to_string(), Value::from(iw));
@@ -231,9 +203,6 @@ pub fn dispatch_diff(a: &DiffArgs) -> String {
         Ok(v) => v,
         Err(e) => return err_payload(vec![("error", Value::from(e))]),
     };
-    // W3.3: the mask is validated against the operand frame — a rect that
-    // leaves it is a typed bad_region, never a silent clamp — and it is
-    // applied before anything is counted.
     let mask = match a.mask.as_ref() {
         None => None,
         Some(v) => {
@@ -251,8 +220,6 @@ pub fn dispatch_diff(a: &DiffArgs) -> String {
     let d = match crate::cap::pixel_diff(&base, &next, thr, mask.as_ref()) {
         Ok(d) => d,
         Err(e) => {
-            // Typed refusal: both sizes named, no silent scale. The images
-            // never meet, so there is no diff PNG to write or return.
             return err_payload(vec![
                 ("code", Value::from("size_mismatch")),
                 ("error", Value::from(e)),
@@ -305,16 +272,10 @@ pub fn dispatch_diff(a: &DiffArgs) -> String {
     next_o.insert("h".to_string(), Value::from(next.h as i64));
     payload.insert("next".to_string(), Value::from(next_o));
     payload.insert("threshold".to_string(), Value::from(a.threshold));
-    // W3.1/A1: the counts and the box are native operand pixels; `image` and
-    // `scale` describe the bytes actually returned, and the operand origins
-    // say where those pixels sit on the screen (null for a file operand,
-    // which has no origin).
     payload.insert("bbox_space".to_string(), Value::from("native"));
     payload.insert("base_source".to_string(), base_source);
     payload.insert("next_source".to_string(), next_source);
     if d.identical {
-        // No changed pixels, no diff image: an all-dimmed file still lands
-        // when `out` is set so the path contract holds on both outcomes.
         if let Some(path) = a.out.as_deref() {
             let flat = Img {
                 w: base.w,
@@ -357,9 +318,6 @@ pub fn dispatch_diff(a: &DiffArgs) -> String {
         }
         return crate::wrapped_text(&crate::py_dumps(&Value::Object(payload)));
     }
-    // Changed: the red-over-dimmed visualization, long-edge clamped for
-    // the wire (full-res pixels decided the counts above, never the
-    // clamped ones).
     let viz = match diff_image(&base, &next, thr, mask.as_ref()) {
         Ok(im) => im,
         Err(e) => return err_payload(vec![("error", Value::from(e))]),
@@ -528,9 +486,6 @@ mod tests {
             .expect("structuredContent present")
     }
 
-    /// The identical-case response (`bbox: null`, `diff_out: null`) and the
-    /// differing-case response (real bbox) must both validate against the
-    /// tool's own declared `outputSchema`.
     #[test]
     fn diff_payload_matches_declared_output_schema() {
         let dir = std::env::temp_dir().join(format!("puppet-diff-schema-{}", std::process::id()));
@@ -538,7 +493,6 @@ mod tests {
         let next_p = dir.join("next.png");
         let alt_p = dir.join("alt.png");
 
-        // Identical: same pixels in both files.
         let solid = solid_img(10, 10, 60, 120, 200);
         write_png(&base_p, &solid);
         write_png(&next_p, &solid);
@@ -556,7 +510,6 @@ mod tests {
         assert_eq!(sc.get("bbox"), Some(&Value::Null));
         assert_payload_valid_against_output_schema(&sc);
 
-        // Differing: one pixel moved, so the bbox is a real 4-tuple.
         let mut altered = solid_img(10, 10, 60, 120, 200);
         let p = (5 * 10 + 3) as usize;
         altered.px[3 * p] = 255;

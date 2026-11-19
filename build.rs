@@ -21,9 +21,6 @@
 
 use std::process::Command;
 
-/// Run `git` in the package root. `None` when git is missing or the command
-/// fails (source tarball, no git on PATH): an unstamped build is degraded, not
-/// broken, so this never fails the build.
 fn git(args: &[&str]) -> Option<String> {
     let out = Command::new("git").args(args).output().ok()?;
     if !out.status.success() {
@@ -39,16 +36,11 @@ fn main() {
     let dirty = git(&["status", "--porcelain"]).is_some_and(|s| !s.is_empty());
 
     println!("cargo:rustc-env=PUPPET_GIT_SHA={sha}");
-    // Empty, or the suffix appended to the sha in the version string.
     println!(
         "cargo:rustc-env=PUPPET_GIT_DIRTY={}",
         if dirty { "-dirty" } else { "" }
     );
 
-    // Re-stamp on a commit (loose ref + reflog), a checkout or detached-HEAD
-    // move (`.git/HEAD`), a staged edit (index), an unstaged source edit (src/,
-    // tests/), or a manifest edit. Nothing else can change the stamp, so
-    // `target/` and `bin/` are deliberately not walked.
     println!("cargo:rerun-if-changed=.git/index");
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs/heads");

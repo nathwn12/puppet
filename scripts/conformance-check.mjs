@@ -72,7 +72,6 @@ function session() {
   };
 }
 
-// ---- the same rule as tests/envelope_truth.rs ---------------------------
 function allowedTypes(prop) {
   const out = [];
   const pushT = (t) => {
@@ -167,39 +166,28 @@ async function main() {
       }
     };
 
-    // cursor + list_windows: empty args.
     await row("cursor", {}, "cursor empty args");
     const lw = await s.call("list_windows", {});
     await row("list_windows", {}, "list_windows empty args");
     const wins = lw?.result?.structuredContent?.windows ?? [];
 
-    // screenshot with out set: the PNG below doubles as the diff fixture.
     await row("screenshot", { display: -1, region: [0, 0, 64, 64], out: png }, "screenshot out set");
     if (!existsSync(png)) fail("screenshot", `out file missing: ${png}`);
 
-    // diff on two identical PNGs: bbox null, diff_out null — the shape that
-    // once shipped in violation of its own schema.
     await row("diff", { base: { path: png }, next: { path: png } }, "diff identical PNGs");
 
-    // window: unknown title is a typed target_gone refusal (no desktop
-    // touch, no ambiguity needed).
     await row("window", { action: "focus", title: "NoSuchWindowXYZ12345" }, "window unknown target", true);
 
-    // do: posted-key refusal without touching the desktop (dry_run proves
-    // the policy; allow_foreground buys nothing).
     await row("do",
       { actions: [{ type: "click", x: 5, y: 5 }], dry_run: true, allow_foreground: true },
       "do posted-key refusal", true);
 
-    // elements: first listed window when one exists, else the unknown-target
-    // refusal. Either envelope still validates against the schema.
     if (wins.length > 0 && Number.isInteger(wins[0]?.hwnd)) {
       await row("elements", { hwnd: wins[0].hwnd }, `elements on hwnd ${wins[0].hwnd}`);
     } else {
       await row("elements", { title: "NoSuchWindowXYZ12345" }, "elements unknown target", true);
     }
 
-    // Completeness: every listed tool has a passing row.
     for (const name of schemas.keys()) {
       if (!covered.has(name)) fail("coverage", `tool ${name} has no passing conformance row`);
     }

@@ -1,11 +1,3 @@
-//! P4a monitor-match live probe: monitor-scoped screenshots must serve the
-//! requested display (DXGI output matched by rect/handle/device/size, never
-//! the display-index assumption), falling back to GDI with a note when no
-//! output matches. Read-only; no owner data.
-//!
-//! Gated by PUPPET_LIVE_DESKTOP=1. Single-monitor boxes exercise display 0
-//! (regression: the old code assumed output 0); multi-monitor boxes also
-//! exercise display 1. Fewer than 2 displays skips with a line.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -144,8 +136,6 @@ fn monitor_scope_serves_requested_display() {
         .and_then(|c| c.get("backend"))
         .and_then(|b| b.as_str())
         .unwrap_or("?");
-    // Driver-type probe: with the explicit adapter created UNKNOWN the
-    // session opens and display 0 is served by DXGI, not GDI.
     assert_eq!(
         b0, "dxgi",
         "display 0 must be dxgi after the adapter fix, got backend={b0}, shot={sc0}"

@@ -1,12 +1,3 @@
-//! P2a envelope truth: every tool result is machine-readable — a real
-//! `structuredContent` object (never a JSON string), a matching per-tool
-//! `outputSchema`, and correct `isError` on tool failures.
-//!
-//! These tests fail on the pre-P2a tree (double-encoded
-//! `structuredContent.result` string; screenshot domain errors with
-//! `isError: false`) and pass after. Safe for the owner's live desktop:
-//! only read-only tools and error paths (unknown window/action) run; the
-//! `do` case is `dry_run` with an unknown action type, so nothing injects.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -180,7 +171,6 @@ fn list_windows_structured_is_real_object() {
         .get("windows")
         .and_then(|w| w.as_array())
         .expect("windows array");
-    // Text block stays byte-identical: the same array, JSON-encoded.
     let text = r
         .get("content")
         .and_then(|c| c.as_array())
@@ -273,9 +263,6 @@ fn window_missing_target_is_error() {
 
 #[test]
 fn window_unknown_action_is_error() {
-    // An unknown action needs a resolvable target to reach the
-    // unknown-action branch: reuse a live hwnd when one is listed,
-    // else fall back to the (still isError:true) resolve path.
     let mut s = Session::spawn();
     let lw = s.result(6, "list_windows", serde_json::json!({}));
     let hwnd = lw
@@ -314,9 +301,6 @@ fn window_unknown_action_is_error() {
 
 #[test]
 fn do_all_failed_actions_is_a_tool_error() {
-    // Zero successes: the burst payload's top-level `ok` is false, `failed`
-    // counts every action, and the envelope is isError:true. On the pre-fix
-    // tree the payload carried no top-level `ok` and reported isError:false.
     let mut s = Session::spawn();
     let r = s.result(
         8,
@@ -354,9 +338,6 @@ fn do_all_failed_actions_is_a_tool_error() {
 
 #[test]
 fn do_partial_failure_stays_a_success_envelope() {
-    // Continue-always: at least one action succeeded, so the call is not a
-    // tool error even though the top-level `ok` (all-actions rule) is false.
-    // The failing action is FIRST, which also proves the rest still ran.
     let mut s = Session::spawn();
     let r = s.result(
         9,
@@ -387,28 +368,6 @@ fn do_partial_failure_stays_a_success_envelope() {
     );
 }
 
-// The `diff` defect class: `diff` emitted `bbox: null` / `diff_out: null`
-// while its declared `outputSchema` allowed only array/object, and the
-// tests above still passed because they assert only presence and
-// non-emptiness. This test closes that hole: every `tools/call` row below
-// is validated against the tool's OWN declared `outputSchema` from
-// `tools/list` — every `required` key present on success, every present
-// key's JSON type allowed (`type`, `anyOf`, `oneOf`; `integer` satisfies
-// `number`; unlisted keys pass only because every schema sets
-// `additionalProperties: true`; props that declare no type pass
-// unconstrained). Error envelopes (`isError: true`) carry typed refusals
-// (`{ok: false, ...}`) rather than the success shape, so they check
-// `ok: false` plus the per-key types, never the success `required` list.
-// Coverage is counted per tool and the test fails if any listed tool has
-// no row — a new tool with no case cannot slip in unvalidated.
-//
-// Safe for the owner's live desktop: `do` rows are `dry_run`, `window`
-// rows fail at the target lock (ambiguous title) before any action runs,
-// and everything else is read-only.
-
-/// Kill leftover fixture processes from a previous (possibly panicked) run.
-/// Scoped strictly to our own fixture executable plus the exact test window
-/// title — never touches owner apps.
 fn kill_stale_conformance_fixtures(title: &str) {
     let _ = Command::new("taskkill")
         .args([
@@ -424,16 +383,11 @@ fn kill_stale_conformance_fixtures(title: &str) {
         .status();
 }
 
-/// Owning handle for one fixture process. `Drop` kills and reaps, so a
-/// panic anywhere in the test still cleans up.
 struct ConformanceFixture {
     child: Child,
 }
 
 impl ConformanceFixture {
-    /// Spawn the fixture app. Stale cleanup is the caller's job (once per
-    /// title, before the first spawn): a mid-pair cleanup would kill the
-    /// sibling that makes the ambiguous case ambiguous.
     fn spawn(title: &str) -> Self {
         let child = Command::new(env!("CARGO_BIN_EXE_puppet_fixture_app"))
             .arg(title)
@@ -442,7 +396,6 @@ impl ConformanceFixture {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn fixture app");
-        // Give the process a beat to create its window before the first call.
         std::thread::sleep(Duration::from_millis(500));
         ConformanceFixture { child }
     }
@@ -500,8 +453,6 @@ fn json_type(v: &Value) -> &'static str {
     }
 }
 
-/// Validate one `tools/call` envelope against the tool's own declared
-/// `outputSchema` and count the row toward that tool's coverage.
 fn assert_conforms(
     schemas: &HashMap<String, Value>,
     coverage: &mut HashMap<String, usize>,
@@ -587,12 +538,10 @@ fn payload_conforms_to_own_output_schema() {
         id
     };
 
-    // cursor: empty args.
     let r = s.result(next_id(), "cursor", serde_json::json!({}));
     assert_eq!(r.get("isError"), Some(&Value::from(false)));
     assert_conforms(&schemas, &mut coverage, "cursor", &r, "cursor empty args");
 
-    // list_windows: empty args.
     let r = s.result(next_id(), "list_windows", serde_json::json!({}));
     assert_eq!(r.get("isError"), Some(&Value::from(false)));
     assert_conforms(
@@ -603,7 +552,6 @@ fn payload_conforms_to_own_output_schema() {
         "list_windows empty args",
     );
 
-    // screenshot with `out` null (inline image only).
     let r = s.result(
         next_id(),
         "screenshot",
@@ -622,7 +570,6 @@ fn payload_conforms_to_own_output_schema() {
         "screenshot out null",
     );
 
-    // screenshot with `out` set (exact bytes also land on disk).
     let dir = std::env::temp_dir().join(format!("puppet-envelope-conform-{}", std::process::id()));
     let shot_p = dir.join("shot.png");
     let shot_path = shot_p.to_string_lossy().to_string();
@@ -648,9 +595,6 @@ fn payload_conforms_to_own_output_schema() {
         "screenshot out set",
     );
 
-    // do: posted-key refusal. dry_run proves the policy without touching
-    // the desktop: allow_foreground buys nothing, every acting verb is
-    // refused per action with no_foreground_policy and zero events.
     let r = s.result(
         next_id(),
         "do",
@@ -680,8 +624,6 @@ fn payload_conforms_to_own_output_schema() {
     }
     assert_conforms(&schemas, &mut coverage, "do", &r, "do posted-key refusal");
 
-    // window: ambiguous title. Two fixtures share one title, so the lock
-    // fails with a candidate list before any action runs.
     let ambig = "env-conform-ambig";
     kill_stale_conformance_fixtures(ambig);
     let _fx1 = ConformanceFixture::spawn(ambig);
@@ -710,7 +652,6 @@ fn payload_conforms_to_own_output_schema() {
     drop(_fx1);
     drop(_fx2);
 
-    // elements: non-empty (fixture window) and empty (offset past the end).
     let elem_title = "env-conform-elem";
     kill_stale_conformance_fixtures(elem_title);
     let _fxe = ConformanceFixture::spawn(elem_title);
@@ -766,8 +707,6 @@ fn payload_conforms_to_own_output_schema() {
     assert_conforms(&schemas, &mut coverage, "elements", &r, "elements empty");
     drop(_fxe);
 
-    // diff identical (same file twice: bbox null, diff_out null) AND
-    // differing (grid overlay moves pixels: real bbox array).
     let a_p = dir.join("a.png");
     let b_p = dir.join("b.png");
     let a_path = a_p.to_string_lossy().to_string();
@@ -827,9 +766,6 @@ fn payload_conforms_to_own_output_schema() {
     }
     assert_conforms(&schemas, &mut coverage, "diff", &r, "diff differing");
 
-    // diff size-mismatch: a typed refusal naming both sizes, never a silent
-    // scale. The error envelope carries ok:false plus the refusal keys, so
-    // it checks per-key types, never the success required list.
     let r = s.result(
         next_id(),
         "diff",
@@ -852,8 +788,6 @@ fn payload_conforms_to_own_output_schema() {
 
     let _ = std::fs::remove_dir_all(&dir);
 
-    // Completeness: every tool in tools/list has at least one row, and no
-    // row names a tool that vanished. A new tool with no case fails here.
     for name in schemas.keys() {
         assert!(
             coverage.get(name).copied().unwrap_or(0) >= 1,
@@ -869,11 +803,6 @@ fn payload_conforms_to_own_output_schema() {
     );
 }
 
-/// AMENDMENT-01 A4 (and A3's live half): detail is a native region capture,
-/// never an upscale. `max_px:null` returns the crop at `scale:1.0`, the image
-/// is exactly the reported source, and a second identical call is
-/// byte-identical — while the resize branch in `src/cap.rs` stays guarded by
-/// the `>` test that makes an upscale impossible to introduce.
 #[test]
 fn a_native_region_capture_is_scale_one_and_byte_stable() {
     let mut s = Session::spawn();
@@ -929,7 +858,6 @@ fn a_native_region_capture_is_scale_one_and_byte_stable() {
         "two identical native region captures must be byte-identical"
     );
 
-    // The guard on the decision: the only resize branch refuses to enlarge.
     let cap = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cap.rs"),
     )

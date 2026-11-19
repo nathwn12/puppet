@@ -1,8 +1,3 @@
-//! puppet-rs: native Rust MCP server, wire-parity with puppet.py (FastMCP 4.3.0).
-//!
-//! Tools: screenshot, list_windows, window, do, cursor, elements.
-//! HEADLESS: windows_subsystem windows (never a console); stdout carries
-//! protocol frames ONLY; diagnostics go to stderr.
 
 #![windows_subsystem = "windows"]
 
@@ -45,13 +40,11 @@ const FORMULA: &str = "screen_x = source.x + round((img_x + 0.5) * source.w / im
 const SUPPORTED_VERSIONS: [&str; 2] = ["2025-06-18", "2025-11-25"];
 const LATEST_VERSION: &str = "2025-11-25";
 const MODERN_VERSION: &str = "2026-07-28";
-// Batching is not implemented, so 2024-11-05 and 2025-03-26 are not advertised: do not serve what we do not support.
 const ALL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-11-25", "2026-07-28"];
 const ELEMENT_CAP: usize = 200;
 const UIA_DEPTH_LIMIT: i64 = 8;
 const WDA_EXCLUDEFROMCAPTURE: u32 = 0x11;
 
-/// Dedupe map for stale-window reports: window handle -> (tag, rect, seen).
 type StaleMap = HashMap<i64, (String, (i32, i32, i32, i32), u64)>;
 
 static STALE: LazyLock<Mutex<StaleMap>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -67,7 +60,6 @@ pub fn forget_stale(hwnd: i64) {
 }
 
 
-/// Python round() half-to-even to an integer value.
 fn py_round_half_even(x: f64) -> f64 {
     if !x.is_finite() || x.abs() > 9.0e15 {
         return x;
@@ -162,19 +154,10 @@ fn verr_text(tool: &str, errs: &[VErr]) -> String {
     s
 }
 
-/// Shared integer-overflow gate (F4): ONE policy for every int parser —
-/// REJECT anything that does not fit in `i64` with one consistent message.
-/// Each call site (`coerce_int`, `burst::py_int`, `screen::py_int_elem` via
-/// `parse_region`) checks this first so the same out-of-range input is
-/// rejected identically instead of Err vs clamp vs None.
 pub(crate) fn int_overflow_err(v: &Value) -> String {
     format!("integer out of range: {v} does not fit in i64")
 }
 
-/// True when `v` parses as an integer but overflows `i64` (u64 > MAX,
-/// integral float outside the i64 range, or a digit string whose checked
-/// i64 accumulation overflows). Garbage (non-numeric, fractional floats,
-/// bad literals) returns false so each caller keeps its own message there.
 pub(crate) fn is_int_overflow(v: &Value) -> bool {
     match v {
         Value::Number(n) => {
@@ -203,9 +186,6 @@ pub(crate) fn is_int_overflow(v: &Value) -> bool {
             if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
                 return false;
             }
-            // Handle the sign edge explicitly: the magnitude of i64::MIN
-            // (9223372036854775808) overflows a positive i64 accumulation,
-            // so accumulate the magnitude as unsigned and compare once.
             let mut mag: u64 = 0;
             for b in digits.bytes() {
                 mag = match mag
@@ -226,8 +206,6 @@ pub(crate) fn is_int_overflow(v: &Value) -> bool {
     }
 }
 
-/// Checked region rejection reason — shared by the screenshot region
-/// path and the `wait_for` stable path so both fail identically.
 #[derive(Debug)]
 pub(crate) enum RegionReject {
     Order,
@@ -235,17 +213,6 @@ pub(crate) enum RegionReject {
     OverCap(i128, i128),
 }
 
-/// Checked `[left,top,right,bottom]` validator. Never subtracts in `i64`
-/// before validating, so `i64::MIN`/`MAX` inputs are typed errors in both
-/// debug and release (no panic, no wraparound bypass). Checks, in order:
-/// 1. `right>left` and `bottom>top` (inverted/empty rejected — comparison
-///    only, no subtraction);
-/// 2. every coordinate fits in `i32` (the BitBlt/GDI path casts to `i32` —
-///    anything outside would truncate, so extremes are rejected);
-/// 3. width/height computed in `i128`, rejected when over `max_edge`.
-///
-/// Returns `(w, h)` on success; the caller formats the cap message with
-/// its own prefix so screenshot vs stable keep their typed shapes.
 pub(crate) fn validate_region(
     l: i64,
     t: i64,
@@ -571,8 +538,6 @@ fn missing_arg(_tool: &str, args: &Map<String, Value>, field: &str) -> VErr {
 }
 
 
-/// Float rendering matching Python repr() for the value ranges this server
-/// emits (bounded magnitudes; never exponent-form, never non-finite).
 fn py_float(f: f64) -> String {
     if f.is_nan() {
         return "NaN".to_string();
@@ -592,8 +557,6 @@ fn py_float(f: f64) -> String {
     }
 }
 
-/// json.dumps ensure_ascii string quoting (short escapes + \uXXXX, astral as
-/// surrogate pairs, 0x7F escaped like the json module's [^\ -~] class).
 fn py_json_str(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 2);
     o.push('"');
@@ -707,8 +670,6 @@ fn text_block(s: &str) -> String {
     format!("{{\"text\":{},\"type\":\"text\"}}", jstr(s))
 }
 
-/// Orderpending live probe of the python image block; current guess follows the
-/// text-block payload-first pattern. Documented as an open question.
 fn image_block(b64: &str, mime: &str) -> String {
     format!(
         "{{\"data\":{},\"mimeType\":{},\"type\":\"image\"}}",
@@ -717,15 +678,6 @@ fn image_block(b64: &str, mime: &str) -> String {
     )
 }
 
-/// P2a envelope: `structuredContent` carries the real machine-readable value
-/// parsed from the tool's JSON text (never a double-encoded string), while
-/// the text block stays byte-identical for legacy clients. A top-level
-/// array (only `list_windows`) is namespaced as `{"windows": [...]}`; any
-/// other value passes through unchanged. `_meta.fastmcp` noise is gone.
-///
-/// No-fallback rule: only a JSON object or array payload yields a success
-/// envelope. Anything else (unparseable text, a JSON string/number/bool)
-/// is an internal error, never a `{"result": "<text>"}` string wrapper.
 fn structured_of_text(s: &str) -> Option<Value> {
     match serde_json::from_str::<Value>(s) {
         Ok(Value::Array(a)) => {
@@ -738,9 +690,6 @@ fn structured_of_text(s: &str) -> Option<Value> {
     }
 }
 
-/// `isError` rule shared by every envelope: a payload is a tool error when
-/// its top-level `ok` is false, except a `do` burst, which is a tool error
-/// only when none of its per-action results succeeded (continue-always).
 pub(crate) fn payload_is_err(sc: &Value) -> bool {
     match sc.get("ok") {
         Some(Value::Bool(false)) => match sc.get("results").and_then(|r| r.as_array()) {
@@ -759,12 +708,6 @@ fn wrapped_text(s: &str) -> String {
             "error: internal: tool payload is not a JSON object or array",
         )]);
     };
-    // Tool-level failure is signalled by the payload itself: any object
-    // with top-level `"ok": false` (window resolve/action errors, elements
-    // resolve errors, cursor read errors) is `isError: true`. `do` is the one
-    // exception by contract: its `ok` is false when ANY action failed, but a
-    // burst is continue-always, so only a burst where NOTHING succeeded (its
-    // `results` carry no `ok:true`) is a tool error.
     let is_err = payload_is_err(&sc);
     format!(
         "{{\"content\":[{}],\"isError\":{},\"structuredContent\":{}}}",
@@ -778,13 +721,6 @@ fn err_result_text(s: &str) -> String {
     format!("{{\"content\":[{}],\"isError\":true}}", text_block(s))
 }
 
-/// P3a hidden-desktop capture: the `do` text envelope plus the hidden
-/// PrintWindow PNG as a real MCP `image` content block alongside the JSON
-/// text (not only base64 inside it). `structuredContent` and `isError`
-/// follow the same rule as `wrapped_text` (a `do` burst is a tool error only
-/// when nothing succeeded). Only the hidden path with a
-/// successful capture uses this; every other `do` call keeps the exact
-/// P2a text-only envelope.
 pub(crate) fn wrapped_text_with_image(s: &str, png_b64: &str, mime: &str) -> String {
     let Some(sc) = structured_of_text(s) else {
         return tool_err_blocks(&[text_block(
@@ -863,19 +799,11 @@ fn enum_child_windows(hwnd: HWND) -> Result<Vec<HWND>, String> {
     };
     let mut v: Vec<isize> = Vec::new();
     unsafe {
-        // Measured: EnumChildWindows returns FALSE with last-error 0 for a
-        // valid window with no children, and pywin32 does not raise there
-        // (python falls into the empty-list branch). Only a nonzero
-        // last-error is a real failure.
         SetLastError(0);
         let ok = EnumChildWindows(hwnd, Some(child_cb), &mut v as *mut Vec<isize> as LPARAM);
         if ok == 0 {
             let code = GetLastError();
             if code != 0 {
-                // pywin32 raises pywintypes.error (code, funcname, message);
-                // str(e) renders as the tuple below (reading: pywin32
-                // error-tuple str convention; only reachable when UIA also
-                // failed on a live hwnd, i.e. effectively never).
                 let mut buf = vec![0u16; 256];
                 let n = FormatMessageW(
                     FORMAT_MESSAGE_FROM_SYSTEM,
@@ -929,9 +857,6 @@ fn display_monitors() -> Vec<[i32; 4]> {
     v
 }
 
-/// Same enumeration as `display_monitors`, paired with each monitor's
-/// `HMONITOR` handle. The existing signature stays (callers index rects);
-/// DXGI output matching uses this sibling.
 fn display_monitor_handles() -> Vec<([i32; 4], HMONITOR)> {
     let mut v: Vec<([i32; 4], HMONITOR)> = Vec::new();
     unsafe {
@@ -945,8 +870,6 @@ fn display_monitor_handles() -> Vec<([i32; 4], HMONITOR)> {
     v
 }
 
-/// `\\.\DISPLAYn` device name for a monitor handle, via `GetMonitorInfoW`.
-/// Empty when unreadable; callers treat that as "no device match".
 fn monitor_device(hmon: HMONITOR) -> String {
     unsafe {
         let mut info: MONITORINFOEXW = std::mem::zeroed();
@@ -999,11 +922,6 @@ pub(crate) fn exe_of_pid(pid: u32) -> String {
     }
 }
 
-/// Process creation time (FILETIME as u64: 100 ns ticks since 1601) for a
-/// PID, or `None` when the process cannot be opened. PIDs are recycled by
-/// Windows, so this is what tells two processes with the same PID apart.
-/// `GetProcessTimes` is the documented source; the two FILETIME halves are
-/// joined into one comparable u64.
 pub(crate) fn process_created(pid: u32) -> Option<u64> {
     if pid == 0 {
         return None;
@@ -1026,13 +944,6 @@ pub(crate) fn process_created(pid: u32) -> Option<u64> {
     }
 }
 
-/// Desktop name a window lives on, read from the desktop of the window's
-/// thread (`GetThreadDesktop` + `GetUserObjectInformationW(UOI_NAME)`).
-///
-/// Handle values are per-process, so a raw `HDESK` comparison across
-/// processes is meaningless; the NAME is the comparable identity. Used to
-/// decide whether a target really lives on the private desktop this call
-/// created (see `burst::private_desktop_earned`).
 pub(crate) fn window_desktop_name(hwnd: HWND) -> Option<String> {
     if hwnd.is_null() {
         return None;
@@ -1118,14 +1029,11 @@ fn cloaked(hwnd: HWND) -> i64 {
 
 fn win_dpi(hwnd: HWND) -> i64 {
     unsafe {
-        // GetDpiForWindow returns 0 on failure per contract (python try/except).
         GetDpiForWindow(hwnd) as i64
     }
 }
 
 
-/// Elevation of one open token: Some(true) elevated, Some(false) not.
-/// The caller owns `tok` (opened via OpenProcessToken); it is not closed here.
 fn token_elevated(tok: HANDLE) -> Option<bool> {
     unsafe {
         let mut elev = TOKEN_ELEVATION { TokenIsElevated: 0 };
@@ -1145,10 +1053,6 @@ fn token_elevated(tok: HANDLE) -> Option<bool> {
     }
 }
 
-/// Elevation of a process id via its token (gap 2): Some(true/false) when
-/// readable, None when not (fail-open: unknown is never NAMED elevated).
-/// Openable with PROCESS_QUERY_LIMITED_INFORMATION, the same handle level
-/// `exe_of_pid` already uses.
 pub(crate) fn process_elevated(pid: u32) -> Option<bool> {
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
@@ -1168,8 +1072,6 @@ pub(crate) fn process_elevated(pid: u32) -> Option<bool> {
     }
 }
 
-/// Elevation of this server process (gap 2). Unknown reads as false so the
-/// predicate below fails closed (refuse) rather than injecting blind.
 pub(crate) fn self_elevated() -> bool {
     unsafe {
         let mut tok: HANDLE = std::ptr::null_mut();
@@ -1182,16 +1084,10 @@ pub(crate) fn self_elevated() -> bool {
     }
 }
 
-/// Pure UIPI predicate (gap 2): input from this process to the target is
-/// UIPI-doomed exactly when the target is determinably elevated and we are
-/// not. `SendInput` "neither GetLastError nor the return value will indicate
-/// the failure was caused by UIPI blocking", so this pre-check is the only
-/// signal that names the cause.
 pub(crate) fn uipi_blocked(target_elevated: Option<bool>, self_elev: bool) -> bool {
     matches!(target_elevated, Some(true)) && !self_elev
 }
 
-/// Elevation of the process owning a window (gap 2).
 pub(crate) fn window_elevated(hwnd: HWND) -> Option<bool> {
     let pid = pid_of(hwnd);
     if pid == 0 {
@@ -1250,9 +1146,6 @@ fn window_info(hwnd: HWND, include_app_ids: bool) -> Option<Map<String, Value>> 
         m.insert("hwnd".to_string(), Value::from(hwnd as i64));
         m.insert("pid".to_string(), Value::from(pid as i64));
         m.insert("exe".to_string(), Value::from(exe_of_pid(pid)));
-        // Opt-in: the AppUserModelID comes from the window's property store,
-        // which is a per-window COM read, so it is only paid for on request.
-        // null (never a guess) when the store or property is unavailable.
         if include_app_ids {
             m.insert(
                 "appId".to_string(),
@@ -1299,9 +1192,6 @@ fn window_info(hwnd: HWND, include_app_ids: bool) -> Option<Map<String, Value>> 
         m.insert("cloaked".to_string(), Value::from(cloaked(hwnd)));
         m.insert("visible".to_string(), Value::from(true));
         m.insert("dpi".to_string(), Value::from(win_dpi(hwnd)));
-        // Gap 2: elevation names the UIPI condition. true = elevated target
-        // (input from this server is UIPI-blocked), false = not, null =
-        // unreadable (fail-open: unknown is never named elevated).
         m.insert(
             "elevated".to_string(),
             match window_elevated(hwnd) {
@@ -1343,7 +1233,6 @@ fn candidates() -> Vec<Cand> {
                 foreground: h == fg,
             });
         }
-        // Foreground-most first, stable (enum order already z-order).
         rows.sort_by_key(|c| !c.foreground);
         rows
     }
@@ -1359,15 +1248,6 @@ fn cand_public(c: &Cand) -> Map<String, Value> {
     m
 }
 
-/// windows-core-compatible Win32/HRESULT error text.
-///
-/// Reading: `windows::core::Error`'s Display is `"{message} ({code:#010X})"`
-/// (windows-result 0.2.0 `error.rs:227`, `hresult.rs:65-112,145-147`): the
-/// message is FormatMessageW(FROM_SYSTEM|IGNORE_INSERTS) on the HRESULT value,
-/// wide-trimmed; BOOL-call failures map via HRESULT::from_win32. This helper
-/// makes the identical OS call with the identical input, so the text matches
-/// by construction. Only reachable on failing OS calls (never on the parity
-/// harness's live fixtures).
 pub(crate) fn hr_text(hr: i32) -> String {
     use windows_sys::Win32::System::Diagnostics::Debug::{
         FormatMessageW, FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS,
@@ -1394,7 +1274,6 @@ pub(crate) fn hr_text(hr: i32) -> String {
 }
 
 pub(crate) fn win32_text(code: u32) -> String {
-    // HRESULT::from_win32 (windows-result 0.2.0 hresult.rs:117-124).
     let hr = if code as i32 <= 0 {
         code as i32
     } else {
@@ -1464,16 +1343,10 @@ pub mod uia;
 pub mod winop;
 
 
-/// Commit this binary was compiled from (`build.rs`), `unknown` when git was
-/// unavailable at build time.
 const GIT_SHA: &str = env!("PUPPET_GIT_SHA");
-/// `-dirty` when the tree was modified at build time, else empty.
 const GIT_DIRTY: &str = env!("PUPPET_GIT_DIRTY");
 
 fn main() {
-    // Provenance answers without touching the desktop: this prints and returns
-    // before any Win32 call or the stdio pump. MCP clients pass no args, so
-    // the server path below is unchanged.
     if std::env::args_os()
         .skip(1)
         .any(|a| a == "--version" || a == "-V")
@@ -1499,7 +1372,6 @@ mod tests {
 
     #[test]
     fn region_validator_table() {
-        // Order: inverted or empty edges reject without any subtraction.
         assert!(matches!(
             validate_region(5000, 0, 0, 100, 8192),
             Err(RegionReject::Order)
@@ -1512,7 +1384,6 @@ mod tests {
             validate_region(0, 0, 0, 100, 8192),
             Err(RegionReject::Order)
         ));
-        // Extremes: MIN/MAX (and any out-of-i32 coord) reject before cast.
         assert!(matches!(
             validate_region(i64::MIN, 0, i64::MAX, 100, 8192),
             Err(RegionReject::Extreme)
@@ -1525,7 +1396,6 @@ mod tests {
             validate_region(0, 0, i64::MAX, 100, 8192),
             Err(RegionReject::Extreme)
         ));
-        // Over-cap: width and height each reject with their sizes.
         match validate_region(0, 0, 9000, 100, 8192) {
             Err(RegionReject::OverCap(w, h)) => assert_eq!((w, h), (9000, 100)),
             other => panic!("width>cap must reject OverCap, got: {other:?}"),
@@ -1534,7 +1404,6 @@ mod tests {
             Err(RegionReject::OverCap(w, h)) => assert_eq!((w, h), (100, 5000)),
             other => panic!("height>cap must reject OverCap, got: {other:?}"),
         }
-        // Valid edge: exactly the cap passes.
         assert_eq!(
             validate_region(0, 0, 8192, 100, 8192).expect("edge==cap"),
             (8192, 100)
@@ -1581,9 +1450,6 @@ mod tests {
         assert!(!is_int_overflow(&json!("-9223372036854775808")));
     }
 
-    /// No-fallback rule: a non-JSON payload yields no structured value, and
-    /// the wrapped path is an `isError: true` envelope — never a success
-    /// envelope with a `{"result": "<text>"}` string payload.
     #[test]
     fn non_json_payload_is_error_never_string_result() {
         assert!(structured_of_text("not json").is_none());

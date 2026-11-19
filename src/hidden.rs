@@ -1,22 +1,3 @@
-//! Hidden-desktop target mode for the `do` tool (`desktop:"hidden"`).
-//!
-//! Opt-in only: plain `do` never reaches this module. When requested, one
-//! dedicated thread owns the whole desktop lifecycle so the MCP server's own
-//! thread desktop is never moved:
-//!
-//!   GetThreadDesktop(original) -> CreateDesktopW -> SetThreadDesktop(hidden)
-//!   -> CreateProcessW(lpDesktop=hidden) -> EnumDesktopWindows (poll for the
-//!   target window) -> [caller drives it through the existing PostMessage
-//!   path] -> capture + readback on the hidden desktop -> WM_CLOSE/terminate
-//!   -> SetThreadDesktop(original) -> CloseDesktop -> OpenDesktopW must
-//!   return NULL (teardown proof).
-//!
-//! Teardown order is load-bearing: the thread is moved off the desktop BEFORE
-//! CloseDesktop, otherwise CloseDesktop fails with ERROR_BUSY (170). The
-//! target window is resolved with EnumDesktopWindows, never the owner's
-//! EnumWindows, so the owner's desktop is never enumerated or touched. The
-//! capture also runs on the hidden-desktop thread so the device context
-//! belongs to that desktop.
 
 use std::sync::mpsc;
 use std::thread::JoinHandle;
@@ -43,22 +24,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::cap::{encode_png, Img};
 
-/// `DESKTOP_ALL_ACCESS` (winnt.h). windows-sys exposes the individual
-/// DESKTOP_* rights but not the combined mask, so it is spelled here.
 const DESKTOP_ALL_ACCESS: u32 = 0x000F_01FF;
 const SETUP_TIMEOUT_MS: u64 = 8000;
 const TEARDOWN_TIMEOUT_MS: u32 = 3000;
 
-/// Per-request desktop name with no module-level mutable state.
-///
-/// Previously a process-global `static DESKTOP_SEQ: AtomicU64` counter was
-/// shared across requests to uniquify the hidden-desktop name. The name only
-/// needs to be unique per `spawn()` call, so every component here is derived
-/// from this call's context: process id + wall-clock nanos + calling thread
-/// id + the per-call stack address of a local. Concurrent `spawn()` calls
-/// share no mutable state (audit rule: no request state in globals); a
-/// same-nanosecond collision on one thread only risks a `CreateDesktopW`
-/// name clash, which surfaces as a setup error for that request alone.
 fn unique_desktop_name() -> String {
     let pid = std::process::id();
     let nanos = SystemTime::now()
@@ -71,8 +40,6 @@ fn unique_desktop_name() -> String {
         .filter(|b| b.is_ascii_digit())
         .map(|b| b as char)
         .collect();
-    // Address of a call-local: distinct per live `spawn()` frame, adds
-    // entropy when two calls land in the same nanosecond on one thread.
     let stack_entropy = &nanos as *const _ as usize;
     format!("puppet_hidden_{pid}_{nanos}_{tid_digits}_{stack_entropy:x}")
 }
@@ -145,14 +112,6 @@ pub struct Hidden {
 impl Hidden {
     pub fn teardown(mut self) -> Done {
         let _ = self.tx_go.send(());
-        // The capture this wait covers (`PrintWindow` on the hidden desktop)
-        // must run on the hidden-desktop thread — a helper thread would be on
-        // another desktop and could not paint that window — so it is bounded
-        // from the caller side instead: the owner thread's result is awaited
-        // for the Capture family's deadline (the same clamped,
-        // env-overridable limit every other PrintWindow call uses) and a
-        // stalled provider returns the typed `capture_timeout` line rather
-        // than a bespoke timeout string.
         let limit = crate::deadline::limit(crate::deadline::Family::Capture);
         let done = match self.rx_done.recv_timeout(limit) {
             Ok(d) => d,
@@ -183,8 +142,6 @@ impl Hidden {
                 let _ = j.join();
             }
         } else {
-            // Timed-out (or otherwise unproven) teardown: detach rather than
-            // hang the caller on join; the owner thread finishes on its own.
             let _ = self.join.take();
         }
         done
@@ -225,11 +182,6 @@ pub fn program_from_background(s: &str) -> Result<String, String> {
     Ok(prog.to_string())
 }
 
-/// Quote one command-line element per CommandLineToArgvW rules: bare when
-/// it needs nothing, else double-quoted with backslash runs doubled ahead
-/// of a quote (and trailing runs doubled). The program itself keeps its
-/// historical always-quoted form; each `background_args` entry is encoded
-/// with this quoter so paths with spaces survive as one argv element.
 fn quote_cmd_arg(s: &str) -> String {
     if !s.is_empty()
         && !s
@@ -259,9 +211,6 @@ fn quote_cmd_arg(s: &str) -> String {
     o
 }
 
-/// Build the CreateProcessW command line: the program exactly as before
-/// (always double-quoted, so the zero-args launch is byte-identical),
-/// then each argv element quoted as needed.
 fn build_command_line(program: &str, args: &[String]) -> Vec<u16> {
     let mut cmd = format!("\"{program}\"");
     for a in args {
@@ -283,9 +232,6 @@ pub fn spawn(program: &str, args: &[String]) -> Hidden {
     let argv: Vec<String> = args.to_vec();
     let nm = name.clone();
     let join = std::thread::spawn(move || owner(prog, argv, nm, tx_ready, rx_go, tx_done));
-    // Worst-case setup is bounded: window discovery (8 s) + text-target
-    // readiness (3 s) + title-stem wait (4 s), so 20 s leaves headroom over
-    // the sum while still failing fast when the owner thread dies.
     let ready = match rx_ready.recv_timeout(Duration::from_secs(20)) {
         Ok(r) => r,
         Err(_) => Ready {
@@ -349,7 +295,6 @@ fn owner(
         }
         let set_ok = SetThreadDesktop(hdesk) != 0;
 
-        // Launch the target with its desktop pinned to the hidden one.
         let mut si: STARTUPINFOW = std::mem::zeroed();
         si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
         si.lpDesktop = name_w.as_ptr() as PWSTR;
@@ -392,22 +337,14 @@ fn owner(
 
         let pid = pi.dwProcessId;
         let hwnd = wait_for_window(hdesk, pid);
-        // The top-level window turns visible before its content controls
-        // exist; wait (bounded) for a text target so posted keyboard input
-        // has a document to land in by the time the caller drives.
         if let Some(h) = hwnd {
             wait_for_text_target(h as HWND, 3000);
             wait_for_title_stem(h as HWND, &args, 4000);
         }
-        // Snapshot the driven text controls BEFORE the caller drives, so
-        // the evidence read below can be reverted before teardown (the
-        // hidden target shares the owner's per-user persisted state).
         let mut pre_text: Vec<TextSnapshot> = Vec::new();
         if let Some(h) = hwnd {
             snapshot_edit_texts(h as HWND, &mut pre_text);
         }
-        // Same-fixture baseline for the revert proof, read with the same
-        // function as the evidence and post-revert reads.
         let pre_drive_text = hwnd.and_then(read_target_text);
         let (hwnd_class, hwnd_title, hwnd_pid) = match hwnd {
             Some(h) => (
@@ -430,10 +367,8 @@ fn owner(
             error: None,
         });
 
-        // The caller drives the target now; wait for it to finish.
         let _ = rx_go.recv();
 
-        // Evidence while the target is still alive.
         let alive = match hwnd {
             Some(h) => IsWindow(h as HWND) != 0,
             None => false,
@@ -441,19 +376,10 @@ fn owner(
         let text = hwnd.and_then(read_target_text);
         let capture = hwnd.map(capture_window);
 
-        // Revert driven input before teardown so a persisting app writes
-        // back the pre-drive content, not our evidence run.
         restore_edit_texts(&pre_text);
-        // Same-fixture revert evidence: reread with the readback function
-        // after the restore, before WM_CLOSE.
         let post_revert_text = hwnd.and_then(read_target_text);
         let reverted = post_revert_text == pre_drive_text;
 
-        // Teardown: close the target, then move the thread off the desktop
-        // BEFORE CloseDesktop (else ERROR_BUSY 170), then prove it is gone.
-        // A launcher stub may hand the window to a different pid on the same
-        // private desktop, so emptiness is judged by the desktop's windows,
-        // not only by the launched process handle.
         let close_posted = match hwnd {
             Some(h) => PostMessageW(h as HWND, WM_CLOSE, 0, 0) != 0,
             None => false,
@@ -528,8 +454,6 @@ fn window_title(hwnd: HWND) -> String {
     }
 }
 
-/// Class names every process emits that are never the target's main window
-/// (dropdown list boxes, tooltips, menus, IME and shadow helpers).
 fn is_noise_class(cls: &str) -> bool {
     matches!(
         cls,
@@ -552,7 +476,6 @@ fn window_pid(hwnd: HWND) -> u32 {
     pid
 }
 
-/// Process ids owning any window on the private desktop.
 fn desktop_pids(hdesk: HDESK) -> Vec<u32> {
     let mut ctx = EnumCtx {
         pid: 0,
@@ -572,8 +495,6 @@ fn desktop_pids(hdesk: HDESK) -> Vec<u32> {
     pids
 }
 
-/// Terminate one exact pid (used only for processes owning a window on the
-/// private desktop we created). Returns whether the call succeeded.
 fn kill_pid(pid: u32) -> bool {
     unsafe {
         let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
@@ -599,11 +520,6 @@ fn wait_desktop_empty(hdesk: HDESK, ms: u64) -> bool {
     }
 }
 
-/// Pick the target's top-level window on the private desktop, scored so a
-/// hidden overlay (no title, zero-size) never wins over the real window.
-/// Preference: visible + titled + non-zero rect + unowned, owned by the
-/// launched pid first, then any such window (a launcher stub may hand off to
-/// another pid on the same private desktop).
 fn pick_window(ctx: &EnumCtx) -> Option<(i64, u8)> {
     let mut best: Option<(i64, u8)> = None;
     for &h in &ctx.hwnds {
@@ -643,13 +559,6 @@ fn pick_window(ctx: &EnumCtx) -> Option<(i64, u8)> {
     best
 }
 
-/// True when the hidden target already offers a text-input control: the
-/// thread's focused control when it is text input, else any visible +
-/// enabled Edit-like descendant. The top-level window becomes visible
-/// (and `wait_for_window` returns) before XAML content finishes
-/// initializing, so driving keyboard input immediately would resolve to
-/// the frame and be swallowed; readiness gating keeps `bg_text_target`
-/// honest by the time the caller drives.
 fn text_target_ready(h: HWND) -> bool {
     unsafe {
         if IsWindow(h) == 0 {
@@ -695,9 +604,6 @@ fn has_text_descendant(h: HWND) -> bool {
     false
 }
 
-/// Wait (bounded) for the hidden target's text control to exist. Returns
-/// immediately when the window dies; times out silently (the caller drives
-/// anyway and the per-action results plus readback tell the story).
 fn wait_for_text_target(h: HWND, ms: u64) {
     let deadline = Instant::now() + Duration::from_millis(ms);
     while !text_target_ready(h) {
@@ -708,11 +614,6 @@ fn wait_for_text_target(h: HWND, ms: u64) {
     }
 }
 
-/// Poll for the desktop's destruction after CloseDesktop: a dying target
-/// process can transiently pin the desktop past our own close (its
-/// windowless threads release on exit), so a single immediate reopen can
-/// falsely report survival. Bounded; every successful reopen is closed so
-/// the probe itself never pins the desktop.
 fn wait_open_null(name_w: &[u16], ms: u64) -> bool {
     let deadline = Instant::now() + Duration::from_millis(ms);
     loop {
@@ -730,13 +631,6 @@ fn wait_open_null(name_w: &[u16], ms: u64) -> bool {
     }
 }
 
-/// Wait (bounded) for the window title to name the launched document: when
-/// the first argv element is an existing file, its stem should appear in the
-/// title once the app selects the document tab (Win11 Notepad restores its
-/// persisted session first and opens the file tab async, so the text target
-/// can be ready while the title still names a restored tab). Skips fast for
-/// flags and non-paths. Silent timeout: the caller drives anyway and the
-/// title evidence tells the story.
 fn wait_for_title_stem(h: HWND, args: &[String], ms: u64) {
     let stem: Option<String> = args.first().and_then(|a| {
         let p = std::path::Path::new(a);
@@ -777,8 +671,6 @@ fn wait_for_window(hdesk: HDESK, pid: u32) -> Option<i64> {
             EnumDesktopWindows(hdesk, Some(enum_cb), &mut ctx as *mut EnumCtx as LPARAM);
         }
         if let Some((h, score)) = pick_window(&ctx) {
-            // A visible, titled, non-zero, unowned window is the target; a
-            // weaker candidate is kept only until the deadline.
             if score >= 3 {
                 return Some(h);
             }
@@ -819,13 +711,6 @@ unsafe extern "system" fn child_cb(hwnd: HWND, lp: LPARAM) -> BOOL {
     1
 }
 
-/// Best-effort readback of the target's text after driving: every
-/// non-empty Edit-like control in the descendant tree is collected and
-/// joined (multi-tab editors such as Win11 Notepad restore their persisted
-/// per-user tab session even in a fresh hidden-desktop process, so the
-/// typed text may sit in any tab's document rather than the first child in
-/// Z-order — and modern editors nest the document deeper than one level),
-/// else the window's own text. Never raises; `None` means nothing readable.
 fn read_target_text(hwnd: i64) -> Option<String> {
     let h = hwnd as HWND;
     let mut parts: Vec<String> = Vec::new();
@@ -836,17 +721,11 @@ fn read_target_text(hwnd: i64) -> Option<String> {
     sm_get_text(h)
 }
 
-/// Snapshot of one text control's content for post-evidence restore.
 struct TextSnapshot {
     hwnd: isize,
     text: String,
 }
 
-/// Record every Edit-like descendant's current text (recursive, same walk
-/// as the readback). The hidden target shares the owner's per-user
-/// persisted state (Win11 Notepad restores its tab session even on a fresh
-/// hidden desktop), so driven input must be reverted before teardown or
-/// every headless run would accumulate into the owner's store.
 fn snapshot_edit_texts(h: HWND, out: &mut Vec<TextSnapshot>) {
     let mut kids: Vec<isize> = Vec::new();
     unsafe {
@@ -864,9 +743,6 @@ fn snapshot_edit_texts(h: HWND, out: &mut Vec<TextSnapshot>) {
     }
 }
 
-/// Best-effort revert of driven input: put every snapshotted control back
-/// the way it was. Runs after evidence, before WM_CLOSE, so a persisting
-/// app writes back the original content. Never fails the teardown.
 fn restore_edit_texts(snaps: &[TextSnapshot]) {
     for s in snaps {
         let h = s.hwnd as HWND;
@@ -891,8 +767,6 @@ fn restore_edit_texts(snaps: &[TextSnapshot]) {
     }
 }
 
-/// Depth-first descendant walk collecting the text of every non-empty
-/// Edit-like control.
 fn collect_edit_texts(h: HWND, parts: &mut Vec<String>) {
     let mut kids: Vec<isize> = Vec::new();
     unsafe {
@@ -925,10 +799,6 @@ fn px_min_max(img: &Img) -> (u8, u8) {
     (mn, mx)
 }
 
-/// PrintWindow into a 32-bpp DIB section. A compatible bitmap from
-/// `GetDC(NULL)` on a desktop with no display surface can come back
-/// monochrome, so the destination is created explicitly as a top-down
-/// 32-bpp DIB section.
 fn grab_dib(hwnd: HWND, w: i32, h: i32, flags: u32) -> Result<Img, String> {
     use windows_sys::Win32::Graphics::Gdi::{
         CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
@@ -996,10 +866,6 @@ fn grab_dib(hwnd: HWND, w: i32, h: i32, flags: u32) -> Result<Img, String> {
     }
 }
 
-/// PrintWindow capture on the hidden-desktop thread. Flag 2
-/// (PW_RENDERFULLCONTENT) is used first; when it yields a flat bitmap (some
-/// classic GDI windows only paint through WM_PRINTCLIENT) flag 0 is tried and
-/// the non-flat result is kept.
 fn capture_window(hwnd: i64) -> Capture {
     let h = hwnd as HWND;
     let mut rc = RECT::default();
@@ -1091,8 +957,6 @@ mod tests {
 
     #[test]
     fn command_line_bare_program_is_historically_quoted() {
-        // Zero-args launch keeps the exact historical form: the program
-        // alone, always double-quoted.
         assert_eq!(cmd_line("notepad.exe", &[]), "\"notepad.exe\"");
     }
 
@@ -1111,10 +975,6 @@ mod tests {
 
     #[test]
     fn command_line_escapes_quotes_and_backslashes() {
-        // CommandLineToArgvW rules: 2n+1 backslashes before a literal
-        // quote, 2n trailing — inside a quoted element. An element with no
-        // spaces stays bare (a trailing backslash outside quotes is
-        // literal and needs no doubling).
         assert_eq!(cmd_line("prog", &["a\"b"]), "\"prog\" \"a\\\"b\"");
         assert_eq!(
             cmd_line("prog", &["C:\\dir with space\\"]),

@@ -1,9 +1,3 @@
-//! P2b schema truth: the declared tool surface is truthful and the
-//! element fingerprint is stable across geometry changes.
-//!
-//! These tests fail on the pre-P2b tree (no annotations,
-//! `do.actions.items` untyped, `fp` includes rect) and pass after. Only
-//! `tools/list` runs: no desktop touch, no injection.
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
@@ -15,8 +9,6 @@ use serde_json::{Map, Value};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Every action type `do.actions.items` must cover, and every verb the
-/// claims source must classify.
 const ACTION_TYPES: [&str; 16] = [
     "click",
     "clipboard_get",
@@ -36,10 +28,8 @@ const ACTION_TYPES: [&str; 16] = [
     "wait_for",
 ];
 
-/// The claims source and its tables, parsed rather than copied (W1.1, W1.3).
 const CLAIMS: &str = include_str!("../src/claims.rs");
 
-/// The bracketed body of one `pub const NAME … = [ … ];` declaration.
 fn table_body(name: &str) -> &'static str {
     let at = CLAIMS
         .find(&format!("pub const {name}:"))
@@ -60,7 +50,6 @@ fn table_body(name: &str) -> &'static str {
     &rest[open..close]
 }
 
-/// Every double-quoted string in a fragment, in order.
 fn quoted(fragment: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = fragment;
@@ -73,7 +62,6 @@ fn quoted(fragment: &str) -> Vec<String> {
     out
 }
 
-/// A table of `arity`-field rows from the claims source.
 fn claims_rows(name: &str, arity: usize) -> Vec<Vec<String>> {
     let values = quoted(table_body(name));
     assert_eq!(
@@ -123,7 +111,6 @@ impl Session {
         Session { child, stdin, rx }
     }
 
-    /// One request/response round-trip on this session.
     fn call(&mut self, id: i64, method: &str, params: Value) -> Value {
         let frame = serde_json::json!({
             "jsonrpc": "2.0", "id": id, "method": method, "params": params,
@@ -186,7 +173,6 @@ fn input_schema(t: &Map<String, Value>) -> &Map<String, Value> {
         .unwrap_or_else(|| panic!("{} must carry inputSchema", t["name"]))
 }
 
-/// Every variant of a oneOf/anyOf (following $defs/$ref when present).
 fn union_variants<'a>(schema: &'a Value, root: &'a Value) -> Vec<&'a Map<String, Value>> {
     let resolve = |v: &'a Value| -> Option<&'a Map<String, Value>> {
         let o = v.as_object()?;
@@ -215,7 +201,6 @@ fn union_variants<'a>(schema: &'a Value, root: &'a Value) -> Vec<&'a Map<String,
     out
 }
 
-/// The declared `type` value(s) of one action variant.
 fn variant_types(v: &Map<String, Value>) -> Vec<String> {
     let t = v
         .get("properties")
@@ -233,7 +218,6 @@ fn variant_types(v: &Map<String, Value>) -> Vec<String> {
     panic!("action variant type must use const/enum, got: {t}");
 }
 
-/// Recursively collect every `required` array in a schema.
 fn collect_required(schema: &Value, into: &mut Vec<BTreeSet<String>>) {
     match schema {
         Value::Object(o) => {
@@ -433,10 +417,6 @@ fn screenshot_schema_states_real_bounds() {
     }
 }
 
-/// SPEC W3.2 and AMENDMENT-01 A3: the two capture defaults an agent inherits.
-/// Lossless by default (`fmt` is `png`), and the preview clamp stays 1280 on
-/// both capture tools — the native path is the caller's explicit
-/// `max_px:null`, never a raised default.
 #[test]
 fn capture_defaults_are_lossless_and_bounded() {
     let tools = list_tools();
@@ -565,13 +545,6 @@ fn p2a_output_schemas_unchanged_in_shape() {
     }
 }
 
-/// Frozen P2a contract: every tool's `outputSchema` from `tools/list`
-/// must equal `tests/fixtures/output_schemas_p2a.json` value-for-value
-/// (`serde_json::Value` equality is order-insensitive for objects, so
-/// key order is free but every field, type, and required entry is
-/// pinned). The fixture was captured from the P2b tree's own binary,
-/// whose `outputSchema`s were verified value-identical across the
-/// rewrite; any future edit to an envelope fails here first.
 #[test]
 fn p2a_output_schemas_match_frozen_fixture() {
     let frozen: Value = serde_json::from_str(include_str!("fixtures/output_schemas_p2a.json"))
@@ -607,10 +580,6 @@ fn p2a_output_schemas_match_frozen_fixture() {
     }
 }
 
-/// W1.3: the schema prose may not document a dead verb or a code that does
-/// not exist. Every action type is classified in the claims source, and a
-/// verb classified `refused` is only ever described inside a refusal
-/// clause (`refused`/`refuses`/`refusal` within the same sentence).
 #[test]
 fn every_action_type_is_classified_and_refused_verbs_say_so() {
     let tools = list_tools();
@@ -620,7 +589,6 @@ fn every_action_type_is_classified_and_refused_verbs_say_so() {
         .expect("do must carry a description");
     let rows = claims_rows("REFUSALS", 3);
 
-    // Every action type the schema declares has a classification.
     let classified: Vec<String> = rows.iter().map(|r| r[0].clone()).collect();
     for verb in ACTION_TYPES {
         assert!(
@@ -629,7 +597,6 @@ fn every_action_type_is_classified_and_refused_verbs_say_so() {
         );
     }
 
-    // A refused verb is documented as refused, naming its code.
     for row in rows.iter().filter(|r| r[1] == "refused") {
         let (verb, code) = (&row[0], &row[2]);
         let mut documented = false;
@@ -656,8 +623,6 @@ fn every_action_type_is_classified_and_refused_verbs_say_so() {
     }
 }
 
-/// W1.3: three codes never existed as behaviour and must not survive in any
-/// tool description.
 #[test]
 fn no_description_documents_a_code_that_never_existed() {
     let dead = [
@@ -675,8 +640,6 @@ fn no_description_documents_a_code_that_never_existed() {
                 "{name} documents {code}, which no code emits"
             );
         }
-        // The input schema's own prose counts too: an option description is
-        // read by the agent as the tool's contract.
         let schema = serde_json::to_string(&t["inputSchema"]).unwrap();
         for code in dead {
             assert!(
@@ -687,11 +650,6 @@ fn no_description_documents_a_code_that_never_existed() {
     }
 }
 
-/// SPEC W1.4: each `TOOL_*` const stays under its budget, and the whole
-/// surface under their sum. Measured on the consts the server serves, not on
-/// a re-serialisation of them. AMENDMENT-02 raised `diff` from 2 400 to
-/// 2 800 so the W3 mask and scale contract fits without deleting a claim;
-/// the sum is unchanged.
 const TOOL_BUDGETS: [(&str, usize); 7] = [
     ("screenshot", 4000),
     ("diff", 2800),
@@ -703,7 +661,6 @@ const TOOL_BUDGETS: [(&str, usize); 7] = [
 ];
 const BUDGET_SUM: usize = 26700;
 
-/// The `r#"…"#` value of one `pub const TOOL_*` line in `src/schemas.rs`.
 fn tool_const(name: &str) -> String {
     let src = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/schemas.rs"),
@@ -720,7 +677,6 @@ fn tool_const(name: &str) -> String {
     rest[..end].to_string()
 }
 
-/// One `pub const NAME: &str = "value";` claim from the claims source.
 fn claims_const(name: &str) -> String {
     let at = CLAIMS
         .find(&format!("pub const {name}:"))
@@ -750,9 +706,6 @@ fn tool_consts_fit_their_byte_budgets() {
     println!("BUDGET_OK sum={sum}");
 }
 
-/// The budget may not delete truth: every load-bearing claim the claims
-/// source states still reaches an agent through the contract it reads
-/// (`initialize` instructions plus the seven tool descriptions).
 #[test]
 fn the_budget_cut_kept_every_load_bearing_claim() {
     let mut s = Session::spawn();
@@ -793,14 +746,11 @@ fn the_budget_cut_kept_every_load_bearing_claim() {
             .join("\n")
     );
 
-    // The coordinate rule, verbatim from the claims source.
     let coord = claims_const("COORD_RULE");
     assert!(
         surface.contains(&coord),
         "the byte cut must not drop the coordinate rule"
     );
-    // `SendInput` is never called (I1), and the effect/satisfied readings
-    // that keep `ok` from being mistaken for a result.
     let i1 = claims_rows("INVARIANTS", 2)
         .into_iter()
         .find(|r| r[0] == "I1")
@@ -822,13 +772,10 @@ fn the_budget_cut_kept_every_load_bearing_claim() {
             _ => {}
         }
     }
-    // expect_fp is an agent-facing requirement, not a footnote: it has to
-    // be readable on both tools that take it.
     assert!(
         do_desc.contains("expect_fp") && elements_desc.contains("expect_fp"),
         "do and elements must both state the expect_fp requirement"
     );
-    // The refusal table survives in the tool an agent reads before acting.
     for row in claims_rows("REFUSALS", 3) {
         if row[1] != "refused" {
             continue;
@@ -842,9 +789,6 @@ fn the_budget_cut_kept_every_load_bearing_claim() {
     }
 }
 
-/// SPEC W2.2: both tools that take an `fp` state the three exclusions and the
-/// consequence, so an agent cannot read the fingerprint as covering geometry,
-/// text or state — and cannot skip `expect_fp` after moving a slider.
 #[test]
 fn the_fingerprint_prose_names_the_three_exclusions() {
     let tools = list_tools();

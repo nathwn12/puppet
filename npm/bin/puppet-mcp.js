@@ -48,15 +48,8 @@ const MANIFEST_PATH = path.join(PKG_DIR, 'engine-manifest.json');
 const PKG_PATH = path.join(PKG_DIR, 'package.json');
 const PLATFORM_OVERRIDE_ENV = 'PUPPET_MCP_ALLOW_NON_WINDOWS';
 const RUNTIME_CACHE_OVERRIDE_ENV = 'PUPPET_ENGINE_CACHE';
-// Local-bundle override, diagnostics only. A normal run leaves it unset and
-// downloads runtime.archive from the Release. The pre-publish cleanroom names
-// the archive it just built, because the Release that would serve it does not
-// exist until AFTER the build job passes. Every size/sha256 assertion still
-// runs on the local bytes: an override can never smuggle in a bad artifact.
 const RUNTIME_BUNDLE_OVERRIDE_ENV = 'PUPPET_ENGINE_BUNDLE';
 const DOWNLOAD_TIMEOUT_MS = 15 * 60 * 1000;
-// Staging/extraction guards: the real runtime bundle is ~2 MB. These caps
-// reject zip bombs, never the real artifact.
 const MAX_ENTRIES = 4096;
 const MAX_TOTAL_UNCOMPRESSED = 2 * 1024 * 1024 * 1024;
 const MAX_ENTRY_SIZE = 1 * 1024 * 1024 * 1024;
@@ -103,21 +96,15 @@ function loadPackageVersion() {
   return pkg.version;
 }
 
-// Engine cache leaf dirs are `<semver>-<bundleSha8>` (or `<semver>-unpublished`
-// before the release workflow fills the manifest hashes).
 function isEngineLeafName(base) {
   return /^\d+\.\d+\.\d+-(?:[0-9a-fA-F]{8}|unpublished)$/.test(base);
 }
 
-// The semver embedded in an engine cache path, or null when the path names
-// no engine leaf.
 function parseEngineVersionFromDir(dir) {
   const m = /^(\d+\.\d+\.\d+)-(?:[0-9a-fA-F]{8}|unpublished)$/.exec(path.basename(dir));
   return m ? m[1] : null;
 }
 
-// Fail closed on version skew: never spawn an engine older (or newer) than
-// this launcher. Prints one actionable line and exits non-zero.
 function assertVersionMatch(pkgVersion, manifest, cacheDir) {
   const reprovision = `npx -y puppet-mcp@${pkgVersion}`;
   if (manifest.serverVersion !== pkgVersion) {
@@ -135,10 +122,6 @@ function assertVersionMatch(pkgVersion, manifest, cacheDir) {
   }
 }
 
-// A sha256 slot the release workflow has not filled yet. The committed
-// manifest carries the sentinel for every hash computed at release time;
-// the workflow replaces each with the real 64-hex digest. Anything else
-// shaped (64 hex chars) is release-provisioned.
 function isPlaceholderSha(sha) {
   return typeof sha !== 'string' || !/^[0-9a-fA-F]{64}$/.test(sha);
 }
@@ -147,14 +130,9 @@ function shortHash(sha) {
   return isPlaceholderSha(sha) ? 'unpublished' : sha.toLowerCase().slice(0, 8);
 }
 
-// Resolved runtime cache directory. Never throws: the diagnostic path must
-// print SOMETHING and exit 0 even where provisioning could never run.
 function resolveRuntimeDir(manifest) {
   const notes = [];
   let root = process.env[RUNTIME_CACHE_OVERRIDE_ENV];
-  // An override that already names an engine leaf dir (<semver>-<sha8>)
-  // is used as-is, so a stale pin resolves to the stale engine and the
-  // version gate below can refuse it instead of silently provisioning past.
   if (root && isEngineLeafName(path.basename(path.resolve(root)))) {
     return { dir: path.resolve(root), overridden: true, notes };
   }
@@ -215,13 +193,6 @@ function usage(exitCode, stream) {
   process.exit(exitCode);
 }
 
-// --- minimal zip reader (stored + deflate, builtins only) -----------------
-// The runtime bundle is an ordinary deflate zip written by PowerShell's
-// Compress-Archive. Node has no builtin unzip, and this package is
-// dependency-free by design, so the container parse is hand-rolled here
-// (~120 lines) over zlib.inflateRawSync. Anything outside the artifact's
-// actual shape (encryption, data descriptors, zip64, unknown methods) is an
-// explicit error, never a silent misparse.
 
 const CRC_TABLE = (() => {
   const t = new Int32Array(256);
@@ -240,7 +211,6 @@ function crc32(buf) {
 }
 
 function findEocd(buf) {
-  // EOCD is >= 22 bytes at the very end, with up to 64 KiB of comment.
   const lo = Math.max(0, buf.length - (65557 + 22));
   for (let i = buf.length - 22; i >= lo; i--) {
     if (buf.readUInt32LE(i) === 0x06054b50) return i;
@@ -285,14 +255,6 @@ function extractZip(buf, destDir) {
     total += uncompSize;
     if (total > MAX_TOTAL_UNCOMPRESSED) throw new Error('archive uncompressed total exceeds cap');
 
-    // Traversal guard: zip names normally use forward slashes, but
-    // PowerShell's Compress-Archive can write nested entry names
-    // with backslashes. Normalize every backslash to `/` FIRST, then run
-    // the unchanged checks below on the normalized name: absolute paths,
-    // drive letters, and `..` segments stay rejected, and the resolved
-    // target must still sit under destDir.
-    // (Spelled via char code so the source never holds a literal
-    // double-backslash.)
     const BACKSLASH = String.fromCharCode(92);
     const name = rawName.split(BACKSLASH).join('/');
     if (name.startsWith('/') || /^[A-Za-z]:/.test(name)) {
@@ -325,7 +287,6 @@ function extractZip(buf, destDir) {
   return extracted;
 }
 
-// --- provisioning ---------------------------------------------------------
 
 function sha256File(filePath) {
   const h = crypto.createHash('sha256');
@@ -334,7 +295,6 @@ function sha256File(filePath) {
 }
 
 function checkFile(filePath, want) {
-  // want: {name, sha256, size}. Returns null when good, else a reason.
   let st;
   try {
     st = fs.statSync(filePath);
@@ -348,10 +308,6 @@ function checkFile(filePath, want) {
   return null;
 }
 
-// Is `cacheDir` a COMPLETE, MANIFEST-CORRECT engine cache? This is the only
-// definition of "ready" in this file: reuse, a sibling's cache adopted after
-// a lost rename, and the failure cleanup all ask the same question, so a
-// half-written or foreign directory can never be adopted or preserved.
 function targetReady(cacheDir, rt, manifest) {
   try {
     const marker = JSON.parse(fs.readFileSync(path.join(cacheDir, '.ready'), 'utf8'));
@@ -363,20 +319,12 @@ function targetReady(cacheDir, rt, manifest) {
   return checkFile(path.join(cacheDir, rt.server.name), rt.server) === null;
 }
 
-// Windows refuses a directory rename onto an existing directory with one of
-// these; they are the *expected* shape of losing a provisioning race to a
-// sibling launcher, never a reason to fail.
 const SIBLING_WON = new Set(['EPERM', 'EACCES', 'EBUSY', 'EEXIST', 'ENOTEMPTY']);
 
 function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-// Publish a verified staging dir as the cache. Two launchers starting the
-// same version at the same moment both stage and both rename; the loser must
-// adopt the winner's directory (verified) instead of dying EPERM - observed
-// live as `Connection closed ... rename staging-34508 -> 6.1.2-e8f96a59`.
-// Returns 'renamed' | 'adopted'.
 function publishStaging(staging, cacheDir, rt, manifest) {
   let lastErr = null;
   for (const delay of [0, 25, 75, 150, 300]) {
@@ -387,7 +335,6 @@ function publishStaging(staging, cacheDir, rt, manifest) {
     } catch (err) {
       lastErr = err;
       if (!SIBLING_WON.has(err.code)) throw err;
-      // The sibling may have finished between our attempt and this check.
       if (targetReady(cacheDir, rt, manifest)) return 'adopted';
     }
   }
@@ -398,9 +345,6 @@ function publishStaging(staging, cacheDir, rt, manifest) {
   );
 }
 
-// The ONLY fetch call site in this package. The diagnostic path returns
-// before the ensure* functions, so --doctor/--print-manifest provably reach
-// no network: grep `fetch(` — it appears exactly once, here.
 async function downloadToMemory(url) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), DOWNLOAD_TIMEOUT_MS);
@@ -431,7 +375,6 @@ async function ensureRuntime(manifest, cacheDir) {
   const markerPath = path.join(cacheDir, '.ready');
   const reuse = (() => {
     if (!targetReady(cacheDir, rt, manifest)) {
-      // Name the reason so a broken cache is never silently re-provisioned.
       try {
         fs.readFileSync(markerPath, 'utf8');
         log(`cached engine at ${cacheDir} is invalid; re-provisioning.`);

@@ -1,22 +1,4 @@
 #!/usr/bin/env node
-// Structural gate for .github/workflows/release.yml: the release lane's
-// ordering invariants, asserted on the raw workflow so an edit cannot quietly
-// re-open the drift the derivation closed.
-//
-// This is NOT a YAML parser and does not try to be one: GitHub itself is the
-// YAML gate (an unparsable workflow never runs). What this proves is the SHAPE
-// of a workflow that does parse — that the version is derived before anything
-// asserts it, that no step writes a version, that the changelog section closes
-// after the test and before any tag, and that the tag is created in the publish
-// job immediately before the release is attached.
-//
-// It reads the file's actual structure (jobs at 2 spaces, steps as `      - `
-// items), so any reordering, removal or rename that breaks an invariant fails
-// here in milliseconds instead of in a 20-minute release run. It is called by
-// the release lane itself, first step after checkout.
-//
-// Usage: node scripts/check-release-workflow.mjs [--file <path>]
-// Exit 0 when every invariant holds, 1 otherwise. No dependencies.
 
 import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -36,7 +18,6 @@ try {
 
 const lines = text.split(/\r?\n/);
 
-// A job is `  <name>:` directly under `jobs:`; its steps are `      - ` items.
 function jobText(name) {
   const start = lines.findIndex((l) => new RegExp(`^  ${name}:\\s*$`).test(l));
   if (start < 0) return null;
@@ -119,8 +100,6 @@ check("concurrency", () => {
   return "release-${{ github.repository }}";
 });
 
-// ---- checkout: the dispatched ref is the source, the commit input is an
-// assertion, and the derivation needs the full history and tags -------------
 check("checkout-full-history-no-ref", () => {
   for (const [label, list] of [["build", buildSteps], ["publish", publishSteps]]) {
     const i = at(list, /^actions\/checkout/);
@@ -131,7 +110,6 @@ check("checkout-full-history-no-ref", () => {
   return "both checkouts: fetch-depth 0, no ref:";
 });
 
-// ---- the derivation happens before anything asserts a version -------------
 check("build-derive-first", () => {
   const derive = at(buildSteps, /^derive release version$/);
   const refAssert = at(buildSteps, /^assert the ref names the derived version$/);
@@ -150,7 +128,6 @@ check("publish-rederives", () => {
   return `re-derive #${redrive} < tag #${tag}`;
 });
 
-// ---- no writer: the lane asserts every manifest, it never repairs one -----
 check("no-version-writer", () => {
   const all = [...buildSteps, ...publishSteps];
   need(indexOf(all, /^apply the derived version$/) < 0, "an 'apply the derived version' step exists; this lane asserts, never writes");
@@ -170,7 +147,6 @@ check("manifest-asserts-present", () => {
   return "Cargo.toml + npm/package.json + npm/engine-manifest.json asserted against the derivation";
 });
 
-// ---- changelog closes after the gate, and the tag exists only after that --
 check("changelog-after-test", () => {
   const test = at(buildSteps, /^test$/);
   const close = at(buildSteps, /^close the changelog section$/);
@@ -196,7 +172,6 @@ check("tag-before-attach", () => {
   return `tag #${tag} immediately before attach #${attach}, guarded by stale check + dry_run`;
 });
 
-// ---- the publish assertions read the derived tag, not GITHUB_REF ----------
 check("publish-reads-derived-tag", () => {
   const env = /^  publish:[\s\S]*?\n    env:\n      RELEASE_TAG: (.+)$/m.exec(text);
   need(env, "publish has no RELEASE_TAG env");

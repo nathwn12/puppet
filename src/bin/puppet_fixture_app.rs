@@ -1,30 +1,3 @@
-//! P3a test fixture: a minimal single-window GUI app for the hidden-desktop
-//! proof. One top-level window (title from argv[1], else a default) with
-//! one visible, enabled EDIT child holding known initial text. No file I/O,
-//! no persistence, no registry, no tabs, no prompts, no session restore.
-//! WM_CLOSE destroys the window and the process exits, so hidden-desktop
-//! teardown needs nothing but the close post.
-//! P3b paging tests pass argv[2] = N to append N named buttons after the
-//! edit (overflow for the 200-entry page); without it the window is exactly
-//! the single-edit fixture as before.
-//!
-//! Test-only in spirit (only the desktop live tests launch it), but
-//! built as a regular `src/bin` target so integration tests resolve it
-//! through `env!("CARGO_BIN_EXE_puppet_fixture_app")`.
-//!
-//! W6.2 adds the `caps` mode, the only mode that differs from the window
-//! above: a frame hosting a child button at a known client rect, a
-//! message-swallowing control, a checkbox, a listbox, a grid, the p4c
-//! tree/trackbar the state object reads, and a stamped message log
-//! readable through `elements` detail:text. Every capability is opt-in by
-//! argv, so `p4c`, a numeric button count and the baseline window are
-//! byte-for-byte what they were.
-//!
-//! W2.1 adds the p4c mode's live button and its activation counter: a posted
-//! `WM_APP+1` renames the button (same auto_id, new name, so its fingerprint
-//! moves while its selector keeps resolving), and every activation is
-//! mirrored into a read-only STATIC, so a refused mutation can prove it
-//! activated nothing.
 
 #![windows_subsystem = "windows"]
 
@@ -45,9 +18,6 @@ use windows_sys::Win32::UI::Controls::{
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-// ---------------------------------------------------------------- W6.2 caps
-// Control ids double as UIA automation ids, so the walk accepts every entry
-// (name + auto_id + invokable rule, `src/uia.rs:714`).
 const CAPS_LOG_ID: i32 = 4000;
 const CAPS_SWALLOW_ID: i32 = 4001;
 const CAPS_LIST_ID: i32 = 4002;
@@ -58,38 +28,21 @@ const CAPS_TRACK_ID: i32 = 4006;
 const CAPS_TREE_ID: i32 = 4007;
 const CAPS_FRAME_BTN_ID: i32 = 4100;
 
-// ---------------------------------------------------------------- W2.1 p4c
-// The p4c window's live button, the read-only STATIC that reports its
-// activation count, and the posted message that re-renders (renames) it. A
-// rename changes `name`, so the element fingerprint moves while `auto_id`
-// keeps resolving: the selector still finds a control, just not the one the
-// snapshot saw.
 const P4C_LIVE_BTN_ID: i32 = 3003;
 const P4C_COUNT_ID: i32 = 3004;
-// W2.3: the control a wait snapshots (disabled, so an `enabled` wait cannot be
-// satisfied by it) and the control that replaces it — a fresh one with the same
-// name and a different automation id, so its fingerprint moves.
 const P4C_WAIT_ID: i32 = 3005;
 const P4C_WAIT_TAKER_ID: i32 = 3007;
 const WM_P4C_RENAME: u32 = WM_APP + 1;
 const WM_P4C_SWAP: u32 = WM_APP + 2;
 
-/// Button hwnd, counter hwnd and activation count, all 0 until the p4c
-/// window creates them: every other mode leaves them 0, so its behaviour is
-/// unchanged.
 static P4C_BTN: AtomicIsize = AtomicIsize::new(0);
 static P4C_COUNT: AtomicIsize = AtomicIsize::new(0);
 static P4C_ACT: AtomicIsize = AtomicIsize::new(0);
-/// W2.3's pair: the disabled holder of the waited name and the control that
-/// takes it, 0 until the p4c window creates them.
 static P4C_WAIT: AtomicIsize = AtomicIsize::new(0);
 static P4C_WAIT_NEW: AtomicIsize = AtomicIsize::new(0);
 
-/// The stamped log's own window, 0 until it exists.
 static CAPS_LOG_HWND: AtomicIsize = AtomicIsize::new(0);
-/// Set by the caps window's first WM_PAINT: the harness's readiness signal.
 static CAPS_PAINTED: AtomicBool = AtomicBool::new(false);
-/// Process-relative clock: every stamp is milliseconds since boot.
 static CAPS_START: OnceLock<Instant> = OnceLock::new();
 static CAPS_LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
@@ -97,9 +50,6 @@ fn caps_ms() -> u128 {
     CAPS_START.get_or_init(Instant::now).elapsed().as_millis()
 }
 
-/// Append one stamped line and mirror the whole log into the read-only
-/// RichEdit the harness reads through `elements` detail:text. Bounded so the
-/// 4000-char text cap never eats the newest lines.
 fn caps_push(line: String) {
     let text = {
         let mut lines = match CAPS_LINES.lock() {
@@ -119,7 +69,6 @@ fn caps_push(line: String) {
     }
 }
 
-/// GET_X_LPARAM/GET_Y_LPARAM: signed client coordinates out of an lParam.
 fn caps_point(l: isize) -> (i32, i32) {
     let x = (l & 0xffff) as u16 as i16 as i32;
     let y = ((l >> 16) & 0xffff) as u16 as i16 as i32;
@@ -161,15 +110,8 @@ fn caps_name_of(id: i32) -> &'static str {
     }
 }
 
-/// The caps top-level: logs every message an agent can post, and counts
-/// activations as `activate <name>` lines (an absent line is zero
-/// activations, which is what W4.1/W4.2 assert).
 unsafe extern "system" fn wndproc_caps(hwnd: HWND, msg: u32, w: usize, l: isize) -> isize {
     match msg {
-        // Readiness signal: the first processed WM_PAINT is the moment this
-        // window has a frame a capture can accept, so the harness waits for
-        // this line instead of guessing with a sleep. A fresh window reads
-        // all-black until then and the capture refuses that frame.
         WM_PAINT => {
             if !CAPS_PAINTED.swap(true, Ordering::SeqCst) {
                 caps_push("painted".to_string());
@@ -201,9 +143,6 @@ unsafe extern "system" fn wndproc_caps(hwnd: HWND, msg: u32, w: usize, l: isize)
     DefWindowProcW(hwnd, msg, w, l)
 }
 
-/// The message-swallowing control: it records every button message it is
-/// handed and returns 0, so it never activates and never reports anything
-/// else. A fixture for W4.1's `effect:"ignored"`.
 unsafe extern "system" fn wndproc_swallow(hwnd: HWND, msg: u32, w: usize, l: isize) -> isize {
     match msg {
         WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN | WM_RBUTTONUP => {
@@ -221,15 +160,10 @@ unsafe extern "system" fn wndproc_swallow(hwnd: HWND, msg: u32, w: usize, l: isi
     DefWindowProcW(hwnd, msg, w, l)
 }
 
-/// The frame around the child button: plain default processing, so it is a
-/// real container a hit-test can resolve instead of the top-level.
 unsafe extern "system" fn wndproc_plain(hwnd: HWND, msg: u32, w: usize, l: isize) -> isize {
     DefWindowProcW(hwnd, msg, w, l)
 }
 
-/// One `layout <name> cx=… cy=… w=… h=…` line in the top-level's CLIENT
-/// coordinates: the known rect a coordinate click aims at, measured rather
-/// than assumed.
 fn caps_layout(top: HWND, child: HWND, name: &str) {
     unsafe {
         let mut r: RECT = std::mem::zeroed();
@@ -256,8 +190,6 @@ fn caps_layout(top: HWND, child: HWND, name: &str) {
     }
 }
 
-/// Register a plain child-window class with a light background (a black
-/// frame would read as a blank capture) and the given window proc.
 fn caps_register_class(name: &str, proc_: WNDPROC) {
     let cls = wide(name);
     unsafe {
@@ -284,10 +216,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> i
         PostQuitMessage(0);
         return 0;
     }
-    // W2.1: the p4c live button counts its activations into a read-only
-    // STATIC (an absent activation reads as `activations=0`), and renames
-    // itself on the posted re-render, which moves its fingerprint without
-    // moving its selector.
     if msg == WM_COMMAND {
         let id = (w & 0xffff) as i32;
         let code = ((w >> 16) & 0xffff) as u32;
@@ -307,11 +235,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> i
         }
         return 0;
     }
-    // W2.3: a different control takes the name the wait is polling for. The
-    // holder is DESTROYED rather than renamed: the Win32 UIA provider serves a
-    // cached Name for an existing element for seconds after WM_SETTEXT, so a
-    // rename would make the swap unobservable inside a wait. A destroyed
-    // control leaves the tree at once and the new one is a fresh element.
     if msg == WM_P4C_SWAP {
         let holder = P4C_WAIT.load(Ordering::SeqCst);
         if holder != 0 {
@@ -345,20 +268,9 @@ fn main() {
     let title = argv
         .next()
         .unwrap_or_else(|| "puppet hidden fixture".to_string());
-    // Opt-in stress mode for paging tests: a second argv element N creates
-    // N named buttons after the baseline edit (no other behaviour changes;
-    // without it the window is exactly the single-edit fixture as before).
-    // A second argv element of exactly "p4c" instead builds the P4c
-    // pattern-proof controls (tree + trackbar + multiline edit).
     let mode = argv.next().unwrap_or_default();
     let p4c = mode == "p4c";
-    // W6.2 capability window: the p4c controls plus the frame/button,
-    // swallowing control, checkbox, listbox, grid and stamped log.
     let caps = mode == "caps";
-    // W3.4: two opt-in frames for the blank-frame measurement. `blackrect`
-    // paints real content with one genuinely black rectangle inside it, and
-    // `blank` paints nothing at all (no class brush, no children). Both are
-    // offscreen popups, so neither ever appears on a monitor.
     let blackrect = mode == "blackrect";
     let blank = mode == "blank";
     let offscreen = blackrect || blank;
@@ -386,8 +298,6 @@ fn main() {
         let (win_w, win_h) = if caps {
             (760, 620)
         } else if p4c {
-            // W2.1's live button and activation counter sit under the
-            // baseline edit; the extra height is the room for them.
             (480, 420)
         } else {
             (480, 320)
@@ -417,10 +327,6 @@ fn main() {
             return;
         }
         if offscreen {
-            // W3.4: `blackrect` gets real painted content (a BUTTON paints
-            // itself, the proven paint path for an offscreen window) with a
-            // genuinely black rectangle inside it; `blank` gets no child at
-            // all, so its frame reads all-black and the capture must refuse.
             if blackrect {
                 let content = CreateWindowExW(
                     0,
@@ -485,11 +391,6 @@ fn main() {
             DestroyWindow(hwnd);
             return;
         }
-        // W6.2 capabilities, all opt-in by the `caps` mode: a frame with a
-        // child button at a known client rect (W4.2), a message-swallowing
-        // control (W4.1), a checkbox, a listbox, a grid (W5.1), the p4c
-        // tree/trackbar the state object reads, and a stamped message log
-        // (W4.4, W4.5) readable through `elements` detail:text.
         if caps {
             let icc = INITCOMMONCONTROLSEX {
                 dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
@@ -499,8 +400,6 @@ fn main() {
             caps_register_class("PuppetCapsFrame", Some(wndproc_plain));
             caps_register_class("PuppetCapsSwallow", Some(wndproc_swallow));
             let btn_cls = wide("BUTTON");
-            // A frame hosting a child Button: the point resolves to a child
-            // window, never to the locked top-level.
             let frame_cls = wide("PuppetCapsFrame");
             let frame = CreateWindowExW(
                 0,
@@ -533,7 +432,6 @@ fn main() {
                     std::ptr::null(),
                 );
             }
-            // A control that swallows button messages and never activates.
             let swallow_cls = wide("PuppetCapsSwallow");
             let swallow = CreateWindowExW(
                 0,
@@ -549,7 +447,6 @@ fn main() {
                 std::ptr::null_mut(),
                 std::ptr::null(),
             );
-            // ToggleButton (TogglePattern) for the state object.
             let toggle = CreateWindowExW(
                 0,
                 btn_cls.as_ptr(),
@@ -564,7 +461,6 @@ fn main() {
                 std::ptr::null_mut(),
                 std::ptr::null(),
             );
-            // ListBox: SelectionItem-shaped items.
             let list_cls = wide("LISTBOX");
             let list = CreateWindowExW(
                 0,
@@ -586,8 +482,6 @@ fn main() {
                 }
                 SendMessageW(list, LB_SETCURSEL, 0, 0);
             }
-            // A GridItem-shaped table: a report-mode ListView with two
-            // columns and three rows.
             let grid_cls = wide("SysListView32");
             let grid = CreateWindowExW(
                 0,
@@ -624,7 +518,6 @@ fn main() {
                     }
                 }
             }
-            // The tree and trackbar the W5.1 state readers are proven on.
             let tree_cls = wide("SysTreeView32");
             let tree = CreateWindowExW(
                 0,
@@ -681,7 +574,6 @@ fn main() {
                 SendMessageW(track, TBM_SETRANGE, 1, (100 << 16) as isize);
                 SendMessageW(track, TBM_SETPOS, 1, 0);
             }
-            // The stamped log, last: every earlier control can write to it.
             LoadLibraryW(wide("Msftedit.dll").as_ptr());
             let rich_cls = wide("RICHEDIT50W");
             let log = CreateWindowExW(
@@ -712,13 +604,6 @@ fn main() {
             caps_layout(hwnd, swallow, "dc-swallow");
             caps_layout(hwnd, toggle, "dc-toggle");
         }
-        // Paging stress controls: named buttons stacked below the edit.
-        // They need no layout (the walk enumerates offscreen children) and
-        // no input; their only job is to overflow the 200-entry page.
-        // A shared-label pair brackets the numbered tail: the first dup
-        // lands on page 1, the second past the 200-entry cap, so a
-        // name:p3b-dup wait must see both (ambiguous) only with a full
-        // cross-page scan.
         if extra > 0 {
             let btn_cls = wide("BUTTON");
             let dup = wide("p3b-dup");
@@ -768,11 +653,6 @@ fn main() {
                 std::ptr::null(),
             );
         }
-        // P4c pattern-proof controls: a SysTreeView32 with a root + child
-        // node (ExpandCollapse), a trackbar (RangeValue), and a RichEdit
-        // multiline edit (TextPattern). Control IDs double as UIA
-        // automation ids so the walk accepts them (name + auto_id +
-        // invokable rule).
         if p4c {
             let icc = INITCOMMONCONTROLSEX {
                 dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
@@ -832,7 +712,6 @@ fn main() {
                 std::ptr::null(),
             );
             if !track.is_null() {
-                // Range 0..100, initial position 0.
                 SendMessageW(track, TBM_SETRANGE, 1, (100 << 16) as isize);
                 SendMessageW(track, TBM_SETPOS, 1, 0);
             }
@@ -865,10 +744,6 @@ fn main() {
                 DestroyWindow(hwnd);
                 return;
             }
-            // W2.1: a live button whose selector survives a re-render. The
-            // posted WM_P4C_RENAME renames it (fingerprint moves, auto_id
-            // does not), and every activation is counted into the STATIC so
-            // a refused mutation can prove zero activations.
             let btn_cls = wide("BUTTON");
             let live_btn = CreateWindowExW(
                 0,
@@ -904,9 +779,6 @@ fn main() {
             }
             P4C_BTN.store(live_btn as isize, Ordering::SeqCst);
             P4C_COUNT.store(count as isize, Ordering::SeqCst);
-            // W2.3's pair: a disabled holder of `p4c-wait`, so an `enabled`
-            // wait cannot be satisfied by it, and (on the posted swap) a fresh
-            // enabled control with the same name and a different automation id.
             let wait_btn = CreateWindowExW(
                 0,
                 btn_cls.as_ptr(),

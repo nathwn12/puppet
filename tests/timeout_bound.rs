@@ -1,30 +1,3 @@
-//! Bounded UIA / PrintWindow calls: a target that never answers must return a
-//! typed `uia_timeout` / `capture_timeout` inside its deadline, and the worker
-//! must still be usable afterwards.
-//!
-//! The defect this pins: `uia_element_list` (and the UIA activation paths) and
-//! `shot::capture_window` called COM / `PrintWindow` inline on a pool worker
-//! with no deadline, so a provider that never answered held that worker
-//! forever; four of them made every later `tools/call` wait indefinitely while
-//! `ping` still answered.
-//!
-//! Deterministic without a hung provider: the server child is started with
-//! `PUPPET_TEST_STALL_*_MS` (a test-only hook, consumed once per process) plus
-//! a short `PUPPET_*_TIMEOUT_MS` deadline, so the first bounded call of each
-//! family overruns the deadline on purpose and the SECOND call proves the
-//! worker came back. Both hooks are env on the child only: no in-process state
-//! is shared with any other test.
-//!
-//! Live-gated like the rest of the desktop suite (`PUPPET_LIVE_DESKTOP=1`):
-//! it needs a real window to walk and capture.
-//!
-//! The COVERAGE of that discipline is pinned statically (no desktop needed):
-//! `every_com_entry_point_is_bounded` reads the sources and fails when a UIA
-//! or PrintWindow entry point stops routing through `deadline::bound` /
-//! `deadline::limit`. That is what closed the 6.1.3 gap: `uia_is_enabled`,
-//! `uia_expand_collapse`, `uia_expand_state`, `uia_range_value`, `uia_scroll`,
-//! `uia_element_text` and the hidden-desktop capture were unbounded while the
-//! three originally wrapped calls were not.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -59,9 +32,6 @@ impl Session {
         Self::spawn_with_stall(true)
     }
 
-    /// The same child with the same deadlines; `stall` decides whether the
-    /// test-only stall hooks are armed. `false` is the control arm of a
-    /// differential run: identical sequence, no overrun.
     fn spawn_with_stall(stall: bool) -> Self {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_puppet"));
         cmd.env("PUPPET_UIA_TIMEOUT_MS", UIA_DEADLINE_MS.to_string())
@@ -108,7 +78,6 @@ impl Session {
         self.stdin.flush().expect("flush frame");
     }
 
-    /// Send one `tools/call` and time how long the RESPONSE took to arrive.
     fn timed_call(&mut self, id: i64, name: &str, arguments: Value) -> (Value, Duration) {
         let frame = serde_json::json!({
             "jsonrpc": "2.0",
@@ -174,9 +143,6 @@ fn raw_text(r: &Value) -> String {
     serde_json::to_string(r).unwrap_or_default()
 }
 
-/// A bounded call must return typed inside its deadline, and the worker must
-/// serve the next call normally (the walk goes back to the UIA backend, which
-/// also proves the abandoned helper leaked no apartment state).
 #[test]
 fn uia_walk_times_out_typed_and_the_worker_recovers() {
     if !live() {
@@ -187,7 +153,6 @@ fn uia_walk_times_out_typed_and_the_worker_recovers() {
     let title = fx.title.clone();
     let mut s = Session::spawn();
 
-    // First UIA walk in this process: the stall hook is armed, so it overruns.
     let (red, elapsed) = s.timed_call(1, "elements", serde_json::json!({"title": title}));
     let sc = sc_of(&red);
     let uia_error = sc
@@ -215,7 +180,6 @@ fn uia_walk_times_out_typed_and_the_worker_recovers() {
         elapsed < Duration::from_millis(UIA_DEADLINE_MS + 2500),
         "a stalled walk must be cut at the deadline, not at the {STALL_MS}ms stall: {elapsed:?}"
     );
-    // The elements tool still answers: the Win32 fallback carries the page.
     assert_eq!(
         sc.get("fallback"),
         Some(&Value::from("win32")),
@@ -229,7 +193,6 @@ fn uia_walk_times_out_typed_and_the_worker_recovers() {
         "the Win32 fallback must still list elements, got: {sc}"
     );
 
-    // Second walk, same process: stall consumed, so this must succeed on UIA.
     let (green, second_elapsed) = s.timed_call(2, "elements", serde_json::json!({"title": title}));
     let sc2 = sc_of(&green);
     assert_eq!(
@@ -248,7 +211,6 @@ fn uia_walk_times_out_typed_and_the_worker_recovers() {
     );
 }
 
-/// The capture path: same mechanism, same typed shape, same recovery.
 #[test]
 fn capture_times_out_typed_and_the_worker_recovers() {
     if !live() {
@@ -282,7 +244,6 @@ fn capture_times_out_typed_and_the_worker_recovers() {
         "a stalled capture must be cut at the deadline, not at the {STALL_MS}ms stall: {elapsed:?}"
     );
 
-    // Second capture, same process: stall consumed, the capture must succeed.
     let (green, second_elapsed) = s.timed_call(
         2,
         "screenshot",
@@ -311,9 +272,6 @@ extern "system" {
     fn GetProcessHandleCount(process: *mut core::ffi::c_void, count: *mut u32) -> i32;
 }
 
-/// Open kernel handles in the child, read through the handle this process
-/// already holds for it: no `OpenProcess`, so sampling adds nothing to the
-/// count it reads.
 fn handle_count(child: &Child) -> i64 {
     use std::os::windows::io::AsRawHandle;
     let mut n: u32 = 0;
@@ -322,16 +280,6 @@ fn handle_count(child: &Child) -> i64 {
     i64::from(n)
 }
 
-/// A helper abandoned on timeout, which then returns and exits, must leave no
-/// handle behind: a child that times out and a child that does not run the
-/// identical sequence, so the two must book-keep identically.
-///
-/// Same two arms rather than an absolute count: `cargo test` runs targets
-/// concurrently and every UIA call lazily initialises (tens of handles), so a
-/// lone number is noise. Both arms pay that same cost and are sampled the same
-/// way, so the only difference left is the timeout's own bookkeeping. The
-/// sampling happens after `STALL_MS` plus a margin, i.e. after the abandoned
-/// helper's stall has expired and its thread has exited.
 #[test]
 fn a_returned_helper_leaves_no_handle_behind() {
     if !live() {
@@ -344,7 +292,6 @@ fn a_returned_helper_leaves_no_handle_behind() {
     fn retained(title: &str, stall: bool) -> i64 {
         let mut s = Session::spawn_with_stall(stall);
         let before = handle_count(&s.child);
-        // First walk: overruns the deadline only in the stall arm.
         let (first, _) = s.timed_call(1, "elements", serde_json::json!({"title": title}));
         let first_text = raw_text(&first);
         if stall {
@@ -358,8 +305,6 @@ fn a_returned_helper_leaves_no_handle_behind() {
                 "the control arm must not time out, got: {first_text}"
             );
         }
-        // Second walk: consumes nothing in the stall arm (the hook is one-shot)
-        // and proves the worker survived; it also warms UIA in the control arm.
         let (second, _) = s.timed_call(2, "elements", serde_json::json!({"title": title}));
         assert!(
             !raw_text(&second).contains("uia_timeout"),
@@ -388,24 +333,14 @@ fn src_text(name: &str) -> String {
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
 }
 
-/// The text from a `pub fn <name>` signature to the end of its first
-/// statement block: enough to see whether the body opens with `bound(`.
 fn fn_body_slice(text: &str, name: &str) -> String {
-    // Matches `fn name(` so a `pub unsafe fn` (the capture path) is covered
-    // too; `name_inner` cannot match because the following char is not `(`.
     let sig = format!("fn {name}(");
     let at = text
         .find(&sig)
         .unwrap_or_else(|| panic!("src no longer declares `{sig}`: update this audit"));
-    // 1200 chars covers the signature + the wrapping prologue of every entry
-    // point here; the inner `_inner` call is what follows.
     text[at..(at + 1200).min(text.len())].to_string()
 }
 
-/// Every UIA / PrintWindow entry point runs under the deadline module. The
-/// gap this pins: only `uia_element_list`, `uia_activate` and `uia_set_value`
-/// were bounded, so a provider that stopped answering wedged the worker in
-/// six other verbs and in the hidden-desktop capture.
 #[test]
 fn every_com_entry_point_is_bounded() {
     let uia = src_text("uia.rs");
@@ -431,14 +366,11 @@ fn every_com_entry_point_is_bounded() {
             "{name} must name its own operation in the deadline line"
         );
     }
-    // The window capture (PrintWindow) is bounded the same way...
     let shot = src_text("shot.rs");
     assert!(
         fn_body_slice(&shot, "capture_window").contains("deadline::bound("),
         "shot::capture_window must route through deadline::bound"
     );
-    // ...and the hidden-desktop capture cannot move off its desktop thread,
-    // so it takes the SAME family deadline on the caller side.
     let hidden = src_text("hidden.rs");
     assert!(
         hidden.contains("crate::deadline::limit(crate::deadline::Family::Capture)"),

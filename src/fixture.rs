@@ -1,14 +1,3 @@
-//! Offscreen test fixture: a window the test process owns, positioned off
-//! any monitor, never activated. See task brief Deliverable 1.
-//!
-//! Top-level `WS_POPUP` (never on the taskbar) at (-4000,-4000), shown with
-//! `SW_SHOWNOACTIVATE` so it is visible to UIA without ever activating.
-//! One child `EDIT` (id 100), one read-only `EDIT` (id 102), one `BUTTON`
-//! labelled `OK` (id 101). Message pump runs on the creating thread;
-//! teardown posts `WM_CLOSE` and joins the thread deterministically.
-//!
-//! Safety: never moves the pointer, never sends input, never focuses,
-//! never captures the screen. Only the fixture HWNDs are touched.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -19,11 +8,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Posted-message counters for the no-steal tests: a background click posts
-/// WM_LBUTTONDOWN/UP to this window, and the test asserts they arrived
-/// (proving delivery) while the owner's foreground window and pointer did
-/// not move (proving nothing was stolen). Counters are process-wide and
-/// monotonic; `reset_msg_counts` zeroes them before a measured action.
 static MSG_MOUSEDOWN: AtomicU64 = AtomicU64::new(0);
 static MSG_MOUSEUP: AtomicU64 = AtomicU64::new(0);
 static MSG_MOUSEMOVE: AtomicU64 = AtomicU64::new(0);
@@ -58,10 +42,6 @@ pub fn wheel_count() -> u64 {
     MSG_WHEEL.load(Ordering::SeqCst)
 }
 
-/// Keys each fixture EDIT refused, keyed by the EDIT's HWND. Per control,
-/// not process-wide: `cargo test` runs these tests in parallel against
-/// separate fixtures, and a process-wide counter would report another
-/// test's injected keys as if they had arrived here.
 static SWALLOWED_KEYS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<isize, u64>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -84,8 +64,6 @@ pub fn reset_swallowed_keys(hwnd: HWND) {
     m.insert(hwnd as isize, 0);
 }
 
-/// The editor's class wndproc, captured when the guard is installed. Every
-/// system EDIT shares the class proc, so one slot is enough.
 static OLD_EDIT_PROC: AtomicUsize = AtomicUsize::new(0);
 
 /// Guard installed on the fixture EDIT.
@@ -104,8 +82,6 @@ static OLD_EDIT_PROC: AtomicUsize = AtomicUsize::new(0);
 /// changing what SetValue does — the strict read-back assertion stays.
 unsafe extern "system" fn guarded_edit_wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> isize {
     match msg {
-        // 0x0100 WM_KEYDOWN, 0x0101 WM_KEYUP, 0x0102 WM_CHAR, 0x0104/0x0105
-        // WM_SYSKEY*, 0x0109 WM_UNICHAR, 0x0300/0x0302/0x0303 WM_CUT/PASTE/CLEAR.
         0x0100 | 0x0101 | 0x0102 | 0x0104 | 0x0105 | 0x0109 | 0x0300 | 0x0302 | 0x0303 => {
             bump_swallowed(hwnd);
             0
@@ -117,10 +93,7 @@ unsafe extern "system" fn guarded_edit_wndproc(hwnd: HWND, msg: u32, w: usize, l
     }
 }
 
-/// Install the typing guard on a fixture EDIT (called on the fixture thread
-/// right after the control is created).
 unsafe fn guard_edit(hwnd: HWND) {
-    // `as usize` first: clippy rejects a direct fn-pointer -> isize cast.
     let new_proc = guarded_edit_wndproc as usize as isize;
     let old = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, new_proc);
     if old != 0 {
@@ -165,40 +138,13 @@ unsafe extern "system" fn fixture_wndproc(hwnd: HWND, msg: u32, w: usize, l: isi
     DefWindowProcW(hwnd, msg, w, l)
 }
 
-/// How long a window may take to produce its first composited frame and a
-/// stable UIA walk before the readiness wait gives up.
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Block until a freshly created window can be captured and read.
-///
-/// Two startup races are collapsed into this one wait, because every test that
-/// owns a window has to survive both:
-///
-/// * **First composited frame.** A window that has not processed its first
-///   `WM_PAINT` reads back all-black, and `shot::capture_window` refuses an
-///   all-black frame with `capture_unavailable`. The window is invalidated and
-///   then captured until a frame is accepted; that frame is the one the test
-///   measures, so no test has to retry its own first capture.
-/// * **UIA tree.** The provider serves a window's children asynchronously
-///   after `ShowWindow`, so the first walk can return the Win32 fallback or a
-///   partial list. The wait polls until the UIA backend serves the window's
-///   children. A host where UIA is genuinely unavailable is not waited on: the
-///   Win32 fallback is synchronous and is the documented floor.
-///
-/// The readiness probe leaves no trace: its capture signature is dropped from
-/// the stale-detection cache, so the first capture a test asks for is not
-/// reported `stale` because of it.
 fn await_ready(hwnd: HWND) -> Result<(), String> {
     await_ready_within(hwnd, READY_TIMEOUT)
 }
 
-/// `await_ready` with an explicit deadline, so the wait's own contract can be
-/// proven without spending the full timeout.
 fn await_ready_within(hwnd: HWND, timeout: Duration) -> Result<(), String> {
-    // Ask for a repaint of the window and its children. `RDW_UPDATENOW` is
-    // deliberately absent: it is a synchronous send, so it would block on a
-    // window whose thread has not reached its message pump yet — the very
-    // state this wait exists for.
     unsafe {
         RedrawWindow(
             hwnd,
@@ -316,7 +262,6 @@ impl Fixture {
                 return;
             }
             let edit_cls = wide("EDIT");
-            // EDIT id 100 (writable), ES_AUTOHSCROLL so SetValue behaves.
             let edit = CreateWindowExW(
                 0,
                 edit_cls.as_ptr(),
@@ -331,7 +276,6 @@ impl Fixture {
                 std::ptr::null_mut(),
                 std::ptr::null(),
             );
-            // Read-only EDIT id 102.
             let edit_ro = CreateWindowExW(
                 0,
                 edit_cls.as_ptr(),
@@ -362,9 +306,6 @@ impl Fixture {
                 std::ptr::null_mut(),
                 std::ptr::null(),
             );
-            // The EDIT refuses external typing: the UIA provider focuses it
-            // to write, and owner keystrokes would otherwise land in the
-            // document while a test reads it back.
             guard_edit(edit);
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             let _ = tx.send((
@@ -404,8 +345,6 @@ impl Fixture {
             button,
             thread: Some(thread),
         };
-        // A fixture is handed to a test only after it can be captured and
-        // read, so no test has to wait out the startup race itself.
         await_ready(hwnd).unwrap_or_else(|e| panic!("fixture never became readable: {e}"));
         f
     }
@@ -551,13 +490,8 @@ impl Drop for MessageWindow {
 /// Foreground-session verdict for environment-independent tests.
 #[derive(Debug, PartialEq, Eq)]
 pub enum FgVerdict {
-    /// No foreground session exists (`before == 0`): there is no state
-    /// to reason about, so the caller skips the assertion with a message
-    /// instead of asserting a state the environment cannot guarantee.
     SkipNoSession,
-    /// The tool left the foreground window exactly as it found it.
     Unchanged,
-    /// The foreground window changed under the tool: `Changed(before, after)`.
     Changed(i64, i64),
 }
 
@@ -695,17 +629,9 @@ impl OwnedWindows {
 /// the whole matrix is unit-tested without live HWNDs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FgOutcome {
-    /// No foreground session before the op, or the session vanished: there is
-    /// nothing to protect, so the gate skips (headless CI).
     NoSession,
-    /// The sample is the window the op found: the harness held the field.
     Held,
-    /// The sample is a window THIS PROCESS owns: the harness took the
-    /// foreground. Fail, with no exemption.
     HarnessSteal,
-    /// The sample is somebody else's window: a third party (owner activity,
-    /// shell churn, a parallel test binary) took the foreground. The harness
-    /// did not cause it, so it re-baselines instead of failing.
     External,
 }
 
@@ -752,10 +678,6 @@ pub fn assert_foreground_held_owned(before: i64, owned: &OwnedWindows, what: &st
     assert_foreground_held_with(before, owned, what, foreground_now);
 }
 
-/// The gate above, with the sample source injected: `foreground_now` live, a
-/// scripted sequence in the unit tests. The seam exists so the decision loop
-/// (immediate fail on a harness steal, re-baseline on third-party churn, the
-/// sample bound) is provable WITHOUT activating anything.
 fn assert_foreground_held_with(
     before: i64,
     owned: &OwnedWindows,
@@ -812,8 +734,6 @@ fn assert_foreground_held_with(
             std::thread::sleep(FG_SAMPLE_GAP);
         }
     }
-    // Final assertion against the fresh baseline: whatever the churn did, the
-    // foreground must still not be a window this process owns.
     let last = sample();
     assert!(
         !owned.owns(last),
@@ -869,8 +789,6 @@ pub fn check_foreground_left_clean(fixture_top: i64, before: i64, what: &str) {
         cur = foreground_now();
     }
     if is_owned_window(fixture_top, cur) {
-        // Read-only/dry-run caller cannot have activated this (see doc
-        // comment): parallel-fixture churn on a headed box, not tool fault.
         println!(
             "FG_OWN_CHURN: {what}: a test-owned window is foreground after settle (foreground={cur} fixture={fixture_top}); read-only path cannot activate, not attributed to the tool"
         );
@@ -883,7 +801,6 @@ pub fn check_foreground_left_clean(fixture_top: i64, before: i64, what: &str) {
     }
 }
 
-/// Settle-based enforcement lives in `check_foreground_left_clean` above.
 impl Drop for Fixture {
     fn drop(&mut self) {
         unsafe {
@@ -903,18 +820,12 @@ mod self_tests {
 
     #[test]
     fn foreground_outcome_matrix_separates_steal_from_third_party() {
-        // No session before or after: skip, never a verdict on the tool.
         assert_eq!(fg_outcome(0, 0, false), FgOutcome::NoSession);
         assert_eq!(fg_outcome(0, 12345, true), FgOutcome::NoSession);
         assert_eq!(fg_outcome(7, 0, false), FgOutcome::NoSession);
-        // Same window: held, whoever owns it.
         assert_eq!(fg_outcome(7, 7, false), FgOutcome::Held);
         assert_eq!(fg_outcome(7, 7, true), FgOutcome::Held);
-        // A window this process owns that is not the baseline: the harness
-        // stole the foreground — the defect the gate exists for.
         assert_eq!(fg_outcome(7, 9, true), FgOutcome::HarnessSteal);
-        // A window somebody else owns: an environment change, not the tool.
-        // This is the case the old single-sample assert misreported.
         assert_eq!(fg_outcome(7, 9, false), FgOutcome::External);
         println!("FG_OUTCOME_MATRIX_OK=skip,held,harness-steal,external");
     }
@@ -925,13 +836,10 @@ mod self_tests {
         let fx = Fixture::new();
         let owned = OwnedWindows::new().with_fixture(&fx);
         let top = fx.hwnd_i64();
-        // The fixture top and its children are ours; a null handle never is.
         assert!(owned.owns(top), "registered top must be owned");
         assert!(owned.owns(fx.edit() as i64), "EDIT child must be owned");
         assert!(owned.owns(fx.button() as i64), "BUTTON child must be owned");
         assert!(!owned.owns(0), "null hwnd is never owned");
-        // An empty set still answers for this process by PID: an unregistered
-        // window of ours (a sibling fixture) is ours to answer for.
         let bare = OwnedWindows::new();
         assert!(
             bare.owns(top),
@@ -942,7 +850,6 @@ mod self_tests {
             4,
             "top + EDIT + read-only EDIT + BUTTON"
         );
-        // The log line carries the identity the next flake needs.
         let d = owned.describe(top);
         assert!(
             d.contains("owner=harness") && d.contains("exe=") && d.contains("class="),
@@ -951,9 +858,6 @@ mod self_tests {
         println!("FG_OWNED_SET_OK tops={} desc={d}", owned.tops().len());
     }
 
-    /// A scripted stand-in for `GetForegroundWindow`: returns each sample in
-    /// order, then repeats the last one. Lets the gate's decision loop be
-    /// proven without activating a single window.
     fn scripted(samples: &[i64]) -> impl FnMut() -> i64 + '_ {
         let mut i = 0usize;
         move || {
@@ -981,7 +885,6 @@ mod self_tests {
         let ours = 0x1111_i64;
         let third = 0x2222_i64;
         let owned = OwnedWindows::new().with_top(ours);
-        // (a) The harness itself becomes foreground: immediate, strict fail.
         let e = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             assert_foreground_held_with(third, &owned, "scripted steal", scripted(&[ours]));
         }))
@@ -993,8 +896,6 @@ mod self_tests {
             "both ends named: {text}"
         );
         assert!(text.contains("owner=harness"), "owner named: {text}");
-        // (b) A third party takes focus FIRST and the harness steals second:
-        // the re-baseline must not launder the steal.
         let e = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             assert_foreground_held_with(
                 0x3333,
@@ -1012,11 +913,7 @@ mod self_tests {
     fn gate_rebaselines_third_party_churn_instead_of_blaming_the_harness() {
         let ours = 0x1111_i64;
         let owned = OwnedWindows::new().with_top(ours);
-        // Nobody's window but ours exists on the desktop side of this script:
-        // repeated third-party churn is re-baselined, then the final sample
-        // must not be harness-owned. No window was activated to prove this.
         assert_foreground_held_with(0x2222, &owned, "scripted churn", scripted(&[0x3333; 6]));
-        // A headless session (no foreground window before the op) skips.
         assert_foreground_held_with(0, &owned, "scripted headless", scripted(&[0]));
         println!("FG_GATE_CHURN_OK=rebaseline,headless-skip");
     }
@@ -1027,14 +924,10 @@ mod self_tests {
         let fx = Fixture::new();
         let ours = fx.hwnd_i64();
         let owned = OwnedWindows::new().with_fixture(&fx);
-        // Our own fixture handle, offered as a foreground sample, is a steal.
         assert_eq!(
             fg_outcome(0x2222, ours, owned.owns(ours)),
             FgOutcome::HarnessSteal
         );
-        // A real foreign top-level window — found by read-only enumeration and
-        // never activated or otherwise touched — is a third party, and its
-        // module lands in the log.
         let foreign = crate::enum_windows()
             .into_iter()
             .map(|h| h as i64)
@@ -1057,14 +950,9 @@ mod self_tests {
 
     #[test]
     fn fg_verdict_matrix_covers_skip_and_change() {
-        // Simulates the headless-CI path without needing a headless session:
-        // with no foreground window before the work, the verdict is Skip,
-        // never a failure, whatever the after state is.
         assert_eq!(fg_verdict(0, 0), FgVerdict::SkipNoSession);
         assert_eq!(fg_verdict(0, 12345), FgVerdict::SkipNoSession);
-        // A headed session with a stable foreground must be Unchanged...
         assert_eq!(fg_verdict(7, 7), FgVerdict::Unchanged);
-        // ...and any change is reported with both ends, never swallowed.
         assert_eq!(fg_verdict(7, 9), FgVerdict::Changed(7, 9));
         println!("FG_VERDICT_MATRIX_OK=skip,unchanged,changed");
     }
@@ -1072,10 +960,6 @@ mod self_tests {
     #[test]
     fn foreground_self_pid_rule_sees_own_fixture() {
         let _g = desktop();
-        // Live proof for the FG_SKIP_SELF branch: a window this test process
-        // owns (the offscreen fixture) reports our own PID, so a "before"
-        // value pointing at a sibling test's fixture is recognised as "no
-        // user session" rather than a contract violation. Read-only.
         let f = Fixture::new();
         let top = f.hwnd_i64();
         assert!(
@@ -1095,9 +979,6 @@ mod self_tests {
         println!("FG_SELF_RULE_OK=top={top}");
     }
 
-    /// The wait is a measurement, not a sleep: a window with no frame to
-    /// capture never reads as ready, so the helper cannot be replaced by "the
-    /// handle exists".
     #[test]
     fn the_readiness_wait_refuses_a_window_with_no_frame() {
         let _g = desktop();
@@ -1115,15 +996,10 @@ mod self_tests {
         );
     }
 
-    /// The frame the wait is about: a window with no composited frame reads
-    /// all-black and the capture refuses it — exactly what a fresh window does
-    /// before its first `WM_PAINT`. The wait returns only once a frame exists.
     #[test]
     fn a_window_with_no_composited_frame_is_refused_until_the_wait_sees_one() {
         let _g = desktop();
         let f = Fixture::new();
-        // Hiding the window removes its composited frame without touching the
-        // fixture, which is the same all-black read a fresh window produces.
         unsafe {
             ShowWindow(f.hwnd(), SW_HIDE);
         }
@@ -1133,16 +1009,12 @@ mod self_tests {
             refused.contains("all-black") || refused.contains("blank"),
             "the refusal must be the blank-frame one, got: {refused}"
         );
-        // Shown again, the same wait finds the frame and returns.
         unsafe {
             ShowWindow(f.hwnd(), SW_SHOWNOACTIVATE);
         }
         await_ready(f.hwnd()).expect("the wait must find the frame once the window is shown");
     }
 
-    /// Readiness has exactly one path: the fixture constructor waits, and no
-    /// test paints or polls a fresh window of its own. A second per-test wait
-    /// is how this class came back the first time, so its names are banned.
     #[test]
     fn the_readiness_wait_is_the_only_startup_wait() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1156,9 +1028,6 @@ mod self_tests {
             files.len()
         );
         for (path, body) in &files {
-            // The helper's own file names the banned forms in this test, so
-            // the name scan starts outside it; the constructor assertion below
-            // pins the one path inside it.
             if path != "src/fixture.rs" {
                 for banned in ["wait_uia_stable", "force_paint"] {
                     assert!(
@@ -1181,9 +1050,6 @@ mod self_tests {
             .find(|(path, _)| path == "src/fixture.rs")
             .map(|(_, body)| body.as_str())
             .expect("src/fixture.rs must be in the scan");
-        // Only the production half of the file counts: the assertions below
-        // live in its test module, and a literal there would satisfy the
-        // search it is meant to enforce.
         let production = fixture.split("#[cfg(test)]").next().unwrap_or_default();
         assert!(
             production.contains("await_ready(hwnd)"),
@@ -1191,7 +1057,6 @@ mod self_tests {
         );
     }
 
-    /// Every `.rs` under `dir`, as (path relative to the manifest, contents).
     fn collect_rs(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -1222,7 +1087,6 @@ mod self_tests {
         unsafe {
             let mut rc = std::mem::zeroed::<RECT>();
             assert_ne!(GetWindowRect(f.hwnd(), &mut rc), 0);
-            // Offscreen: far negative origin, never on the visible desktop.
             assert!(
                 rc.left <= -3000 && rc.top <= -3000,
                 "fixture must be offscreen, got left={} top={} right={} bottom={}",
@@ -1231,7 +1095,6 @@ mod self_tests {
                 rc.right,
                 rc.bottom
             );
-            // Never activated the owner's foreground window.
             assert_eq!(
                 GetForegroundWindow(),
                 fg_before,
@@ -1239,7 +1102,6 @@ mod self_tests {
             );
             assert_ne!(f.hwnd(), fg_before, "fixture must never be foreground");
         }
-        // Drop destroys deterministically.
         let hwnd = f.hwnd();
         drop(f);
         assert_eq!(
