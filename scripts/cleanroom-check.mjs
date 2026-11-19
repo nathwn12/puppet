@@ -46,7 +46,6 @@ if (process.platform !== "win32") {
   process.exit(1);
 }
 
-// ---- args ---------------------------------------------------------------
 const argv = process.argv.slice(2);
 const keep = argv.includes("--keep");
 const ti = argv.indexOf("--tarball");
@@ -71,7 +70,6 @@ const fail = (check, detail) => rows.push([check, "FAIL", detail]);
 // the quotes and npm would receive them literally).
 const q = (s) => `"${s}"`;
 
-// ---- scrubbed world -----------------------------------------------------
 // Every invocation owns a brand-new root (mkdtemp) AND creates every path it
 // redirects the child into, BEFORE the first npm call. Both halves matter:
 //

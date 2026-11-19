@@ -22,7 +22,6 @@ use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-// ---------------------------------------------------------------- constants (puppet.py:1512-1518, 1628-1656)
 
 const M_WHEEL: u32 = 0x0800;
 const M_HWHEEL: u32 = 0x1000;
@@ -154,7 +153,6 @@ fn bg_non_postable(typ: &str) -> Option<&'static str> {
     }
 }
 
-// ---------------------------------------------------------------- small value helpers (mirror CPython str/int/repr)
 
 fn py_type_name(v: &Value) -> &'static str {
     match v {
@@ -309,7 +307,6 @@ fn sleep_cancellable(ms: u64) -> bool {
     crate::cancel::cancelled()
 }
 
-// ---------------------------------------------------------------- foreground input builders (deleted)
 
 fn scroll_wheel(axis: &str, amt: i64) -> Result<(u32, u32), String> {
     let flag = match axis {
@@ -329,7 +326,6 @@ fn utf16_units(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
 }
 
-// ---------------------------------------------------------------- _vk (puppet.py:1571-1623)
 
 /// Resolved key: a virtual-key code (plus whether Shift must be held for the
 /// layout's high byte) or a Unicode fallback when VkKeyScanW has no
@@ -413,7 +409,6 @@ fn monitor_for_point(mons: &[[i32; 4]], x: i64, y: i64) -> Option<[i32; 4]> {
         .copied()
 }
 
-// ---------------------------------------------------------------- clipboard (puppet.py:2547-2602)
 
 /// Clipboard text budget: 1 MiB of characters. Reads truncate, writes
 /// fail typed — never silently, never unbounded.
@@ -491,7 +486,6 @@ fn clipboard_get() -> Result<String, String> {
     }
 }
 
-// ---------------------------------------------------------------- background PostMessage input (puppet.py:1659-1792)
 
 /// Signed 16-bit range a window message can carry in one lParam half.
 const MSG_COORD_MIN: i64 = -32768;
@@ -1181,7 +1175,6 @@ fn bg_execute(
     )
 }
 
-// ---------------------------------------------------------------- wait_for (puppet.py:1795-1892)
 
 /// Pure element-wait decision: given whether a matching control was found
 /// and (when found) whether it is enabled, decide per `state`. Unit-tested;
@@ -1787,7 +1780,6 @@ fn wait_for(a: &Map<String, Value>, t0: &Instant) -> Map<String, Value> {
     )
 }
 
-// ---------------------------------------------------------------- focus helpers (puppet.py:1895-1934)
 
 fn cursor_now() -> (i64, i64) {
     unsafe {
@@ -1859,7 +1851,6 @@ fn target_failure(
     d
 }
 
-// ---------------------------------------------------------------- invoke matching (puppet.py:1334-1388)
 
 fn entry_str(e: &Map<String, Value>, key: &str) -> String {
     match e.get(key) {
@@ -2010,7 +2001,6 @@ fn element_pub_full(entry: &Map<String, Value>) -> Map<String, Value> {
     m
 }
 
-// ---------------------------------------------------------------- element geometry (one gate)
 
 /// Why an element rect cannot become an injection point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2150,7 +2140,6 @@ fn activation_stale(verr: &Option<String>) -> bool {
         .is_some_and(|e| e.starts_with(crate::shot::STALE_REF))
 }
 
-// ---------------------------------------------------------------- invoke activation (UIA patterns + Win32 extent)
 
 /// BM_CLICK a Win32 button child. No mouse, no focus change (puppet.py:1442-1462).
 fn win32_activate(entry: &Map<String, Value>) -> (bool, String, Option<String>) {
@@ -2244,7 +2233,6 @@ fn win32_activate(entry: &Map<String, Value>) -> (bool, String, Option<String>) 
     (true, "win32-click".to_string(), None)
 }
 
-// ---------------------------------------------------------------- UIPI / elevation (gap 2)
 
 /// Pure refusal text (gap 2): the typed, actionable error naming the
 /// elevated target. Separated from the live reader below for testability;
@@ -2342,7 +2330,6 @@ fn uipi_targets_for_action(typ: &str, a: &Map<String, Value>) -> Vec<i64> {
     out
 }
 
-// ---------------------------------------------------------------- burst state + flush (puppet.py:2747-2791)
 
 struct Burst {
     pending: Vec<INPUT>,
@@ -2536,7 +2523,6 @@ fn expand_arg(v: Option<&Value>) -> Result<Option<bool>, String> {
     }
 }
 
-// ---------------------------------------------------------------- the tool
 
 /// `do` call arguments. Explicit struct (not a 10-positional-args function)
 /// so every call site names what it is asking for: a target lock, and the
@@ -6333,7 +6319,6 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------- set_value (4.3.0)
 
     fn burst_bg(actions: &[Value], bg: &str, dry_run: bool) -> (String, Map<String, Value>) {
         // Background-scoped runs: no flags (no flag buys anything under the
@@ -6857,7 +6842,6 @@ mod tests {
         assert_eq!(fx.edit_text(), "");
     }
 
-    // ------------------------------------------------ no-steal (target lock + gate)
 
     fn sc(out: &str) -> Value {
         let outer: Value = serde_json::from_str(out).expect("outer frame");

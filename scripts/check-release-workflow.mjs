@@ -91,7 +91,6 @@ const check = (name, fn) => {
 };
 const need = (cond, msg) => { if (!cond) throw new Error(msg); };
 
-// ---- trigger: the version is never an input -------------------------------
 check("dispatch-inputs", () => {
   const start = lines.findIndex((l) => /^  workflow_dispatch:\s*$/.test(l));
   need(start >= 0, "workflow_dispatch trigger is missing");

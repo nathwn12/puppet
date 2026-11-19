@@ -405,7 +405,6 @@ unsafe fn capture_window_inner(hwnd: HWND, allow_crop_fallback: bool) -> Result<
     ))
 }
 
-// ---------------------------------------------------------------- element model (Win32 fallback)
 
 fn role_of_class(cls: &str) -> &str {
     match cls {

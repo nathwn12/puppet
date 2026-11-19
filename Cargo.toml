@@ -47,7 +47,6 @@ windows = { version = "0.62", features = [
   "Win32_UI_Shell_PropertiesSystem",
 ] }
 
-# ---------------------------------------------------------------- build speed
 # Fast inner loop. `line-tables-only` keeps file:line backtraces but drops
 # variable/type debuginfo. Measured (MSVC, this toolchain): dev PDB 11.7 ->
 # 6.1 MB (-48.0 %); dev target dir 170 -> 142 MB. Wall-clock effect: none

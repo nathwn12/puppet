@@ -72,7 +72,6 @@ const FILES = {
   changelog: "CHANGELOG.md",
 };
 
-// ---------------------------------------------------------------- refusals
 
 class Refusal extends Error {
   constructor(code, message) {
@@ -85,7 +84,6 @@ const refuse = (code, message) => {
   throw new Refusal(code, message);
 };
 
-// ------------------------------------------------------------------ semver
 
 const SEMVER = /^(\d+)\.(\d+)\.(\d+)$/;
 
@@ -111,7 +109,6 @@ function bumpVersion(version, level) {
   return `${maj}.${min}.${pat + 1}`;
 }
 
-// -------------------------------------------------------------------- git
 
 function git(root, args) {
   return execFileSync("git", ["-C", root, ...args], {
@@ -179,7 +176,6 @@ function readCommits(root, base) {
     .filter((c) => /^[0-9a-f]{40}$/.test(c.sha));
 }
 
-// ------------------------------------------------------------ classification
 
 function classify(commit) {
   const body = commit.body ?? "";
@@ -280,7 +276,6 @@ function deriveLevel(records) {
   );
 }
 
-// --------------------------------------------------------------- manifests
 
 function readManifestVersions(root) {
   const read = (rel) => {
@@ -370,7 +365,6 @@ function checkManifests(versions, manifest, derived) {
   }
 }
 
-// --------------------------------------------------------------- changelog
 
 function parseChangelog(text) {
   const lines = text.split("\n");
@@ -428,7 +422,6 @@ function sectionBody(text, version) {
   return lines.slice(start + 1, end < 0 ? lines.length : end).join("\n").trim();
 }
 
-// ------------------------------------------------------------------ derive
 
 function deriveAll(opts = {}) {
   const root = opts.root ?? SELF_ROOT;
@@ -527,7 +520,6 @@ function deriveAll(opts = {}) {
   };
 }
 
-// ------------------------------------------------------------------ report
 
 function report(result) {
   const out = [];
@@ -558,7 +550,6 @@ function report(result) {
   return out.join("\n");
 }
 
-// ------------------------------------------------------------------ --check
 
 const CHECK_CHANGELOG = "# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n- something real.\n";
 

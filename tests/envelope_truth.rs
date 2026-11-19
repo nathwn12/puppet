@@ -387,7 +387,6 @@ fn do_partial_failure_stays_a_success_envelope() {
     );
 }
 
-// ---- payload-vs-schema conformance -------------------------------------
 // The `diff` defect class: `diff` emitted `bbox: null` / `diff_out: null`
 // while its declared `outputSchema` allowed only array/object, and the
 // tests above still passed because they assert only presence and

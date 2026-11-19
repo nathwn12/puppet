@@ -582,7 +582,6 @@ pub fn app_id_of(hwnd: i64) -> Option<String> {
     }
 }
 
-// ---------------------------------------------------------------- coordinates
 
 /// Client rect in SCREEN coordinates, physical pixels:
 /// `[left, top, right, bottom]` from `GetClientRect` + `ClientToScreen`.

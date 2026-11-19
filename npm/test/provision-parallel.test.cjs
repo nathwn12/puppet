@@ -99,7 +99,6 @@ function storedZip(entries) {
   return Buffer.concat([...locals, cd, eocd]);
 }
 
-// --- fixtures --------------------------------------------------------------
 
 function sha256(buf) {
   return crypto.createHash('sha256').update(buf).digest('hex');

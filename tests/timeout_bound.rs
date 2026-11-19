@@ -305,7 +305,6 @@ fn capture_times_out_typed_and_the_worker_recovers() {
     );
 }
 
-// --- the abandoned helper's own bookkeeping -------------------------------
 
 #[link(name = "kernel32")]
 extern "system" {
@@ -381,7 +380,6 @@ fn a_returned_helper_leaves_no_handle_behind() {
     );
 }
 
-// --- static coverage of the boundedness discipline ------------------------
 
 fn src_text(name: &str) -> String {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

@@ -39,7 +39,6 @@ use windows_sys::Win32::UI::HiDpi::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-// ---------------------------------------------------------------- constants
 
 const MODE_B_NOTE: &str = "Mode B (Windows.Graphics.Capture) deferred: needs a WinRT + D3D11 frame pool in this Rust stack and is untestable on a single-monitor box here; Mode A covers the verifiable cases.";
 const FORMULA: &str = "screen_x = source.x + round((img_x + 0.5) * source.w / image.w); screen_y = source.y + round((img_y + 0.5) * source.h / image.h)";
@@ -67,7 +66,6 @@ pub fn forget_stale(hwnd: i64) {
     STALE.lock().unwrap().remove(&hwnd);
 }
 
-// ---------------------------------------------------------------- python numerics
 
 /// Python round() half-to-even to an integer value.
 fn py_round_half_even(x: f64) -> f64 {
@@ -112,7 +110,6 @@ fn py_repr_str(s: &str) -> String {
     o
 }
 
-// ---------------------------------------------------------------- validation (pydantic-shaped)
 
 struct VErr {
     loc: String,
@@ -573,7 +570,6 @@ fn missing_arg(_tool: &str, args: &Map<String, Value>, field: &str) -> VErr {
     }
 }
 
-// ---------------------------------------------------------------- python-compatible JSON dumps
 
 /// Float rendering matching Python repr() for the value ranges this server
 /// emits (bounded magnitudes; never exponent-form, never non-finite).
@@ -702,7 +698,6 @@ pub fn py_repr_value(v: &Value) -> String {
     }
 }
 
-// ---------------------------------------------------------------- JSON helpers
 
 fn jstr(s: &str) -> String {
     serde_json::to_string(s).unwrap()
@@ -823,7 +818,6 @@ pub fn tool_err_blocks(blocks: &[String]) -> String {
     format!("{{\"content\":[{}],\"isError\":true}}", blocks.join(","))
 }
 
-// ---------------------------------------------------------------- Win32 helpers
 
 pub(crate) unsafe fn win_text(hwnd: HWND) -> String {
     let mut buf = vec![0u16; 512];
@@ -1129,7 +1123,6 @@ fn win_dpi(hwnd: HWND) -> i64 {
     }
 }
 
-// ---------------------------------------------------------------- elevation / UIPI (gap 2)
 
 /// Elevation of one open token: Some(true) elevated, Some(false) not.
 /// The caller owns `tok` (opened via OpenProcessToken); it is not closed here.
@@ -1239,7 +1232,6 @@ fn is_maximized(hwnd: HWND) -> bool {
     }
 }
 
-// ---------------------------------------------------------------- window model
 
 fn window_info(hwnd: HWND, include_app_ids: bool) -> Option<Map<String, Value>> {
     unsafe {
@@ -1471,7 +1463,6 @@ pub mod target;
 pub mod uia;
 pub mod winop;
 
-// ---------------------------------------------------------------- provenance
 
 /// Commit this binary was compiled from (`build.rs`), `unknown` when git was
 /// unavailable at build time.

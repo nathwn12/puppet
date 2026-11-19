@@ -10,7 +10,6 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-// ---------------------------------------------------------------- selectors
 
 type Resolve = (
     Option<HWND>,
@@ -293,7 +292,6 @@ pub fn lock_legacy(hwnd: Option<i64>, title: Option<&str>) -> Result<TargetLock,
     crate::target::lock(&legacy_spec(hwnd, title)?)
 }
 
-// ---------------------------------------------------------------- image
 
 pub struct Img {
     pub w: i32,
@@ -412,7 +410,6 @@ pub fn bitblt_grab(l: i32, t: i32, w: i32, h: i32) -> Result<Img, String> {
     })
 }
 
-// ---------------------------------------------------------------- detector
 
 pub struct Verdict {
     pub rejected: bool,
@@ -582,7 +579,6 @@ fn tag_of(m: &Map<String, Value>) -> String {
     format!("{{{}}}", body.join(","))
 }
 
-// ---------------------------------------------------------------- Pillow-compatible resample
 //
 // Faithful port of Pillow's Resample.c two-pass fixed-point path (8-bit):
 // separable coeffs, weight normalization, INT32 rounding with a 1<<21 bias,
@@ -943,7 +939,6 @@ pub fn encode_jpeg(img: &Img, q: u8) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
-// ---------------------------------------------------------------- PNG decode + pixel diff
 //
 // Ported from `Q:\PROJECTS\PERSONAL\gladius\src\visual.rs`
 // (`png_diff`/`DiffOpts`): per-channel absolute delta above `threshold`

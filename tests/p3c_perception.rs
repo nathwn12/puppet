@@ -84,7 +84,6 @@ impl Drop for Session {
     }
 }
 
-// ---------------------------------------------------------------- synthetic PNGs
 
 /// One RGB8 PNG written with the same colour type the server decodes.
 fn write_png(path: &Path, w: u32, h: u32, px: &[u8]) {
@@ -128,7 +127,6 @@ fn sc_of(r: &Value, what: &str) -> Value {
         .unwrap_or_else(|| panic!("{what} must carry structuredContent, got: {r}"))
 }
 
-// ---------------------------------------------------------------- live fixture
 
 fn live() -> bool {
     if std::env::var("PUPPET_LIVE_DESKTOP").as_deref() == Ok("1") {
