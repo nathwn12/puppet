@@ -1,4 +1,3 @@
-
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -266,7 +265,6 @@ fn capture_times_out_typed_and_the_worker_recovers() {
     );
 }
 
-
 #[link(name = "kernel32")]
 extern "system" {
     fn GetProcessHandleCount(process: *mut core::ffi::c_void, count: *mut u32) -> i32;
@@ -324,7 +322,6 @@ fn a_returned_helper_leaves_no_handle_behind() {
          ended {timed_out} handles above its own baseline, the control arm {control}"
     );
 }
-
 
 fn src_text(name: &str) -> String {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

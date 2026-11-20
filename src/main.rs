@@ -1,4 +1,3 @@
-
 #![windows_subsystem = "windows"]
 
 mod schemas;
@@ -34,7 +33,6 @@ use windows_sys::Win32::UI::HiDpi::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-
 const MODE_B_NOTE: &str = "Mode B (Windows.Graphics.Capture) deferred: needs a WinRT + D3D11 frame pool in this Rust stack and is untestable on a single-monitor box here; Mode A covers the verifiable cases.";
 const FORMULA: &str = "screen_x = source.x + round((img_x + 0.5) * source.w / image.w); screen_y = source.y + round((img_y + 0.5) * source.h / image.h)";
 const SUPPORTED_VERSIONS: [&str; 2] = ["2025-06-18", "2025-11-25"];
@@ -58,7 +56,6 @@ static STALE: LazyLock<Mutex<StaleMap>> = LazyLock::new(|| Mutex::new(HashMap::n
 pub fn forget_stale(hwnd: i64) {
     STALE.lock().unwrap().remove(&hwnd);
 }
-
 
 fn py_round_half_even(x: f64) -> f64 {
     if !x.is_finite() || x.abs() > 9.0e15 {
@@ -101,7 +98,6 @@ fn py_repr_str(s: &str) -> String {
     o.push(q);
     o
 }
-
 
 struct VErr {
     loc: String,
@@ -537,7 +533,6 @@ fn missing_arg(_tool: &str, args: &Map<String, Value>, field: &str) -> VErr {
     }
 }
 
-
 fn py_float(f: f64) -> String {
     if f.is_nan() {
         return "NaN".to_string();
@@ -661,7 +656,6 @@ pub fn py_repr_value(v: &Value) -> String {
     }
 }
 
-
 fn jstr(s: &str) -> String {
     serde_json::to_string(s).unwrap()
 }
@@ -753,7 +747,6 @@ pub fn screenshot_ok(blocks: &[String], cmap: &Value) -> String {
 pub fn tool_err_blocks(blocks: &[String]) -> String {
     format!("{{\"content\":[{}],\"isError\":true}}", blocks.join(","))
 }
-
 
 pub(crate) unsafe fn win_text(hwnd: HWND) -> String {
     let mut buf = vec![0u16; 512];
@@ -1028,11 +1021,8 @@ fn cloaked(hwnd: HWND) -> i64 {
 }
 
 fn win_dpi(hwnd: HWND) -> i64 {
-    unsafe {
-        GetDpiForWindow(hwnd) as i64
-    }
+    unsafe { GetDpiForWindow(hwnd) as i64 }
 }
-
 
 fn token_elevated(tok: HANDLE) -> Option<bool> {
     unsafe {
@@ -1127,7 +1117,6 @@ fn is_maximized(hwnd: HWND) -> bool {
         }
     }
 }
-
 
 fn window_info(hwnd: HWND, include_app_ids: bool) -> Option<Map<String, Value>> {
     unsafe {
@@ -1341,7 +1330,6 @@ pub mod shot;
 pub mod target;
 pub mod uia;
 pub mod winop;
-
 
 const GIT_SHA: &str = env!("PUPPET_GIT_SHA");
 const GIT_DIRTY: &str = env!("PUPPET_GIT_DIRTY");

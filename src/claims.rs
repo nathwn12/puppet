@@ -1,4 +1,3 @@
-
 /// The seven tools, one line each, in `tools_list_result` order.
 pub const TOOL_LINES: [(&str, &str); 7] = [
     (

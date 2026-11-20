@@ -1,4 +1,3 @@
-
 use crate::{display_monitors, enum_windows, window_info, wrapped_text};
 use serde_json::{Map, Value};
 use windows_sys::Win32::Foundation::{GetLastError, HWND, POINT, RECT};
@@ -72,16 +71,14 @@ pub fn do_window(a: &WinArgs) -> String {
     };
     let mut locked: Option<crate::target::TargetLock> = None;
     let (hwnd_r, err, cands) = match a.target.as_ref() {
-        None | Some(Value::Null) => {
-            match crate::cap::lock_legacy(a.hwnd, a.title.as_deref()) {
-                Ok(l) => {
-                    let h = l.hwnd as HWND;
-                    locked = Some(l);
-                    (Some(h), None, None)
-                }
-                Err(e) => (None, Some(e.text()), e.candidates.clone()),
+        None | Some(Value::Null) => match crate::cap::lock_legacy(a.hwnd, a.title.as_deref()) {
+            Ok(l) => {
+                let h = l.hwnd as HWND;
+                locked = Some(l);
+                (Some(h), None, None)
             }
-        }
+            Err(e) => (None, Some(e.text()), e.candidates.clone()),
+        },
         Some(v) => match crate::target::TargetSpec::parse(v) {
             Err(e) => (None, Some(e.text()), None),
             Ok(spec) => match crate::target::lock(&spec) {

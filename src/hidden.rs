@@ -1,4 +1,3 @@
-
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -47,7 +46,6 @@ fn unique_desktop_name() -> String {
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
-
 
 /// Setup result, delivered once the desktop is up and the target window is
 /// resolved (or the setup failed).
@@ -254,7 +252,6 @@ pub fn spawn(program: &str, args: &[String]) -> Hidden {
         join: Some(join),
     }
 }
-
 
 fn owner(
     program: String,
@@ -682,7 +679,6 @@ fn wait_for_window(hdesk: HDESK, pid: u32) -> Option<i64> {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
-
 
 fn sm_get_text(hwnd: HWND) -> Option<String> {
     let mut buf = vec![0u16; 4096];

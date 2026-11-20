@@ -1,4 +1,3 @@
-
 use crate::cap::{
     bitblt_grab, blank_check_json, detector_json, detector_tag, detector_verdict, printwindow_grab,
     Img,
@@ -362,7 +361,6 @@ unsafe fn capture_window_inner(hwnd: HWND, allow_crop_fallback: bool) -> Result<
         "error: capture_unavailable: PrintWindow refused ({why}); refusing an occlusion-prone desktop crop (the window is not foreground, or allow_crop_fallback is false). Capture without activation does not fall back to the foreground. {MODE_B_NOTE}"
     ))
 }
-
 
 fn role_of_class(cls: &str) -> &str {
     match cls {

@@ -1,4 +1,3 @@
-
 use crate::burst::do_burst;
 use crate::schemas::{
     TOOL_CURSOR, TOOL_DIFF, TOOL_DO, TOOL_ELEMENTS, TOOL_LIST_WINDOWS, TOOL_SCREENSHOT, TOOL_WINDOW,

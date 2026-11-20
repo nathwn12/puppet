@@ -1,4 +1,3 @@
-
 use crate::cap::{decode_png, diff_image, finalize, Img};
 use crate::screen::{dispatch_screenshot, ShotArgs};
 use base64::Engine as _;

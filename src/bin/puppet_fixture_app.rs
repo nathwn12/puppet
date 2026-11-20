@@ -1,4 +1,3 @@
-
 #![windows_subsystem = "windows"]
 
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
