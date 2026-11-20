@@ -7,10 +7,10 @@
 <p align="center"><strong>Screenshot, list, and drive Windows windows over MCP stdio without stealing focus, moving the pointer, or writing the clipboard.</strong></p>
 
 <p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/nathwn12/puppet" alt="License" /></a>
-  <img src="https://img.shields.io/github/languages/top/nathwn12/puppet" alt="Language" />
-  <img src="https://img.shields.io/badge/platform-windows%20x64-blue" alt="Platform" />
+  <a href="https://www.npmjs.com/package/puppet-mcp"><img src="https://img.shields.io/npm/v/puppet-mcp" alt="npm version" /></a>
+  <img src="https://img.shields.io/badge/platform-windows--64bit-2b3137?logo=windows&logoColor=white" alt="Platform" />
   <img src="https://img.shields.io/badge/tools-7-brightgreen" alt="7 tools" />
+  <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT" />
 </p>
 
 One stdio connection. One native binary. No focus steal, no cursor move, no clipboard write.
@@ -134,4 +134,4 @@ CI runs `fmt`, `clippy`, `gitleaks`, `cargo check` and the single conformance bi
 - [Third-party notices](THIRD-PARTY-NOTICES.md)
 - [MIT](LICENSE)
 
-Built by nathwn12
+<p align="center"><sub>Built by nathwn12</sub></p>
