@@ -66,3 +66,11 @@ https://www.npmjs.com/package/puppet-mcp
 
 MIT - see LICENSE. Bundled third-party attributions:
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+
+---
+
+<p align="center">
+  <img src="signature.svg" width="120" alt="nathwn12 signature" />
+  <br />
+  Built by nathwn12
+</p>
