@@ -134,4 +134,4 @@ CI runs `fmt`, `clippy`, `gitleaks`, `cargo check` and the single conformance bi
 - [Third-party notices](THIRD-PARTY-NOTICES.md)
 - [MIT](LICENSE)
 
-Built by nathwn12
+<p align="center"><sub>Built by nathwn12</sub></p>

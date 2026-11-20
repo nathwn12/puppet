@@ -71,6 +71,5 @@ MIT - see LICENSE. Bundled third-party attributions:
 
 <p align="center">
   <img src="signature.svg" width="120" alt="nathwn12 signature" />
-  <br />
-  Built by nathwn12
 </p>
+<p align="center"><sub>Built by nathwn12</sub></p>
