@@ -1,4 +1,3 @@
-
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -79,7 +78,6 @@ impl Drop for Session {
     }
 }
 
-
 fn write_png(path: &Path, w: u32, h: u32, px: &[u8]) {
     let file = std::fs::File::create(path).expect("create png");
     let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
@@ -120,7 +118,6 @@ fn sc_of(r: &Value, what: &str) -> Value {
         .cloned()
         .unwrap_or_else(|| panic!("{what} must carry structuredContent, got: {r}"))
 }
-
 
 fn live() -> bool {
     if std::env::var("PUPPET_LIVE_DESKTOP").as_deref() == Ok("1") {

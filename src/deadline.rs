@@ -1,4 +1,3 @@
-
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;

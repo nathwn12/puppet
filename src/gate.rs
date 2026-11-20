@@ -1,4 +1,3 @@
-
 use serde_json::{Map, Value};
 
 /// `delivery:"sendinput"` or `allow_foreground:true` was asked for: the
@@ -176,9 +175,7 @@ impl Gate {
         has_element: bool,
     ) -> Result<Delivery, GateError> {
         match verb {
-            "move" => {
-                Err(no_cursor_policy("move"))
-            }
+            "move" => Err(no_cursor_policy("move")),
             "click" => {
                 if has_element {
                     if self.has_target {
@@ -272,9 +269,7 @@ impl Gate {
                     "UIA ValuePattern.SetValue may focus the control",
                 ))
             }
-            "focus_window" => {
-                Err(no_foreground_policy("focus_window"))
-            }
+            "focus_window" => Err(no_foreground_policy("focus_window")),
             "clipboard_set" => Err(no_clipboard_policy("clipboard_set")),
             _ => Ok(Delivery::None),
         }

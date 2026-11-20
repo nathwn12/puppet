@@ -22,7 +22,6 @@ use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-
 const M_WHEEL: u32 = 0x0800;
 const M_HWHEEL: u32 = 0x1000;
 
@@ -126,7 +125,6 @@ fn bg_non_postable(typ: &str) -> Option<&'static str> {
         _ => None,
     }
 }
-
 
 fn py_type_name(v: &Value) -> &'static str {
     match v {
@@ -272,7 +270,6 @@ fn sleep_cancellable(ms: u64) -> bool {
     crate::cancel::cancelled()
 }
 
-
 fn scroll_wheel(axis: &str, amt: i64) -> Result<(u32, u32), String> {
     let flag = match axis {
         "v" => M_WHEEL,
@@ -290,7 +287,6 @@ fn scroll_wheel(axis: &str, amt: i64) -> Result<(u32, u32), String> {
 fn utf16_units(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyCode {
@@ -365,7 +361,6 @@ fn monitor_for_point(mons: &[[i32; 4]], x: i64, y: i64) -> Option<[i32; 4]> {
         .copied()
 }
 
-
 pub(crate) const MAX_CLIP_CHARS: usize = 1_048_576;
 
 fn check_clip_len(n_chars: usize) -> Result<(), String> {
@@ -431,7 +426,6 @@ fn clipboard_get() -> Result<String, String> {
         r
     }
 }
-
 
 const MSG_COORD_MIN: i64 = -32768;
 const MSG_COORD_MAX: i64 = 32767;
@@ -1051,7 +1045,6 @@ fn bg_execute(
     )
 }
 
-
 fn element_wait_satisfied(state: &str, found: bool, enabled: Option<bool>) -> bool {
     match state {
         "disappear" => !found,
@@ -1576,7 +1569,6 @@ fn wait_for(a: &Map<String, Value>, t0: &Instant) -> Map<String, Value> {
     )
 }
 
-
 fn cursor_now() -> (i64, i64) {
     unsafe {
         let mut pt = POINT { x: 0, y: 0 };
@@ -1636,7 +1628,6 @@ fn target_failure(
     d.insert("via".to_string(), Value::from("none"));
     d
 }
-
 
 fn entry_str(e: &Map<String, Value>, key: &str) -> String {
     match e.get(key) {
@@ -1787,7 +1778,6 @@ fn element_pub_full(entry: &Map<String, Value>) -> Map<String, Value> {
     m
 }
 
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RectRefusal {
     Offscreen,
@@ -1895,7 +1885,6 @@ fn activation_stale(verr: &Option<String>) -> bool {
         .is_some_and(|e| e.starts_with(crate::shot::STALE_REF))
 }
 
-
 fn win32_activate(entry: &Map<String, Value>) -> (bool, String, Option<String>) {
     let inv = entry
         .get("invokable")
@@ -1980,7 +1969,6 @@ fn win32_activate(entry: &Map<String, Value>) -> (bool, String, Option<String>) 
     (true, "win32-click".to_string(), None)
 }
 
-
 fn format_uipi_refusal(exe: &str, pid: u32, hwnd: i64) -> String {
     format!(
         "uipi_blocked: target \"{exe}\" (pid {pid}, hwnd {hwnd}) runs elevated; input from this unelevated process would be silently dropped by UIPI. Relaunch this server elevated and retry; under dry_run this refusal is reported without injecting anything."
@@ -2064,7 +2052,6 @@ fn uipi_targets_for_action(typ: &str, a: &Map<String, Value>) -> Vec<i64> {
     }
     out
 }
-
 
 struct Burst {
     pending: Vec<INPUT>,
@@ -2228,7 +2215,6 @@ fn expand_arg(v: Option<&Value>) -> Result<Option<bool>, String> {
         },
     }
 }
-
 
 /// `do` call arguments. Explicit struct (not a 10-positional-args function)
 /// so every call site names what it is asking for: a target lock, and the
@@ -5664,7 +5650,6 @@ mod tests {
         }
     }
 
-
     fn burst_bg(actions: &[Value], bg: &str, dry_run: bool) -> (String, Map<String, Value>) {
         let out = do_burst(&DoArgs {
             dry_run,
@@ -6121,7 +6106,6 @@ mod tests {
         );
         assert_eq!(fx.edit_text(), "");
     }
-
 
     fn sc(out: &str) -> Value {
         let outer: Value = serde_json::from_str(out).expect("outer frame");

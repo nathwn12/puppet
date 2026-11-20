@@ -1,4 +1,3 @@
-
 use crate::target::{TargetError, TargetLock, TargetSpec};
 use crate::{cand_public, candidates, py_repr_str, py_round_half_even, py_round_n, Cand};
 use serde_json::{Map, Value};
@@ -8,7 +7,6 @@ use windows_sys::Win32::Graphics::Gdi::{
     SelectObject, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, SRCCOPY,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
-
 
 type Resolve = (
     Option<HWND>,
@@ -291,7 +289,6 @@ pub fn lock_legacy(hwnd: Option<i64>, title: Option<&str>) -> Result<TargetLock,
     crate::target::lock(&legacy_spec(hwnd, title)?)
 }
 
-
 pub struct Img {
     pub w: i32,
     pub h: i32,
@@ -408,7 +405,6 @@ pub fn bitblt_grab(l: i32, t: i32, w: i32, h: i32) -> Result<Img, String> {
         Ok(())
     })
 }
-
 
 pub struct Verdict {
     pub rejected: bool,
@@ -573,7 +569,6 @@ fn tag_of(m: &Map<String, Value>) -> String {
         .collect();
     format!("{{{}}}", body.join(","))
 }
-
 
 const PREC_BITS: i64 = 22;
 
@@ -916,7 +911,6 @@ pub fn encode_jpeg(img: &Img, q: u8) -> Result<Vec<u8>, String> {
     .map_err(|e| format!("{e}"))?;
     Ok(buf)
 }
-
 
 /// Decode PNG bytes to RGB pixels. RGB and RGBA (alpha dropped) plus
 /// 8-bit grayscale decode; anything else is a typed refusal, never a

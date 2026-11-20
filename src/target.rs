@@ -1,4 +1,3 @@
-
 use serde_json::{Map, Value};
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
@@ -101,12 +100,10 @@ impl TargetSpec {
             "exe" => spec.exe = Some(val),
             "title" => spec.title_contains = Some(val),
             "class" => spec.class_name = Some(val),
-            _ => {
-                match crate::parse_int_loose(t) {
-                    Some(h) => spec.hwnd = Some(h),
-                    None => spec.title_contains = Some(t.to_string()),
-                }
-            }
+            _ => match crate::parse_int_loose(t) {
+                Some(h) => spec.hwnd = Some(h),
+                None => spec.title_contains = Some(t.to_string()),
+            },
         }
         if spec.is_empty() {
             return Err(TargetError::new(BAD, "target selects nothing"));
@@ -548,7 +545,6 @@ pub fn app_id_of(hwnd: i64) -> Option<String> {
         out
     }
 }
-
 
 /// Client rect in SCREEN coordinates, physical pixels:
 /// `[left, top, right, bottom]` from `GetClientRect` + `ClientToScreen`.

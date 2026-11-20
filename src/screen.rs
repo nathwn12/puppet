@@ -1,4 +1,3 @@
-
 use crate::cap::{bitblt_grab, finalize, Img};
 use crate::dxgi::{dxgi_grab, dxgi_outputs, pick_output};
 use crate::shot::{capture_window, elements_block};
