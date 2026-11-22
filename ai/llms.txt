@@ -1,0 +1,13 @@
+---
+project: puppet
+one_line: 'Drive Windows apps without stealing focus or moving the pointer: screenshot, windows, input and cursor over MCP.'
+stack: [Rust]
+status: draft
+since: 2026-10
+capabilities: []
+limits: []
+updated: 2026-11-22
+draft: true
+---
+
+One stdio connection. One native binary. No focus steal, no cursor move, no clipboard write.
