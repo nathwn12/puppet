@@ -8,17 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- `puppet-mcp` (npm launcher): after losing the publish race to a concurrent
-  launcher, remove this process's owned `.staging-*` copy; the winner's ready
-  cache, server bytes and `.ready` marker stay untouched. `npm test` proves both
-  launchers end ready and no owned staging copy survives.
-- `puppet-mcp` (npm launcher): the cache path itself is the claim. A creator
-  extracts into its own path and publishes `.ready` last via an atomic rename;
-  a peer that finds the path waits for that marker and adopts it instead of
-  clearing it, so a published cache survives. Interrupted or invalid paths are
-  never reclaimed by observation: after a bounded wait the launcher fails with
-  an explicit recovery hint. `npm test` proves the mid-download interleave
-  preserves the winner's cache and that unowned paths are left intact.
+- `puppet-mcp` (npm launcher): provisioning no longer clears a cache path that
+  another process may have published. The creator claims the path with one atomic
+  `mkdir`, extracts into it, and writes `.ready` last via an atomic rename; a
+  peer that finds the path waits a bounded time and adopts the ready cache instead
+  of deleting it. Interrupted or invalid paths are not reclaimed from observation:
+  recovery is manual and bounded — after the wait the launcher fails with an
+  explicit step (remove that directory and retry) — and only a creator clears a
+  path it made. `node --test npm/test/` proves the mid-download interleave
+  preserves the winner's cache, and that unowned or invalid paths are left intact.
 
 ## [8.0.0] - 2026-11-14
 

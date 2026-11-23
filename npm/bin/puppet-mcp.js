@@ -322,32 +322,6 @@ function targetReady(cacheDir, rt, manifest) {
   return checkFile(path.join(cacheDir, rt.server.name), rt.server) === null;
 }
 
-const SIBLING_WON = new Set(['EPERM', 'EACCES', 'EBUSY', 'EEXIST', 'ENOTEMPTY']);
-
-function sleepSync(ms) {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
-function publishStaging(staging, cacheDir, rt, manifest) {
-  let lastErr = null;
-  for (const delay of [0, 25, 75, 150, 300]) {
-    if (delay > 0) sleepSync(delay);
-    try {
-      fs.renameSync(staging, cacheDir);
-      return 'renamed';
-    } catch (err) {
-      lastErr = err;
-      if (!SIBLING_WON.has(err.code)) throw err;
-      if (targetReady(cacheDir, rt, manifest)) return 'adopted';
-    }
-  }
-  if (targetReady(cacheDir, rt, manifest)) return 'adopted';
-  throw new Error(
-    `could not publish the runtime cache at ${cacheDir} (${lastErr && lastErr.code ? lastErr.code : 'unknown'}: ` +
-    `${lastErr && lastErr.message ? lastErr.message : 'rename refused'}); a concurrent launcher holds it and it is not a valid cache yet`
-  );
-}
-
 async function downloadToMemory(url) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), DOWNLOAD_TIMEOUT_MS);
@@ -563,9 +537,7 @@ if (require.main === module) {
 // (it would provision and spawn a server as a side effect of an import).
 module.exports = {
   targetReady,
-  publishStaging,
   checkFile,
   shortHash,
   resolveRuntimeDir,
-  SIBLING_WON,
 };
