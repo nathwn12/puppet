@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   launcher, remove this process's owned `.staging-*` copy; the winner's ready
   cache, server bytes and `.ready` marker stay untouched. `npm test` proves both
   launchers end ready and no owned staging copy survives.
+- `puppet-mcp` (npm launcher): provisioning for one cache path is serialized by
+  an owned lock beside the engine cache. A launcher that finds a sibling's ready
+  cache after its download adopts it instead of clearing it, so a published cache
+  and its `.ready` marker survive; invalid caches are still recovered and the lock
+  is released on success or failure. `npm test` proves the mid-download interleave
+  preserves the winner's cache.
 
 ## [8.0.0] - 2026-11-14
 

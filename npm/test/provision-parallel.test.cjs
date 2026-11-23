@@ -310,3 +310,175 @@ test('post-publish adoption removes the owned staging copy (deterministic local 
     fs.rmSync(fx.root, { recursive: true, force: true });
   }
 });
+
+function runLauncherWithEnv(pkgDir, env) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [path.join(pkgDir, 'bin', 'puppet-mcp.js')], {
+      env, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    let err = '';
+    child.stdout.on('data', (d) => (out += d.toString()));
+    child.stderr.on('data', (d) => (err += d.toString()));
+    child.on('exit', (code) => resolve({ code, out, err }));
+    child.on('error', (e) => resolve({ code: -1, out, err: `${err}\nspawn error: ${e.message}` }));
+  });
+}
+
+test('a sibling that publishes mid-provision keeps its ready cache and marker', async () => {
+  const fx = makePackage();
+  const at = path.join(fx.root, 'at-read');
+  const go = path.join(fx.root, 'go');
+  const hook = path.join(fx.root, 'race-hook.cjs');
+  // Test-only preload: pause the loser AFTER its early targetReady checks but
+  // BEFORE it touches the cache, so a sibling can publish a ready cache in the
+  // window. No production code is involved in the interleave.
+  fs.writeFileSync(hook, `'use strict';
+const fs = require('node:fs');
+const path = require('node:path');
+const real = fs.readFileSync;
+const bundle = process.env.PUPPET_RACE_BUNDLE;
+const dir = process.env.PUPPET_RACE_DIR;
+if (!bundle || !dir) throw new Error('race hook: missing env');
+fs.readFileSync = function (p) {
+  if (typeof p === 'string' && path.resolve(p) === path.resolve(bundle)) {
+    fs.writeFileSync(path.join(dir, 'at-read'), '1');
+    const go = path.join(dir, 'go');
+    const deadline = Date.now() + 20000;
+    while (!fs.existsSync(go)) {
+      if (Date.now() > deadline) throw new Error('race hook: go sentinel timeout');
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+    }
+  }
+  return real.apply(this, arguments);
+};
+`);
+  try {
+    fs.rmSync(fx.cache, { recursive: true, force: true });
+    const baseEnv = {
+      ...process.env,
+      PUPPET_ENGINE_BUNDLE: fx.bundle,
+      PUPPET_ENGINE_CACHE: fx.cache,
+      PUPPET_MCP_ALLOW_NON_WINDOWS: '1',
+    };
+    const loser = runLauncherWithEnv(fx.pkg, {
+      ...baseEnv,
+      NODE_OPTIONS: `--require=${hook}`,
+      PUPPET_RACE_BUNDLE: fx.bundle,
+      PUPPET_RACE_DIR: fx.root,
+    });
+    const deadline = Date.now() + 20000;
+    while (!fs.existsSync(at)) {
+      if (Date.now() > deadline) {
+        const partial = await loser;
+        assert.fail(`loser never reached the bundle read; stderr:\n${partial.err}`);
+      }
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    const winner = await runLauncherWithEnv(fx.pkg, baseEnv);
+    assert.strictEqual(
+      launcher.targetReady(fx.cache, fx.manifest.runtime, fx.manifest), true,
+      `winner must publish a ready cache first; stderr:\n${winner.err}`
+    );
+    // A fixture-owned marker: if the loser deletes the published cache, it vanishes.
+    const token = path.join(fx.cache, 'owner-a.token');
+    fs.writeFileSync(token, 'A');
+    fs.writeFileSync(go, '1');
+    const r = await loser;
+    assert.ok(fs.existsSync(token), `loser must not delete a ready cache its sibling published; stderr:\n${r.err}`);
+    assert.strictEqual(launcher.targetReady(fx.cache, fx.manifest.runtime, fx.manifest), true, 'ready cache survives');
+    assert.match(r.err, /runtime cache ready/, `loser must end ready; stderr:\n${r.err}`);
+    assert.doesNotMatch(r.err, /provisioning failed/, `loser must not fail; stderr:\n${r.err}`);
+  } finally {
+    fs.rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+function baseEnvFor(fx) {
+  return {
+    ...process.env,
+    PUPPET_ENGINE_BUNDLE: fx.bundle,
+    PUPPET_ENGINE_CACHE: fx.cache,
+    PUPPET_MCP_ALLOW_NON_WINDOWS: '1',
+  };
+}
+
+function lockDirFor(fx) {
+  return path.join(path.dirname(fx.cache), `.puppet-lock-${path.basename(fx.cache)}`);
+}
+
+test('an invalid ready cache is recovered and the lock is released', async () => {
+  const fx = makePackage();
+  try {
+    fs.mkdirSync(fx.cache, { recursive: true });
+    fs.writeFileSync(path.join(fx.cache, '.ready'), JSON.stringify({ serverVersion: VERSION, bundleSha256: 'deadbeef' }));
+    fs.writeFileSync(path.join(fx.cache, 'puppet.exe'), 'stale');
+    assert.strictEqual(launcher.targetReady(fx.cache, fx.manifest.runtime, fx.manifest), false, 'fixture cache must start invalid');
+    const r = await runLauncherWithEnv(fx.pkg, baseEnvFor(fx));
+    assert.match(r.err, /is invalid; re-provisioning/, `invalid cache must be named; stderr:\n${r.err}`);
+    assert.match(r.err, /runtime cache ready \(provisioned\)/, `must re-provision; stderr:\n${r.err}`);
+    assert.strictEqual(launcher.targetReady(fx.cache, fx.manifest.runtime, fx.manifest), true, 'cache must end valid');
+    assert.strictEqual(fs.existsSync(lockDirFor(fx)), false, 'lock must be released after success');
+  } finally {
+    fs.rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test('a lock left by a dead owner is reclaimed', async () => {
+  const fx = makePackage();
+  try {
+    fs.mkdirSync(lockDirFor(fx), { recursive: true });
+    fs.writeFileSync(path.join(lockDirFor(fx), 'owner'), '99999999');
+    const r = await runLauncherWithEnv(fx.pkg, baseEnvFor(fx));
+    assert.match(r.err, /runtime cache ready \(provisioned\)/, `dead lock must not block; stderr:\n${r.err}`);
+    assert.strictEqual(fs.existsSync(lockDirFor(fx)), false, 'reclaimed lock must be released');
+  } finally {
+    fs.rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test('a ready cache is reused without reading the bundle', async () => {
+  const fx = makePackage();
+  try {
+    const first = await runLauncherWithEnv(fx.pkg, baseEnvFor(fx));
+    assert.strictEqual(launcher.targetReady(fx.cache, fx.manifest.runtime, fx.manifest), true, `first run must publish; stderr:\n${first.err}`);
+    const second = await runLauncherWithEnv(fx.pkg, {
+      ...baseEnvFor(fx),
+      PUPPET_ENGINE_BUNDLE: path.join(fx.root, 'missing-bundle.zip'),
+    });
+    assert.match(second.err, /runtime cache ready \(reused\)/, `warm run must reuse; stderr:\n${second.err}`);
+    assert.doesNotMatch(second.err, /reading |downloading |provisioning runtime cache/, `warm run must not provision; stderr:\n${second.err}`);
+    assert.strictEqual(fs.existsSync(lockDirFor(fx)), false, 'reuse must not leave a lock');
+  } finally {
+    fs.rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test('a failed provision releases the lock and leaves no ready cache', async () => {
+  const fx = makePackage();
+  try {
+    const corrupt = Buffer.from('corrupt server bytes\n', 'utf8');
+    const entries = [['puppet.exe', corrupt]];
+    for (let i = 0; i < 8; i++) entries.push([`assets/f-${i}.bin`, Buffer.alloc(64, i)]);
+    const zip = storedZip(entries);
+    fs.writeFileSync(fx.bundle, zip);
+    const manifest = {
+      ...fx.manifest,
+      runtime: {
+        ...fx.manifest.runtime,
+        archive: { ...fx.manifest.runtime.archive, sha256: sha256(zip), size: zip.length },
+        server: { ...fx.manifest.runtime.server, sha256: sha256(SERVER_BYTES), size: SERVER_BYTES.length },
+      },
+    };
+    fs.writeFileSync(path.join(fx.pkg, 'engine-manifest.json'), JSON.stringify(manifest, null, 2));
+    // The override names a leaf; keep its sha8 in step with the new archive.
+    fx.cache = path.join(path.dirname(fx.cache), `${VERSION}-${sha256(zip).slice(0, 8)}`);
+    const r = await runLauncherWithEnv(fx.pkg, baseEnvFor(fx));
+    assert.match(r.err, /extracted puppet\.exe invalid/, `server check must fail; stderr:\n${r.err}`);
+    assert.match(r.err, /provisioning failed/, `failure must be named; stderr:\n${r.err}`);
+    assert.strictEqual(fs.existsSync(lockDirFor(fx)), false, 'lock must be released after failure');
+    assert.strictEqual(launcher.targetReady(fx.cache, manifest.runtime, manifest), false, 'no ready cache on failure');
+  } finally {
+    fs.rmSync(fx.root, { recursive: true, force: true });
+  }
+});

@@ -53,6 +53,8 @@ const DOWNLOAD_TIMEOUT_MS = 15 * 60 * 1000;
 const MAX_ENTRIES = 4096;
 const MAX_TOTAL_UNCOMPRESSED = 2 * 1024 * 1024 * 1024;
 const MAX_ENTRY_SIZE = 1 * 1024 * 1024 * 1024;
+const PROVISION_LOCK_TIMEOUT_MS = 60 * 1000;
+const PROVISION_LOCK_RETRY_MS = 25;
 
 function fail(message) {
   process.stderr.write(`puppet-mcp: error: ${message}\n`);
@@ -360,6 +362,41 @@ async function downloadToMemory(url) {
   return Buffer.from(await res.arrayBuffer());
 }
 
+// One writer per cache path. mkdir is atomic on Windows and everywhere else;
+// the owner file carries the pid so a lock left by a dead process is reclaimable.
+// No owner data is touched: the lock sits beside the engine cache this app owns.
+function processAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+async function withProvisionLock(cacheDir, fn) {
+  const lockDir = path.join(path.dirname(cacheDir), `.puppet-lock-${path.basename(cacheDir)}`);
+  const ownerFile = path.join(lockDir, 'owner');
+  const deadline = Date.now() + PROVISION_LOCK_TIMEOUT_MS;
+  fs.mkdirSync(path.dirname(lockDir), { recursive: true });
+  for (;;) {
+    try {
+      fs.mkdirSync(lockDir);
+      fs.writeFileSync(ownerFile, String(process.pid));
+      break;
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+      let owner = null;
+      try { owner = Number(fs.readFileSync(ownerFile, 'utf8').trim()); } catch { /* creator still writing */ }
+      if (Number.isInteger(owner) && !processAlive(owner)) {
+        try { fs.rmSync(lockDir, { recursive: true, force: true }); } catch { /* lost the reclaim race; retry */ }
+      }
+      if (Date.now() >= deadline) fail(`timed out waiting for the provisioning lock at ${lockDir}`);
+      await new Promise((r) => setTimeout(r, PROVISION_LOCK_RETRY_MS));
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    try { fs.rmSync(lockDir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+}
+
 async function ensureRuntime(manifest, cacheDir) {
   const rt = manifest.runtime;
   if (isPlaceholderSha(rt.archive.sha256) || !(rt.archive.size > 0)) {
@@ -389,12 +426,9 @@ async function ensureRuntime(manifest, cacheDir) {
     log(`runtime cache ready (reused): ${cacheDir}`);
     return cacheDir;
   }
-  // A sibling provisioning this same version can finish at any moment: adopt
-  // its completed cache instead of racing the publish.
-  if (targetReady(cacheDir, rt, manifest)) {
-    log(`runtime cache ready (adopted from a concurrent launcher): ${cacheDir}`);
-    return cacheDir;
-  }
+  // The check above is a fast path only: a published .ready cache is immutable,
+  // so warm reuse never needs the lock. All cache mutation below is serialized
+  // per cache path, and the authoritative check runs inside it.
 
   // Local bundle override: the pre-publish cleanroom builds the archive in
   // this same job, before any GitHub Release exists, so it hands the zip over
@@ -430,53 +464,64 @@ async function ensureRuntime(manifest, cacheDir) {
     fail(`${origin} sha256 mismatch; wrote nothing.`);
   }
 
-  // Extract into a staging dir, verify, mark ready, then publish: the target
-  // dir is never observed half-written, and a sibling that publishes first is
-  // adopted rather than raced (see publishStaging).
-  const staging = `${cacheDir}.staging-${process.pid}`;
-  fs.rmSync(staging, { recursive: true, force: true });
-  try {
-    fs.rmSync(cacheDir, { recursive: true, force: true });
-  } catch (err) {
-    // A sibling holds the directory open (a running server): leave its cache
-    // alone and let publishStaging adopt it.
-    if (!SIBLING_WON.has(err.code)) throw err;
-  }
-  fs.mkdirSync(staging, { recursive: true });
-  try {
-    const names = extractZip(data, staging);
-    log(`extracted ${names.length} entries`);
-    const bad = checkFile(path.join(staging, rt.server.name), rt.server);
-    if (bad) throw new Error(`extracted ${rt.server.name} invalid (${bad})`);
-    // The marker is written INSIDE the staging dir, so a directory that
-    // appears under the cache path is complete and verifiable the instant it
-    // is renamed - a sibling can adopt it with no extra wait.
-    fs.writeFileSync(
-      path.join(staging, '.ready'),
-      JSON.stringify({ serverVersion: manifest.serverVersion, bundleSha256: rt.archive.sha256.toLowerCase() }, null, 2)
-    );
-    const published = publishStaging(staging, cacheDir, rt, manifest);
-    // On 'adopted' a sibling won the publish race, so this process's fully
-    // extracted staging copy is an owned duplicate that nothing else references.
-    // Remove only that copy - never the winner's ready cache. A cleanup failure
-    // is surfaced but must not turn a successful adoption into a failure.
-    if (published === 'adopted') {
+  return withProvisionLock(cacheDir, () => {
+    // Authoritative check under the lock: a sibling may have published while
+    // this process was reading the bundle. Adopt it; never clear it.
+    if (targetReady(cacheDir, rt, manifest)) {
+      log(`runtime cache ready (adopted from a concurrent launcher): ${cacheDir}`);
+      return cacheDir;
+    }
+
+    // Invalid-cache recovery: only a cache just proved not ready is cleared,
+    // and only by the lock holder. A ready cache is immutable.
+    if (fs.existsSync(cacheDir)) {
       try {
-        fs.rmSync(staging, { recursive: true, force: true });
+        fs.rmSync(cacheDir, { recursive: true, force: true });
       } catch (err) {
-        log(`warning: could not remove owned staging dir ${staging}: ${err.message}`);
+        if (!SIBLING_WON.has(err.code)) throw err;
       }
     }
-    log(`runtime cache ready (${published === 'adopted' ? 'adopted from a concurrent launcher' : 'provisioned'}): ${cacheDir}`);
-  } catch (err) {
+
+    // Extract into a staging dir, verify, mark ready, then publish: the target
+    // dir is never observed half-written.
+    const staging = `${cacheDir}.staging-${process.pid}`;
     fs.rmSync(staging, { recursive: true, force: true });
-    // Never delete a cache a sibling published while this attempt failed.
-    if (!targetReady(cacheDir, rt, manifest)) {
-      fs.rmSync(cacheDir, { recursive: true, force: true });
+    fs.mkdirSync(staging, { recursive: true });
+    try {
+      const names = extractZip(data, staging);
+      log(`extracted ${names.length} entries`);
+      const bad = checkFile(path.join(staging, rt.server.name), rt.server);
+      if (bad) throw new Error(`extracted ${rt.server.name} invalid (${bad})`);
+      // The marker is written INSIDE the staging dir, so a directory that
+      // appears under the cache path is complete and verifiable the instant it
+      // is renamed - a sibling can adopt it with no extra wait.
+      fs.writeFileSync(
+        path.join(staging, '.ready'),
+        JSON.stringify({ serverVersion: manifest.serverVersion, bundleSha256: rt.archive.sha256.toLowerCase() }, null, 2)
+      );
+      const published = publishStaging(staging, cacheDir, rt, manifest);
+      // On 'adopted' a sibling won the publish race, so this process's fully
+      // extracted staging copy is an owned duplicate that nothing else references.
+      // Remove only that copy - never the winner's ready cache. A cleanup failure
+      // is surfaced but must not turn a successful adoption into a failure.
+      if (published === 'adopted') {
+        try {
+          fs.rmSync(staging, { recursive: true, force: true });
+        } catch (err) {
+          log(`warning: could not remove owned staging dir ${staging}: ${err.message}`);
+        }
+      }
+      log(`runtime cache ready (${published === 'adopted' ? 'adopted from a concurrent launcher' : 'provisioned'}): ${cacheDir}`);
+    } catch (err) {
+      fs.rmSync(staging, { recursive: true, force: true });
+      // Never delete a cache a sibling published while this attempt failed.
+      if (!targetReady(cacheDir, rt, manifest)) {
+        fs.rmSync(cacheDir, { recursive: true, force: true });
+      }
+      throw new Error(`provisioning failed (${err.message}); wrote nothing.`);
     }
-    fail(`provisioning failed (${err.message}); wrote nothing.`);
-  }
-  return cacheDir;
+    return cacheDir;
+  });
 }
 
 function runServer(cacheDir, manifest) {
