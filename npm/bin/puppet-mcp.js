@@ -53,8 +53,9 @@ const DOWNLOAD_TIMEOUT_MS = 15 * 60 * 1000;
 const MAX_ENTRIES = 4096;
 const MAX_TOTAL_UNCOMPRESSED = 2 * 1024 * 1024 * 1024;
 const MAX_ENTRY_SIZE = 1 * 1024 * 1024 * 1024;
-const PROVISION_LOCK_TIMEOUT_MS = 60 * 1000;
-const PROVISION_LOCK_RETRY_MS = 25;
+const CACHE_READY_TIMEOUT_ENV = 'PUPPET_CACHE_READY_TIMEOUT_MS';
+const CACHE_READY_TIMEOUT_DEFAULT_MS = 60 * 1000;
+const CACHE_READY_POLL_MS = 25;
 
 function fail(message) {
   process.stderr.write(`puppet-mcp: error: ${message}\n`);
@@ -362,38 +363,27 @@ async function downloadToMemory(url) {
   return Buffer.from(await res.arrayBuffer());
 }
 
-// One writer per cache path. mkdir is atomic on Windows and everywhere else;
-// the owner file carries the pid so a lock left by a dead process is reclaimable.
-// No owner data is touched: the lock sits beside the engine cache this app owns.
-function processAlive(pid) {
-  try { process.kill(pid, 0); return true; } catch { return false; }
+// A cache path is claimed by the one atomic mkdir that creates it. There is no
+// owner record to observe and no stale-owner reclaim: a process that dies leaves
+// an unfinished path, and peers fail closed after a bounded wait with an explicit
+// recovery hint. Nothing ever deletes a path another process created.
+function cacheReadyTimeoutMs() {
+  const raw = process.env[CACHE_READY_TIMEOUT_ENV];
+  if (raw === undefined) return CACHE_READY_TIMEOUT_DEFAULT_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 && n <= CACHE_READY_TIMEOUT_DEFAULT_MS
+    ? n : CACHE_READY_TIMEOUT_DEFAULT_MS;
 }
 
-async function withProvisionLock(cacheDir, fn) {
-  const lockDir = path.join(path.dirname(cacheDir), `.puppet-lock-${path.basename(cacheDir)}`);
-  const ownerFile = path.join(lockDir, 'owner');
-  const deadline = Date.now() + PROVISION_LOCK_TIMEOUT_MS;
-  fs.mkdirSync(path.dirname(lockDir), { recursive: true });
+async function waitForReadyCache(cacheDir, rt, manifest) {
+  const deadline = Date.now() + cacheReadyTimeoutMs();
   for (;;) {
-    try {
-      fs.mkdirSync(lockDir);
-      fs.writeFileSync(ownerFile, String(process.pid));
-      break;
-    } catch (err) {
-      if (err.code !== 'EEXIST') throw err;
-      let owner = null;
-      try { owner = Number(fs.readFileSync(ownerFile, 'utf8').trim()); } catch { /* creator still writing */ }
-      if (Number.isInteger(owner) && !processAlive(owner)) {
-        try { fs.rmSync(lockDir, { recursive: true, force: true }); } catch { /* lost the reclaim race; retry */ }
-      }
-      if (Date.now() >= deadline) fail(`timed out waiting for the provisioning lock at ${lockDir}`);
-      await new Promise((r) => setTimeout(r, PROVISION_LOCK_RETRY_MS));
+    if (targetReady(cacheDir, rt, manifest)) return true;
+    if (!fs.existsSync(cacheDir)) return false; // a failed creator cleared its own path
+    if (Date.now() >= deadline) {
+      fail(`timed out waiting for ${cacheDir} to become ready; if no launcher owns it, remove that directory and retry`);
     }
-  }
-  try {
-    return await fn();
-  } finally {
-    try { fs.rmSync(lockDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    await new Promise((r) => setTimeout(r, CACHE_READY_POLL_MS));
   }
 }
 
@@ -426,9 +416,9 @@ async function ensureRuntime(manifest, cacheDir) {
     log(`runtime cache ready (reused): ${cacheDir}`);
     return cacheDir;
   }
-  // The check above is a fast path only: a published .ready cache is immutable,
-  // so warm reuse never needs the lock. All cache mutation below is serialized
-  // per cache path, and the authoritative check runs inside it.
+  // The check above is a fast path: a published .ready cache is immutable, so
+  // warm reuse touches nothing. Below, the cache path itself is the claim: a
+  // peer never clears it, it only waits for the creator's ready marker.
 
   // Local bundle override: the pre-publish cleanroom builds the archive in
   // this same job, before any GitHub Release exists, so it hands the zip over
@@ -464,64 +454,44 @@ async function ensureRuntime(manifest, cacheDir) {
     fail(`${origin} sha256 mismatch; wrote nothing.`);
   }
 
-  return withProvisionLock(cacheDir, () => {
-    // Authoritative check under the lock: a sibling may have published while
-    // this process was reading the bundle. Adopt it; never clear it.
-    if (targetReady(cacheDir, rt, manifest)) {
-      log(`runtime cache ready (adopted from a concurrent launcher): ${cacheDir}`);
-      return cacheDir;
-    }
-
-    // Invalid-cache recovery: only a cache just proved not ready is cleared,
-    // and only by the lock holder. A ready cache is immutable.
-    if (fs.existsSync(cacheDir)) {
-      try {
-        fs.rmSync(cacheDir, { recursive: true, force: true });
-      } catch (err) {
-        if (!SIBLING_WON.has(err.code)) throw err;
-      }
-    }
-
-    // Extract into a staging dir, verify, mark ready, then publish: the target
-    // dir is never observed half-written.
-    const staging = `${cacheDir}.staging-${process.pid}`;
-    fs.rmSync(staging, { recursive: true, force: true });
-    fs.mkdirSync(staging, { recursive: true });
+  fs.mkdirSync(path.dirname(cacheDir), { recursive: true });
+  let owns = false;
+  for (let attempt = 0; attempt < 3 && !owns; attempt += 1) {
     try {
-      const names = extractZip(data, staging);
-      log(`extracted ${names.length} entries`);
-      const bad = checkFile(path.join(staging, rt.server.name), rt.server);
-      if (bad) throw new Error(`extracted ${rt.server.name} invalid (${bad})`);
-      // The marker is written INSIDE the staging dir, so a directory that
-      // appears under the cache path is complete and verifiable the instant it
-      // is renamed - a sibling can adopt it with no extra wait.
-      fs.writeFileSync(
-        path.join(staging, '.ready'),
-        JSON.stringify({ serverVersion: manifest.serverVersion, bundleSha256: rt.archive.sha256.toLowerCase() }, null, 2)
-      );
-      const published = publishStaging(staging, cacheDir, rt, manifest);
-      // On 'adopted' a sibling won the publish race, so this process's fully
-      // extracted staging copy is an owned duplicate that nothing else references.
-      // Remove only that copy - never the winner's ready cache. A cleanup failure
-      // is surfaced but must not turn a successful adoption into a failure.
-      if (published === 'adopted') {
-        try {
-          fs.rmSync(staging, { recursive: true, force: true });
-        } catch (err) {
-          log(`warning: could not remove owned staging dir ${staging}: ${err.message}`);
-        }
-      }
-      log(`runtime cache ready (${published === 'adopted' ? 'adopted from a concurrent launcher' : 'provisioned'}): ${cacheDir}`);
+      fs.mkdirSync(cacheDir);
+      owns = true;
     } catch (err) {
-      fs.rmSync(staging, { recursive: true, force: true });
-      // Never delete a cache a sibling published while this attempt failed.
-      if (!targetReady(cacheDir, rt, manifest)) {
-        fs.rmSync(cacheDir, { recursive: true, force: true });
+      if (err.code !== 'EEXIST') throw err;
+      // A peer owns the path now. Wait for its marker; never clear its work.
+      if (await waitForReadyCache(cacheDir, rt, manifest)) {
+        log(`runtime cache ready (adopted from a concurrent launcher): ${cacheDir}`);
+        return cacheDir;
       }
-      throw new Error(`provisioning failed (${err.message}); wrote nothing.`);
+      // The creator removed its own path after a failure; claim it next round.
     }
-    return cacheDir;
-  });
+  }
+  if (!owns) fail(`could not claim ${cacheDir} after repeated contention`);
+
+  // Only the creator writes here. The marker is published last, atomically, so
+  // a peer can only adopt a complete, verified cache.
+  try {
+    const names = extractZip(data, cacheDir);
+    log(`extracted ${names.length} entries`);
+    const bad = checkFile(path.join(cacheDir, rt.server.name), rt.server);
+    if (bad) throw new Error(`extracted ${rt.server.name} invalid (${bad})`);
+    const tmpMarker = path.join(cacheDir, `.ready-${process.pid}`);
+    fs.writeFileSync(
+      tmpMarker,
+      JSON.stringify({ serverVersion: manifest.serverVersion, bundleSha256: rt.archive.sha256.toLowerCase() }, null, 2)
+    );
+    fs.renameSync(tmpMarker, path.join(cacheDir, '.ready'));
+    log(`runtime cache ready (provisioned): ${cacheDir}`);
+  } catch (err) {
+    // We created this path; clearing it cannot destroy a sibling's work.
+    try { fs.rmSync(cacheDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    throw new Error(`provisioning failed (${err.message}); wrote nothing.`);
+  }
+  return cacheDir;
 }
 
 function runServer(cacheDir, manifest) {

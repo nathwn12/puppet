@@ -230,82 +230,19 @@ test('two launchers provisioning the same version in parallel both succeed', asy
   }
 });
 
-test('post-publish adoption removes the owned staging copy (deterministic local fixture)', async () => {
+test('a peer claimed path without a ready marker fails closed and is left intact', async () => {
   const fx = makePackage();
-  const parent = path.dirname(fx.cache);
-  const prefix = `${path.basename(fx.cache)}.staging-`;
-  const ownedStaging = () =>
-    fs.existsSync(parent) ? fs.readdirSync(parent).filter((name) => name.startsWith(prefix)) : [];
   try {
-    fs.mkdirSync(parent, { recursive: true });
-    for (const name of ownedStaging()) fs.rmSync(path.join(parent, name), { recursive: true, force: true });
-    fs.rmSync(fx.cache, { recursive: true, force: true });
-
-    // Publish a valid ready cache at the cache path only AFTER this launcher has
-    // created its own staging dir. At that point its early reuse/adopt checks and
-    // the cache removal at :439 are behind it, so publishStaging must take the
-    // exact post-publish 'adopted' branch. The winner is built from the same
-    // local fixture bytes; no network and no remote binary.
-    const publishWinner = () => {
-      fs.mkdirSync(fx.cache, { recursive: true });
-      fs.writeFileSync(path.join(fx.cache, 'puppet.exe'), SERVER_BYTES);
-      fs.writeFileSync(
-        path.join(fx.cache, '.ready'),
-        JSON.stringify({
-          serverVersion: fx.manifest.serverVersion,
-          bundleSha256: fx.manifest.runtime.archive.sha256,
-        })
-      );
-    };
-    const winner = new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        watcher.close();
-        reject(new Error('staging dir never appeared; cannot force post-publish adoption'));
-      }, 15000);
-      let watcher;
-      watcher = fs.watch(parent, (_event, filename) => {
-        const base = typeof filename === 'string' ? path.basename(filename) : '';
-        if (!base.startsWith(prefix)) return;
-        watcher.close();
-        clearTimeout(timer);
-        try {
-          publishWinner();
-          resolve();
-        } catch (err) {
-          reject(err);
-        }
-      });
+    fs.mkdirSync(fx.cache, { recursive: true });
+    fs.writeFileSync(path.join(fx.cache, 'puppet.exe'), SERVER_BYTES);
+    const r = await runLauncherWithEnv(fx.pkg, {
+      ...baseEnvFor(fx),
+      PUPPET_CACHE_READY_TIMEOUT_MS: '200',
     });
-
-    const [r] = await Promise.all([runLauncher(fx.pkg, fx.bundle, fx.cache), winner]);
-
-    // Branch proof: an extraction in this process followed by the adopt log is
-    // the post-publish path. The early-adopt log at :395 has no extraction line.
-    assert.match(r.err, /extracted \d+ entries/, `launcher must extract into staging; stderr:\n${r.err}`);
-    assert.match(
-      r.err,
-      /runtime cache ready \(adopted from a concurrent launcher\)/,
-      `launcher must take the post-publish adopt branch; stderr:\n${r.err}`
-    );
-    assert.doesNotMatch(r.err, /provisioning failed/, `adoption must not be reported as failure; stderr:\n${r.err}`);
-
-    // The winning ready dir, its server contents and its marker survive.
-    assert.strictEqual(
-      launcher.targetReady(fx.cache, fx.manifest.runtime, fx.manifest),
-      true,
-      'the winning cache stays valid'
-    );
-    assert.deepStrictEqual(fs.readFileSync(path.join(fx.cache, 'puppet.exe')), SERVER_BYTES, 'winning server contents survive');
-    const marker = JSON.parse(fs.readFileSync(path.join(fx.cache, '.ready'), 'utf8'));
-    assert.strictEqual(marker.serverVersion, fx.manifest.serverVersion, 'marker version survives');
-    assert.strictEqual(
-      String(marker.bundleSha256).toLowerCase(),
-      fx.manifest.runtime.archive.sha256.toLowerCase(),
-      'marker bundle hash survives'
-    );
-
-    // The owned staging copy must be gone on success.
-    assert.deepStrictEqual(ownedStaging(), [], `no owned .staging-* copy may survive; found: ${ownedStaging().join(', ')}`);
+    assert.match(r.err, /timed out waiting for .* to become ready/, `must fail closed; stderr:\n${r.err}`);
+    assert.match(r.err, /remove that directory and retry/, `explicit recovery hint required; stderr:\n${r.err}`);
+    assert.strictEqual(fs.existsSync(path.join(fx.cache, 'puppet.exe')), true, 'peer created bytes must survive');
+    assert.strictEqual(fs.existsSync(path.join(fx.cache, '.ready')), false, 'no marker invented for a partial path');
   } finally {
     fs.rmSync(fx.root, { recursive: true, force: true });
   }
@@ -403,35 +340,20 @@ function baseEnvFor(fx) {
   };
 }
 
-function lockDirFor(fx) {
-  return path.join(path.dirname(fx.cache), `.puppet-lock-${path.basename(fx.cache)}`);
-}
-
-test('an invalid ready cache is recovered and the lock is released', async () => {
+test('an invalid ready cache is refused, not cleared', async () => {
   const fx = makePackage();
   try {
     fs.mkdirSync(fx.cache, { recursive: true });
     fs.writeFileSync(path.join(fx.cache, '.ready'), JSON.stringify({ serverVersion: VERSION, bundleSha256: 'deadbeef' }));
     fs.writeFileSync(path.join(fx.cache, 'puppet.exe'), 'stale');
     assert.strictEqual(launcher.targetReady(fx.cache, fx.manifest.runtime, fx.manifest), false, 'fixture cache must start invalid');
-    const r = await runLauncherWithEnv(fx.pkg, baseEnvFor(fx));
-    assert.match(r.err, /is invalid; re-provisioning/, `invalid cache must be named; stderr:\n${r.err}`);
-    assert.match(r.err, /runtime cache ready \(provisioned\)/, `must re-provision; stderr:\n${r.err}`);
-    assert.strictEqual(launcher.targetReady(fx.cache, fx.manifest.runtime, fx.manifest), true, 'cache must end valid');
-    assert.strictEqual(fs.existsSync(lockDirFor(fx)), false, 'lock must be released after success');
-  } finally {
-    fs.rmSync(fx.root, { recursive: true, force: true });
-  }
-});
-
-test('a lock left by a dead owner is reclaimed', async () => {
-  const fx = makePackage();
-  try {
-    fs.mkdirSync(lockDirFor(fx), { recursive: true });
-    fs.writeFileSync(path.join(lockDirFor(fx), 'owner'), '99999999');
-    const r = await runLauncherWithEnv(fx.pkg, baseEnvFor(fx));
-    assert.match(r.err, /runtime cache ready \(provisioned\)/, `dead lock must not block; stderr:\n${r.err}`);
-    assert.strictEqual(fs.existsSync(lockDirFor(fx)), false, 'reclaimed lock must be released');
+    const r = await runLauncherWithEnv(fx.pkg, {
+      ...baseEnvFor(fx),
+      PUPPET_CACHE_READY_TIMEOUT_MS: '200',
+    });
+    assert.match(r.err, /timed out waiting for .* to become ready/, `invalid cache must fail closed; stderr:\n${r.err}`);
+    assert.match(r.err, /remove that directory and retry/, `explicit recovery hint required; stderr:\n${r.err}`);
+    assert.strictEqual(fs.readFileSync(path.join(fx.cache, 'puppet.exe'), 'utf8'), 'stale', 'invalid bytes must remain untouched');
   } finally {
     fs.rmSync(fx.root, { recursive: true, force: true });
   }
@@ -448,13 +370,12 @@ test('a ready cache is reused without reading the bundle', async () => {
     });
     assert.match(second.err, /runtime cache ready \(reused\)/, `warm run must reuse; stderr:\n${second.err}`);
     assert.doesNotMatch(second.err, /reading |downloading |provisioning runtime cache/, `warm run must not provision; stderr:\n${second.err}`);
-    assert.strictEqual(fs.existsSync(lockDirFor(fx)), false, 'reuse must not leave a lock');
   } finally {
     fs.rmSync(fx.root, { recursive: true, force: true });
   }
 });
 
-test('a failed provision releases the lock and leaves no ready cache', async () => {
+test('a failed provision clears only the path it created', async () => {
   const fx = makePackage();
   try {
     const corrupt = Buffer.from('corrupt server bytes\n', 'utf8');
@@ -476,7 +397,7 @@ test('a failed provision releases the lock and leaves no ready cache', async () 
     const r = await runLauncherWithEnv(fx.pkg, baseEnvFor(fx));
     assert.match(r.err, /extracted puppet\.exe invalid/, `server check must fail; stderr:\n${r.err}`);
     assert.match(r.err, /provisioning failed/, `failure must be named; stderr:\n${r.err}`);
-    assert.strictEqual(fs.existsSync(lockDirFor(fx)), false, 'lock must be released after failure');
+    assert.strictEqual(fs.existsSync(fx.cache), false, 'only the creator clears its own claimed path');
     assert.strictEqual(launcher.targetReady(fx.cache, manifest.runtime, manifest), false, 'no ready cache on failure');
   } finally {
     fs.rmSync(fx.root, { recursive: true, force: true });
