@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `puppet-mcp` (npm launcher): after losing the publish race to a concurrent
+  launcher, remove this process's owned `.staging-*` copy; the winner's ready
+  cache, server bytes and `.ready` marker stay untouched. `npm test` proves both
+  launchers end ready and no owned staging copy survives.
+
+## [8.0.0] - 2026-11-14
+
 ### Changed (breaking)
 - `do` element mutations now require `expect_fp`: `invoke` and `click` with an
   element and no fingerprint refuse `expect_fp_required` (returning the fresh
