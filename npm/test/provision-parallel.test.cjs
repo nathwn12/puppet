@@ -229,3 +229,75 @@ test('two launchers provisioning the same version in parallel both succeed', asy
     fs.rmSync(fx.root, { recursive: true, force: true });
   }
 });
+
+test('a successful adoption removes the losing launcher owned staging copy', async () => {
+  const fx = makePackage();
+  const parent = path.dirname(fx.cache);
+  const prefix = `${path.basename(fx.cache)}.staging-`;
+  const ownedStaging = () =>
+    fs.existsSync(parent) ? fs.readdirSync(parent).filter((name) => name.startsWith(prefix)) : [];
+  let adoptionRounds = 0;
+  const leftovers = [];
+  try {
+    for (let round = 0; round < 8; round++) {
+      fs.rmSync(fx.cache, { recursive: true, force: true });
+      // Clear copies from earlier rounds so this assertion is about these two
+      // launchers only; every path removed here is inside the disposable fixture.
+      for (const name of ownedStaging()) {
+        fs.rmSync(path.join(parent, name), { recursive: true, force: true });
+      }
+
+      const [a, b] = await Promise.all([
+        runLauncher(fx.pkg, fx.bundle, fx.cache),
+        runLauncher(fx.pkg, fx.bundle, fx.cache),
+      ]);
+
+      // Outcome survives: both launchers provision successfully, neither is
+      // turned into a failure because a sibling published first.
+      for (const [name, r] of [['A', a], ['B', b]]) {
+        assert.match(
+          r.err,
+          /runtime cache ready/,
+          `round ${round} launcher ${name} must end with a ready cache; stderr:\n${r.err}`
+        );
+        assert.doesNotMatch(
+          r.err,
+          /provisioning failed/,
+          `round ${round} launcher ${name} must not fail because a sibling won; stderr:\n${r.err}`
+        );
+      }
+      if (/adopted from a concurrent launcher/.test(a.err + b.err)) adoptionRounds++;
+
+      // The winning ready dir, its server contents and its marker survive.
+      assert.strictEqual(
+        launcher.targetReady(fx.cache, fx.manifest.runtime, fx.manifest),
+        true,
+        `round ${round}: the winning cache stays valid`
+      );
+      assert.deepStrictEqual(
+        fs.readFileSync(path.join(fx.cache, 'puppet.exe')),
+        SERVER_BYTES,
+        `round ${round}: the winning server contents survive`
+      );
+      const marker = JSON.parse(fs.readFileSync(path.join(fx.cache, '.ready'), 'utf8'));
+      assert.strictEqual(marker.serverVersion, fx.manifest.serverVersion, `round ${round}: marker version survives`);
+      assert.strictEqual(
+        String(marker.bundleSha256).toLowerCase(),
+        fx.manifest.runtime.archive.sha256.toLowerCase(),
+        `round ${round}: marker bundle hash survives`
+      );
+
+      // Collect the loser's owned staging copies across every round; the
+      // aggregate count is the leak metric, so one failure reports the total.
+      for (const name of ownedStaging()) leftovers.push(`round ${round}: ${name}`);
+    }
+    assert.ok(adoptionRounds > 0, 'the parallel fixture must actually exercise at least one adoption');
+    assert.deepStrictEqual(
+      leftovers,
+      [],
+      `${leftovers.length} owned .staging-* cop${leftovers.length === 1 ? 'y survives' : 'ies survive'} a successful adoption; ${leftovers.join('; ')}`
+    );
+  } finally {
+    fs.rmSync(fx.root, { recursive: true, force: true });
+  }
+});

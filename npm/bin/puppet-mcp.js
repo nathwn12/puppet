@@ -456,6 +456,17 @@ async function ensureRuntime(manifest, cacheDir) {
       JSON.stringify({ serverVersion: manifest.serverVersion, bundleSha256: rt.archive.sha256.toLowerCase() }, null, 2)
     );
     const published = publishStaging(staging, cacheDir, rt, manifest);
+    // On 'adopted' a sibling won the publish race, so this process's fully
+    // extracted staging copy is an owned duplicate that nothing else references.
+    // Remove only that copy - never the winner's ready cache. A cleanup failure
+    // is surfaced but must not turn a successful adoption into a failure.
+    if (published === 'adopted') {
+      try {
+        fs.rmSync(staging, { recursive: true, force: true });
+      } catch (err) {
+        log(`warning: could not remove owned staging dir ${staging}: ${err.message}`);
+      }
+    }
     log(`runtime cache ready (${published === 'adopted' ? 'adopted from a concurrent launcher' : 'provisioned'}): ${cacheDir}`);
   } catch (err) {
     fs.rmSync(staging, { recursive: true, force: true });
