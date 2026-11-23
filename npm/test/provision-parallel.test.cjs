@@ -230,73 +230,82 @@ test('two launchers provisioning the same version in parallel both succeed', asy
   }
 });
 
-test('a successful adoption removes the losing launcher owned staging copy', async () => {
+test('post-publish adoption removes the owned staging copy (deterministic local fixture)', async () => {
   const fx = makePackage();
   const parent = path.dirname(fx.cache);
   const prefix = `${path.basename(fx.cache)}.staging-`;
   const ownedStaging = () =>
     fs.existsSync(parent) ? fs.readdirSync(parent).filter((name) => name.startsWith(prefix)) : [];
-  let adoptionRounds = 0;
-  const leftovers = [];
   try {
-    for (let round = 0; round < 8; round++) {
-      fs.rmSync(fx.cache, { recursive: true, force: true });
-      // Clear copies from earlier rounds so this assertion is about these two
-      // launchers only; every path removed here is inside the disposable fixture.
-      for (const name of ownedStaging()) {
-        fs.rmSync(path.join(parent, name), { recursive: true, force: true });
-      }
+    fs.mkdirSync(parent, { recursive: true });
+    for (const name of ownedStaging()) fs.rmSync(path.join(parent, name), { recursive: true, force: true });
+    fs.rmSync(fx.cache, { recursive: true, force: true });
 
-      const [a, b] = await Promise.all([
-        runLauncher(fx.pkg, fx.bundle, fx.cache),
-        runLauncher(fx.pkg, fx.bundle, fx.cache),
-      ]);
-
-      // Outcome survives: both launchers provision successfully, neither is
-      // turned into a failure because a sibling published first.
-      for (const [name, r] of [['A', a], ['B', b]]) {
-        assert.match(
-          r.err,
-          /runtime cache ready/,
-          `round ${round} launcher ${name} must end with a ready cache; stderr:\n${r.err}`
-        );
-        assert.doesNotMatch(
-          r.err,
-          /provisioning failed/,
-          `round ${round} launcher ${name} must not fail because a sibling won; stderr:\n${r.err}`
-        );
-      }
-      if (/adopted from a concurrent launcher/.test(a.err + b.err)) adoptionRounds++;
-
-      // The winning ready dir, its server contents and its marker survive.
-      assert.strictEqual(
-        launcher.targetReady(fx.cache, fx.manifest.runtime, fx.manifest),
-        true,
-        `round ${round}: the winning cache stays valid`
+    // Publish a valid ready cache at the cache path only AFTER this launcher has
+    // created its own staging dir. At that point its early reuse/adopt checks and
+    // the cache removal at :439 are behind it, so publishStaging must take the
+    // exact post-publish 'adopted' branch. The winner is built from the same
+    // local fixture bytes; no network and no remote binary.
+    const publishWinner = () => {
+      fs.mkdirSync(fx.cache, { recursive: true });
+      fs.writeFileSync(path.join(fx.cache, 'puppet.exe'), SERVER_BYTES);
+      fs.writeFileSync(
+        path.join(fx.cache, '.ready'),
+        JSON.stringify({
+          serverVersion: fx.manifest.serverVersion,
+          bundleSha256: fx.manifest.runtime.archive.sha256,
+        })
       );
-      assert.deepStrictEqual(
-        fs.readFileSync(path.join(fx.cache, 'puppet.exe')),
-        SERVER_BYTES,
-        `round ${round}: the winning server contents survive`
-      );
-      const marker = JSON.parse(fs.readFileSync(path.join(fx.cache, '.ready'), 'utf8'));
-      assert.strictEqual(marker.serverVersion, fx.manifest.serverVersion, `round ${round}: marker version survives`);
-      assert.strictEqual(
-        String(marker.bundleSha256).toLowerCase(),
-        fx.manifest.runtime.archive.sha256.toLowerCase(),
-        `round ${round}: marker bundle hash survives`
-      );
+    };
+    const winner = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        watcher.close();
+        reject(new Error('staging dir never appeared; cannot force post-publish adoption'));
+      }, 15000);
+      let watcher;
+      watcher = fs.watch(parent, (_event, filename) => {
+        const base = typeof filename === 'string' ? path.basename(filename) : '';
+        if (!base.startsWith(prefix)) return;
+        watcher.close();
+        clearTimeout(timer);
+        try {
+          publishWinner();
+          resolve();
+        } catch (err) {
+          reject(err);
+        }
+      });
+    });
 
-      // Collect the loser's owned staging copies across every round; the
-      // aggregate count is the leak metric, so one failure reports the total.
-      for (const name of ownedStaging()) leftovers.push(`round ${round}: ${name}`);
-    }
-    assert.ok(adoptionRounds > 0, 'the parallel fixture must actually exercise at least one adoption');
-    assert.deepStrictEqual(
-      leftovers,
-      [],
-      `${leftovers.length} owned .staging-* cop${leftovers.length === 1 ? 'y survives' : 'ies survive'} a successful adoption; ${leftovers.join('; ')}`
+    const [r] = await Promise.all([runLauncher(fx.pkg, fx.bundle, fx.cache), winner]);
+
+    // Branch proof: an extraction in this process followed by the adopt log is
+    // the post-publish path. The early-adopt log at :395 has no extraction line.
+    assert.match(r.err, /extracted \d+ entries/, `launcher must extract into staging; stderr:\n${r.err}`);
+    assert.match(
+      r.err,
+      /runtime cache ready \(adopted from a concurrent launcher\)/,
+      `launcher must take the post-publish adopt branch; stderr:\n${r.err}`
     );
+    assert.doesNotMatch(r.err, /provisioning failed/, `adoption must not be reported as failure; stderr:\n${r.err}`);
+
+    // The winning ready dir, its server contents and its marker survive.
+    assert.strictEqual(
+      launcher.targetReady(fx.cache, fx.manifest.runtime, fx.manifest),
+      true,
+      'the winning cache stays valid'
+    );
+    assert.deepStrictEqual(fs.readFileSync(path.join(fx.cache, 'puppet.exe')), SERVER_BYTES, 'winning server contents survive');
+    const marker = JSON.parse(fs.readFileSync(path.join(fx.cache, '.ready'), 'utf8'));
+    assert.strictEqual(marker.serverVersion, fx.manifest.serverVersion, 'marker version survives');
+    assert.strictEqual(
+      String(marker.bundleSha256).toLowerCase(),
+      fx.manifest.runtime.archive.sha256.toLowerCase(),
+      'marker bundle hash survives'
+    );
+
+    // The owned staging copy must be gone on success.
+    assert.deepStrictEqual(ownedStaging(), [], `no owned .staging-* copy may survive; found: ${ownedStaging().join(', ')}`);
   } finally {
     fs.rmSync(fx.root, { recursive: true, force: true });
   }
