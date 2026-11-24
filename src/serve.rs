@@ -105,7 +105,7 @@ fn tools_list_result() -> String {
 fn discover_result() -> String {
     let supported: Vec<Value> = ALL_VERSIONS.iter().map(|v| Value::from(*v)).collect();
     format!(
-        "{{\"supportedVersions\":{},\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}},\"serverInfo\":{{\"name\":\"puppet\",\"version\":{}}},\"instructions\":{},\"resultType\":\"complete\"}}",
+        "{{\"supportedVersions\":{},\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}},\"serverInfo\":{{\"name\":\"puppet\",\"version\":{}}},\"instructions\":{}}}",
         serde_json::to_string(&Value::Array(supported)).unwrap(),
         serde_json::to_string(env!("CARGO_PKG_VERSION")).unwrap(),
         serde_json::to_string(&crate::claims::instructions()).unwrap()
@@ -125,6 +125,19 @@ fn with_result_type(result: &str) -> String {
     let t = result.trim_end();
     match t.strip_suffix('}') {
         Some(body) => format!("{body},\"resultType\":\"complete\"}}"),
+        None => result.to_string(),
+    }
+}
+
+// The completion envelope OpenCode 2.4.1 requires on modern tools/list and
+// server/discover. Kept separate from with_result_type so tools/call keeps
+// its legacy shape: it still gets resultType only, never cache metadata.
+fn with_completion_envelope(result: &str) -> String {
+    let t = result.trim_end();
+    match t.strip_suffix('}') {
+        Some(body) => {
+            format!("{body},\"resultType\":\"complete\",\"ttlMs\":0,\"cacheScope\":\"private\"}}")
+        }
         None => result.to_string(),
     }
 }
@@ -927,11 +940,13 @@ fn handle_fast<W: Write>(
             let p = v.get("params").cloned().unwrap_or(Value::Null);
             write_result(sink, &id, &init_result(&p)).is_err()
         }
-        "server/discover" => write_result(sink, &id, &discover_result()).is_err(),
+        "server/discover" => {
+            write_result(sink, &id, &with_completion_envelope(&discover_result())).is_err()
+        }
         "tools/list" => {
             let r = tools_list_result();
             if modern {
-                write_result(sink, &id, &with_result_type(&r)).is_err()
+                write_result(sink, &id, &with_completion_envelope(&r)).is_err()
             } else {
                 write_result(sink, &id, &r).is_err()
             }

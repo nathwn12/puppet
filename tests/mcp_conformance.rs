@@ -235,6 +235,91 @@ fn tools_list_modern_carries_result_type() {
 }
 
 #[test]
+fn completion_metadata_on_list_and_discover_only() {
+    let mut s = Session::spawn();
+
+    // Real OpenCode 2.4.1 requires the full completion envelope on a modern
+    // tools/list: resultType, ttlMs and cacheScope, all three.
+    let resp = s.send(&frame(1, "tools/list", meta_params(serde_json::json!({}))));
+    let result = resp.get("result").expect("modern tools/list has result");
+    assert_eq!(
+        result.get("resultType").and_then(|v| v.as_str()),
+        Some("complete"),
+        "modern tools/list must keep resultType complete, got: {result}"
+    );
+    assert_eq!(
+        result.get("ttlMs").and_then(|v| v.as_i64()),
+        Some(0),
+        "modern tools/list must carry ttlMs:0, got: {result}"
+    );
+    assert_eq!(
+        result.get("cacheScope").and_then(|v| v.as_str()),
+        Some("private"),
+        "modern tools/list must carry cacheScope:private, got: {result}"
+    );
+
+    // Legacy tools/list keeps its old shape: no completion envelope.
+    let resp = s.send(&frame(2, "tools/list", serde_json::json!({})));
+    let result = resp.get("result").expect("legacy tools/list has result");
+    for field in ["resultType", "ttlMs", "cacheScope"] {
+        assert!(
+            result.get(field).is_none(),
+            "legacy tools/list must not carry {field}, got: {result}"
+        );
+    }
+
+    // server/discover carries the same completion envelope.
+    let resp = s.send(&frame(3, "server/discover", serde_json::json!({})));
+    let result = resp.get("result").expect("server/discover has result");
+    assert_eq!(
+        result.get("resultType").and_then(|v| v.as_str()),
+        Some("complete"),
+        "server/discover must keep resultType complete, got: {result}"
+    );
+    assert_eq!(
+        result.get("ttlMs").and_then(|v| v.as_i64()),
+        Some(0),
+        "server/discover must carry ttlMs:0, got: {result}"
+    );
+    assert_eq!(
+        result.get("cacheScope").and_then(|v| v.as_str()),
+        Some("private"),
+        "server/discover must carry cacheScope:private, got: {result}"
+    );
+
+    // tools/call is preserved on both paths: no cache metadata here.
+    let resp = s.send(&frame(
+        4,
+        "tools/call",
+        serde_json::json!({"name": "list_windows", "arguments": {}}),
+    ));
+    let result = resp.get("result").expect("legacy tools/call has result");
+    for field in ["ttlMs", "cacheScope"] {
+        assert!(
+            result.get(field).is_none(),
+            "legacy tools/call must not carry {field}, got: {result}"
+        );
+    }
+    let resp = s.send(&frame(
+        5,
+        "tools/call",
+        meta_params(serde_json::json!({"name": "list_windows", "arguments": {}})),
+    ));
+    let result = resp.get("result").expect("modern tools/call has result");
+    assert_eq!(
+        result.get("resultType").and_then(|v| v.as_str()),
+        Some("complete"),
+        "modern tools/call must keep resultType complete, got: {result}"
+    );
+    for field in ["ttlMs", "cacheScope"] {
+        assert!(
+            result.get(field).is_none(),
+            "modern tools/call must not carry {field}, got: {result}"
+        );
+    }
+}
+
+#[test]
 fn tools_call_result_type_modern_only() {
     let mut s = Session::spawn();
     let resp = s.send(&frame(
