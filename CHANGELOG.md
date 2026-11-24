@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Modern MCP `tools/list` and `server/discover` replies now carry the full
+  completion envelope `resultType:"complete"`, `ttlMs:0` and
+  `cacheScope:"private"` that OpenCode 2.4.1 requires. Legacy `tools/list`
+  and every `tools/call` reply keep their previous shape.
 - `puppet-mcp` (npm launcher): provisioning no longer clears a cache path that
   another process may have published. The creator claims the path with one atomic
   `mkdir`, extracts into it, and writes `.ready` last via an atomic rename; a
