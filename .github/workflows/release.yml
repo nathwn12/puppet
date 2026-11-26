@@ -22,8 +22,11 @@
 #           npm/engine-manifest.json.
 #   publish (ubuntu-latest) re-derives on the same commit as a provenance
 #           check, skips a tag older than the current release, creates the tag,
-#           creates the current release from those artifacts and publishes
-#           npm over OIDC trusted publishing (no token; provenance is automatic).
+#           amends the ONE rolling GitHub Release page (product tag `puppet`) in
+#           place from those artifacts, then publishes npm over OIDC trusted
+#           publishing (no token; provenance is automatic). No per-version page
+#           is created: the `v*` tags stay, each version's asset is appended to
+#           the one page, and old npm versions keep resolving the URLs they pinned.
 #
 # Verification of the PUBLISHED package (a stranger's registry install + boot) is
 # deliberately NOT here: it lives in verify-published.yml, dispatched by hand,
@@ -34,9 +37,9 @@
 # workflow_dispatch is the rehearsal lane: it derives the same version from the
 # DISPATCHED REF's history (the branch or tag the run was started on, i.e.
 # github.ref / github.sha) and runs the identical build + pre-publish cleanroom
-# gate, then skips tag creation, release creation, npm publish and
-# outgoing-release deletion for as long as dry_run (default true) holds. A dry
-# run therefore proves the build and the gate without touching the registry,
+# gate, then skips tag creation, release-page amendment and npm publish for as
+# long as dry_run (default true) holds. A dry run therefore proves the build and
+# the gate without touching the registry,
 # the Releases API or the tag namespace.
 #
 # The dispatch's optional `commit` input is an ASSERTION, never the checkout
@@ -236,9 +239,14 @@ jobs:
           if ($man.package -ne 'puppet-mcp') { throw "manifest package $($man.package) != puppet-mcp" }
           # Fill the release-computed hashes from the real artifacts.
           $repo = 'https://github.com/nathwn12/puppet'
+          $productTag = 'puppet'
           $bundle = "puppet-$tag-windows-x86_64.zip"
           $server = Get-Item -LiteralPath target\release\puppet.exe
-          $man.runtime.source = "$repo/releases/download/$tag"
+          # One rolling product page, the gladius model: the page URL is stable
+          # and each version's asset is appended under its own versioned name.
+          # Nothing is deleted, so every already-published npm version still
+          # resolves the v<version> URL it pinned; only NEW versions pin this.
+          $man.runtime.source = "$repo/releases/download/$productTag"
           $man.runtime.archive.name = $bundle
           $man.runtime.archive.sha256 = Get-Sha "dist\$bundle"
           $man.runtime.archive.size = (Get-Item -LiteralPath "dist\$bundle").Length
@@ -349,6 +357,9 @@ jobs:
     # it here, never read from the environment's ref.
     env:
       RELEASE_TAG: v${{ needs.build.outputs.version }}
+      # The single rolling release page (the gladius product-tag model).
+      # Version tags are separate and are never moved or deleted.
+      PRODUCT_TAG: puppet
     steps:
       - uses: actions/checkout@v7
         with:
@@ -422,14 +433,16 @@ jobs:
           git tag -a "$RELEASE_TAG" -m "$RELEASE_TAG" "$sha"
           git push origin "refs/tags/$RELEASE_TAG"
           echo "tagged $sha as $RELEASE_TAG"
-      # Irreversible step 1/3: creating the public release. Skipped only on a
-      # rehearsal dispatch; the tag above is the one this attaches to, and the
-      # body is the changelog section this run closed.
+      # Irreversible step 1/3: amending the single public product page.
+      # Skipped only on a rehearsal dispatch; the `puppet` page is updated in
+      # place (versioned assets appended, never removed) and the body is the
+      # changelog section this run closed. The `v*` tag above still names this
+      # version; no tag is moved or deleted.
       - name: attach archives to the GitHub Release
         if: steps.release_mode.outputs.current == 'true' && (github.event_name != 'workflow_dispatch' || inputs.dry_run == false)
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ env.RELEASE_TAG }}
+          tag_name: ${{ env.PRODUCT_TAG }}
           name: ${{ github.event.repository.name }} ${{ env.RELEASE_TAG }}
           body_path: dist/release-notes.md
           overwrite_files: true
@@ -496,7 +509,7 @@ jobs:
             echo "::error::manifest serverVersion $man_ver != derived version $version"
             exit 1
           fi
-          node -e "const m=require('./npm-pkg/engine-manifest.json'); const tag=process.env.RELEASE_TAG; const src=(m.runtime&&m.runtime.source)||''; const arc=(m.runtime&&m.runtime.archive&&m.runtime.archive.name)||''; if(!src.includes(tag)||!arc.includes(tag)){ console.error('::error::manifest runtime.source/archive do not name tag '+tag+': '+src+' / '+arc); process.exit(1); } console.log('manifest OK: serverVersion '+m.serverVersion+', runtime '+src+' / '+arc)"
+          node -e "const m=require('./npm-pkg/engine-manifest.json'); const tag=process.env.RELEASE_TAG; const product=process.env.PRODUCT_TAG; const src=(m.runtime&&m.runtime.source)||''; const arc=(m.runtime&&m.runtime.archive&&m.runtime.archive.name)||''; if(!src.endsWith('/download/'+product)||!arc.includes(tag)){ console.error('::error::manifest runtime.source must name the product page '+product+' and the archive must name '+tag+': '+src+' / '+arc); process.exit(1); } console.log('manifest OK: serverVersion '+m.serverVersion+', runtime '+src+' / '+arc)"
           if npm view "$pkg@$version" version >/dev/null 2>&1; then
             published="$(npm view "$pkg@$version" version)"
             tarball="$(npm view "$pkg@$version" dist.tarball)"
