@@ -1,0 +1,52 @@
+name: automerge-docs
+
+# Docs-only pull requests can land without a human waiting on them. The file
+# list is re-derived from the GitHub API -- never from a checkout of untrusted
+# PR code -- and only *.md, docs/ and LICEN[CS]E paths qualify. A code file
+# anywhere in the diff leaves the PR for a human.
+#
+# The merge is armed, not forced: `gh pr merge --auto --squash` hands the PR to
+# GitHub's native auto-merge, which still waits for every required check and
+# every required review before it squashes. A red gate never lands here.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, labeled, ready_for_review]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: automerge-docs-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  automerge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Re-derive the changed files from the API
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docs='^(.*\.md|docs/.*|LICEN[CS]E(\.md)?)$'
+          files="$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename')"
+          if [ -z "$files" ]; then
+            echo "automerge-docs: no changed files; nothing to arm"
+            exit 1
+          fi
+          code="$(printf '%s\n' "$files" | grep -vE "$docs" || true)"
+          if [ -n "$code" ]; then
+            echo "automerge-docs: not docs-only, leaving the PR for a human:"
+            printf '%s\n' "$code"
+            exit 1
+          fi
+          echo "automerge-docs: docs-only ($(printf '%s\n' "$files" | wc -l) file(s))"
+
+      - name: Arm squash auto-merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr merge --auto --squash "${{ github.event.pull_request.html_url }}"
