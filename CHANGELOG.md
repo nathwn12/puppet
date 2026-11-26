@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- release: publish to the single rolling `puppet` product page, amended in place,
+  instead of creating a page per version. Version tags are still created and left
+  untouched; each version's asset is appended under its own name so pinned URLs
+  stay resolvable.
+
 ## [8.0.3] - 2026-11-26
 
 ### Changed
