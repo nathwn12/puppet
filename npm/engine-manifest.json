@@ -1,5 +1,5 @@
 {
-  "_comment": "Pinned server manifest for the puppet-mcp launcher. The published package holds ONLY this launcher plus this manifest (no server bytes). On first run the launcher downloads ONLY runtime.archive from the tagged GitHub Release, verifying its sha256 before and after extraction. The release workflow fills the runtime.* hashes it computes from the real build artifacts; the committed manifest carries placeholders the launcher refuses to run with.",
+  "_comment": "Pinned server manifest for the puppet-mcp launcher. npm IS the release: the built runtime zip ships inside this tarball under bin/ (no GitHub Release page exists). On first run the launcher provisions from that bundled zip, verifying its sha256 and size before extraction and the extracted server after; versions published before the tarball carried a zip fall back to the tagged Release URL in runtime.source, verified the same way. The release workflow fills the runtime.* hashes it computes from the real build artifacts; the committed manifest carries placeholders the launcher refuses to run with.",
   "package": "puppet-mcp",
   "serverVersion": "8.0.4",
   "runtime": {
