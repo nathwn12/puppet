@@ -1,0 +1,14 @@
+project: Q:/PROJECTS/PERSONAL/public/puppet
+goal: |-
+  Adopt the canonical generic docs structure and phase-1 checker locally, report-only.
+seam: |-
+  AGENTS.md, spec/docs-structure.md, spec/checker.md, docs-check.mjs, docs-check.json, .gitattributes, .nstack/plan.yaml, adr/0001-vendor-docs-gate.yaml, .github/workflows/docs-report.yml
+check: |-
+  node docs-check.mjs --report exits 0; a planted wrong checker SHA makes --strict exit 1 with an exact SHA mismatch on the real checkout; the byte-exact restored config makes --strict exit 0; git diff --cached --check exits 0; staged paths are exact; git status --short is clean after the commit.
+undo: |-
+  git revert <sha>
+state: |-
+  Decision and spec recorded first; checker vendored second. Local-only commit, no push.
+log:
+  - cycle: 0
+    note: plan, spec and ADR written before the vendored pair; report clean; strict proven red then green; receipt recorded on the commit.
