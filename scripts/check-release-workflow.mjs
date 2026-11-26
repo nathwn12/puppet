@@ -162,14 +162,23 @@ check("changelog-before-tag", () => {
   return "closed in build after the test; no tag in build";
 });
 
-check("tag-before-attach", () => {
+check("no-github-release-page", () => {
+  need(!/softprops\/action-gh-release/.test(text), "the workflow still attaches assets with softprops/action-gh-release");
+  need(!/^\s+- name: attach archives to the GitHub Release\s*$/m.test(text), "the GitHub Release attach step is still present");
+  need(!/\bgh release (?:create|edit|upload|delete)\b/.test(text), "the workflow creates, amends or deletes a GitHub Release page");
+  need(!/^\s+PRODUCT_TAG:/m.test(text), "a rolling product tag is still configured for a release page");
+  need(indexOf(buildSteps, /^attach archives/) < 0 && indexOf(publishSteps, /^attach archives/) < 0, "an attach step remains in build or publish");
+  return "no release page is created, amended or deleted; npm is the release";
+});
+
+check("tag-guarded", () => {
   const tag = at(publishSteps, /^create the release tag$/);
-  const attach = at(publishSteps, /^attach archives to the GitHub Release$/);
-  need(tag + 1 === attach, `the tag (#${tag}) must be created immediately before the attach (#${attach}), found #${tag} then #${attach}`);
+  const pub = at(publishSteps, /^publish to npm/);
+  need(tag < pub, `the tag (#${tag}) must precede npm publish (#${pub})`);
   const raw = publishSteps[tag].raw;
   need(/release_mode\.outputs\.current/.test(raw), "the tag step is not guarded by the stale-tag check");
   need(/inputs\.dry_run == false/.test(raw), "the tag step is not guarded by dry_run");
-  return `tag #${tag} immediately before attach #${attach}, guarded by stale check + dry_run`;
+  return `tag #${tag} before npm publish #${pub}, guarded by stale check + dry_run`;
 });
 
 check("publish-reads-derived-tag", () => {
@@ -180,11 +189,16 @@ check("publish-reads-derived-tag", () => {
   return "publish tags v${{ needs.build.outputs.version }}";
 });
 
-check("retain-historical-releases", () => {
-  const cleanup = publishSteps.find((s) => /delete outgoing releases/i.test(s.name ?? ""));
-  need(!cleanup, "publish must retain historical releases and their runtime assets");
-  need(!/gh release delete/.test(publish), "publish runs gh release delete");
-  return "historical releases and runtime assets are retained";
+check("runtime-ships-in-npm", () => {
+  const stage = at(buildSteps, /^stage npm package from the filled manifest$/);
+  const raw = buildSteps[stage].raw;
+  need(/npm-stage\\bin/.test(raw), "the built runtime zip is not copied into npm-stage/bin");
+  need(/dist\\/.test(raw) && /bundle/.test(raw), "the staged zip is not sourced from the built archive");
+  need(/stageFiles/.test(raw), "the staged runtime zip is not covered by the stage-file assertions");
+  need(indexOf(publishSteps, /^assert runtime bundle rides in the npm tarball$/) >= 0, "publish does not assert the runtime zip is inside the tarball");
+  const clean = buildSteps[at(buildSteps, /^cleanroom check/)].raw;
+  need(!/--bundle/.test(clean), "the cleanroom is still fed an external bundle instead of the tarball's own");
+  return "built zip staged into npm-stage/bin, asserted in publish, cleanroom installs the tarball as-is";
 });
 
 const w = (s, n) => s.padEnd(n);

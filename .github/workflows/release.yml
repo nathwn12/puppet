@@ -1,13 +1,14 @@
 # puppet release: derive the version from history, build the server binary,
-# then tag and publish.
+# then tag and publish to npm. npm IS the release: no GitHub Release page is
+# created, amended or deleted, and no release asset is uploaded.
 #
 # Trigger: a `v*` tag push (a rerun of an existing release), or a dispatch that
 # names the commit to release. NOBODY TYPES A VERSION ANY MORE: the run derives
 # it from the commits since the last release (scripts/derive-release.mjs), so a
 # version that disagrees with the tree can no longer be typed in and discovered
 # by a human afterwards. The tag is produced by the publish job, immediately
-# before the release is attached, so an untagged commit is the normal case and
-# the tag always names the version the derivation proved.
+# before npm publish, so an untagged commit is the normal case and the tag
+# always names the version the derivation proved.
 #
 # Two jobs share one derived version and one commit:
 #   build   (windows-latest) asserts the workflow's own shape, derives the
@@ -22,11 +23,13 @@
 #           npm/engine-manifest.json.
 #   publish (ubuntu-latest) re-derives on the same commit as a provenance
 #           check, skips a tag older than the current release, creates the tag,
-#           amends the ONE rolling GitHub Release page (product tag `puppet`) in
-#           place from those artifacts, then publishes npm over OIDC trusted
-#           publishing (no token; provenance is automatic). No per-version page
-#           is created: the `v*` tags stay, each version's asset is appended to
-#           the one page, and old npm versions keep resolving the URLs they pinned.
+#           then publishes npm over OIDC trusted publishing (no token;
+#           provenance is automatic). NO GitHub Release page is created,
+#           amended or deleted: the server runtime zip rides inside the npm
+#           tarball under bin/, and the launcher provisions it on first run.
+#           Versions published before the tarball carried the bundle fall back
+#           to the release URL their manifest pinned; the v* tags stay as
+#           history's version markers only.
 #
 # Verification of the PUBLISHED package (a stranger's registry install + boot) is
 # deliberately NOT here: it lives in verify-published.yml, dispatched by hand,
@@ -37,10 +40,9 @@
 # workflow_dispatch is the rehearsal lane: it derives the same version from the
 # DISPATCHED REF's history (the branch or tag the run was started on, i.e.
 # github.ref / github.sha) and runs the identical build + pre-publish cleanroom
-# gate, then skips tag creation, release-page amendment and npm publish for as
-# long as dry_run (default true) holds. A dry run therefore proves the build and
-# the gate without touching the registry,
-# the Releases API or the tag namespace.
+# gate, then skips tag creation and npm publish for as long as dry_run
+# (default true) holds. A dry run therefore proves the build and the gate
+# without touching the registry or the tag namespace.
 #
 # The dispatch's optional `commit` input is an ASSERTION, never the checkout
 # source: it is resolved to a full SHA against the fetched history and must be
@@ -52,7 +54,7 @@
 # Action majors mirror the gladius release workflow (verified against the
 # GitHub Releases API on 2026-10-17 there):
 # checkout v7 (v7.0.1), setup-node v7 (v7.1.0), upload-artifact v7 (v7.0.2),
-# download-artifact v8 (v8.0.2), softprops/action-gh-release v3 (v3.0.3).
+# download-artifact v8 (v8.0.2). No release-page action remains in this lane.
 # The toolchain is pinned to the MSRV floor (1.87: rust-toolchain.toml and
 # Cargo.toml rust-version agree, and jpeg-encoder 0.7.1 in Cargo.lock is the
 # crate that sets that floor - it declares rust-version 1.87), not to the
@@ -74,7 +76,7 @@ on:
         type: string
         default: ''
       dry_run:
-        description: 'Rehearse only: skip tag creation, release creation, npm publish and outgoing-release deletion'
+        description: 'Rehearse only: skip tag creation and npm publish'
         required: false
         type: boolean
         default: true
@@ -170,10 +172,10 @@ jobs:
       # The changelog heading is produced by the run, AFTER the gate and before
       # any tag exists: a red build never closes a section. Idempotent, so a
       # rerun over an already-closed section changes nothing. The closed
-      # section doubles as the release body (dist/release-notes.md), which is
-      # why it is written to dist/ rather than committed: the tag names a
-      # commit whose history is the proof, and a release run is not a writer of
-      # repo content.
+      # section is written to dist/release-notes.md as this run's audit trail
+      # (npm is the release; no page consumes it), which is why it is written
+      # to dist/ rather than committed: the tag names a commit whose history
+      # is the proof, and a release run is not a writer of repo content.
       - name: close the changelog section
         shell: bash
         run: node scripts/derive-release.mjs --changelog --notes-out dist/release-notes.md
@@ -186,9 +188,10 @@ jobs:
           # Runtime bundle: the server plus the licence, readme and
           # third-party notices (README.md links to THIRD-PARTY-NOTICES.md,
           # so the link must resolve inside the extracted bundle). The
-          # launcher provisions this bundle from the GitHub Release on
-          # first run (see npm/bin/puppet-mcp.js); no other bytes ride
-          # the release.
+          # launcher provisions this bundle from the npm tarball on first
+          # run (see npm/bin/puppet-mcp.js); the tarball IS the release.
+          # Versions published before the tarball carried a bundle still
+          # fall back to the release URL their manifest pinned.
           $stage = "dist\puppet-$tag-windows-x86_64"
           New-Item -ItemType Directory -Path $stage -Force | Out-Null
           $bundleFiles = @('puppet.exe', 'LICENSE', 'README.md', 'THIRD-PARTY-NOTICES.md')
@@ -238,15 +241,13 @@ jobs:
           if ($man.serverVersion -ne $ver) { throw "manifest serverVersion $($man.serverVersion) != derived version $ver" }
           if ($man.package -ne 'puppet-mcp') { throw "manifest package $($man.package) != puppet-mcp" }
           # Fill the release-computed hashes from the real artifacts.
-          $repo = 'https://github.com/nathwn12/puppet'
-          $productTag = 'puppet'
           $bundle = "puppet-$tag-windows-x86_64.zip"
           $server = Get-Item -LiteralPath target\release\puppet.exe
-          # One rolling product page, the gladius model: the page URL is stable
-          # and each version's asset is appended under its own versioned name.
-          # Nothing is deleted, so every already-published npm version still
-          # resolves the v<version> URL it pinned; only NEW versions pin this.
-          $man.runtime.source = "$repo/releases/download/$productTag"
+          # npm IS the release: the built zip is copied into npm-stage/bin
+          # below, so first run provisions from the tarball, not a page.
+          # runtime.source stays the committed v<version> URL: it is only a
+          # fallback for versions published before the tarball carried the
+          # bundle, and it is never written by this lane.
           $man.runtime.archive.name = $bundle
           $man.runtime.archive.sha256 = Get-Sha "dist\$bundle"
           $man.runtime.archive.size = (Get-Item -LiteralPath "dist\$bundle").Length
@@ -257,7 +258,8 @@ jobs:
           Copy-Item npm/engine-manifest.json dist/engine-manifest.json
           Write-Host "manifest filled for $tag (serverVersion $ver, asserted not written)"
       # The npm-package artifact is populated HERE, after the fill above,
-      # from the filled bytes — never from a stale or pre-fill copy.
+      # from the filled bytes — never from a stale or pre-fill copy. The
+      # built runtime zip is copied into bin/ so the tarball IS the release.
       - name: stage npm package from the filled manifest
         shell: pwsh
         run: |
@@ -269,8 +271,11 @@ jobs:
           # signature-glyph.svg, so both ride the tarball: a published README
           # that references a file the tarball does not contain is the exact
           # defect this stage list exists to prevent.
+          $bundle = "puppet-$env:RELEASE_TAG-windows-x86_64.zip"
+          if (-not (Test-Path -LiteralPath "dist\$bundle")) { throw "built runtime bundle missing: dist\$bundle" }
+          Copy-Item -LiteralPath "dist\$bundle" -Destination "npm-stage\bin\$bundle" -Force
           Copy-Item npm/package.json, npm/engine-manifest.json, npm/LICENSE, npm/README.md, THIRD-PARTY-NOTICES.md, npm/signature-glyph.svg npm-stage/ -Force
-          $stageFiles = @('package.json', 'engine-manifest.json', 'LICENSE', 'README.md', 'THIRD-PARTY-NOTICES.md', 'signature-glyph.svg', 'bin\puppet-mcp.js')
+          $stageFiles = @('package.json', 'engine-manifest.json', 'LICENSE', 'README.md', 'THIRD-PARTY-NOTICES.md', 'signature-glyph.svg', 'bin\puppet-mcp.js', "bin\$bundle")
           foreach ($f in $stageFiles) {
             if (-not (Test-Path -LiteralPath (Join-Path npm-stage $f))) { throw "npm package stage is missing $f" }
           }
@@ -286,17 +291,20 @@ jobs:
           $a = (Get-FileHash -Algorithm SHA256 -LiteralPath npm/engine-manifest.json).Hash
           $b = (Get-FileHash -Algorithm SHA256 -LiteralPath npm-stage/engine-manifest.json).Hash
           if ($a -ne $b) { throw 'staged manifest differs from the filled manifest' }
-          Write-Host "npm package staged with $($stageFiles.Count) files and filled manifest $a"
+          $c = (Get-FileHash -Algorithm SHA256 -LiteralPath "dist\$bundle").Hash.ToLowerInvariant()
+          $d = (Get-FileHash -Algorithm SHA256 -LiteralPath "npm-stage\bin\$bundle").Hash.ToLowerInvariant()
+          if ($c -ne $d) { throw 'staged runtime bundle differs from the built archive' }
+          Write-Host "npm package staged with $($stageFiles.Count) files, manifest $a, runtime $c"
       # Pre-publish clean room: install the staged package like a stranger
       # (scrubbed profile, empty caches) and prove the engine provisions and
       # the server boots. Same build job, blocking: any FAIL fails the build,
       # so publish (needs: build) can never run on a red gate.
-      # --bundle feeds the gate the archive built in THIS job (dist\*.zip):
-      # the GitHub Release that would serve it is created by publish, which
-      # runs after this, so downloading it here can only 404. The launcher
-      # still verifies the local zip's size and sha256 against the filled
-      # manifest, so a wrong archive fails the gate exactly like a bad
-      # download would — the check keeps its teeth.
+      # No --bundle here on purpose: the built zip rides inside the staged
+      # tarball bin/ directory, so this install is byte-for-byte the shape
+      # a stranger gets from npm, with no GitHub Release in existence yet.
+      # The launcher still verifies the bundled zip size and sha256 against
+      # the filled manifest, so a wrong archive fails the gate exactly like
+      # a bad download would — the check keeps its teeth.
       - name: cleanroom check (tarball install + boot)
         shell: pwsh
         run: |
@@ -314,7 +322,7 @@ jobs:
           $tgz = Join-Path $pack $name
           $bundle = "dist\puppet-$tag-windows-x86_64.zip"
           if (-not (Test-Path -LiteralPath $bundle)) { throw "built archive missing: $bundle" }
-          node scripts/cleanroom-check.mjs --tarball "$tgz" --bundle "$bundle"
+          node scripts/cleanroom-check.mjs --tarball "$tgz"
       # Payload-vs-schema conformance on the binary THIS job built: one
       # tools/call per listed tool (diff on two identical PNGs, so the
       # bbox:null shape that once violated its own schema is proven here),
@@ -347,7 +355,7 @@ jobs:
           if-no-files-found: error
           retention-days: 1
   publish:
-    name: tag + github release + npm publish
+    name: tag + npm publish
     needs: [build]
     runs-on: ubuntu-latest
     permissions:
@@ -357,9 +365,8 @@ jobs:
     # it here, never read from the environment's ref.
     env:
       RELEASE_TAG: v${{ needs.build.outputs.version }}
-      # The single rolling release page (the gladius product-tag model).
-      # Version tags are separate and are never moved or deleted.
-      PRODUCT_TAG: puppet
+      # No product tag / release page: npm is the release. The v* tags
+      # below are history version markers and are never moved or deleted.
     steps:
       - uses: actions/checkout@v7
         with:
@@ -433,23 +440,6 @@ jobs:
           git tag -a "$RELEASE_TAG" -m "$RELEASE_TAG" "$sha"
           git push origin "refs/tags/$RELEASE_TAG"
           echo "tagged $sha as $RELEASE_TAG"
-      # Irreversible step 1/3: amending the single public product page.
-      # Skipped only on a rehearsal dispatch; the `puppet` page is updated in
-      # place (versioned assets appended, never removed) and the body is the
-      # changelog section this run closed. The `v*` tag above still names this
-      # version; no tag is moved or deleted.
-      - name: attach archives to the GitHub Release
-        if: steps.release_mode.outputs.current == 'true' && (github.event_name != 'workflow_dispatch' || inputs.dry_run == false)
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ env.PRODUCT_TAG }}
-          name: ${{ github.event.repository.name }} ${{ env.RELEASE_TAG }}
-          body_path: dist/release-notes.md
-          overwrite_files: true
-          files: |
-            dist/*.zip
-            dist/*.zip.sha256
-            dist/engine-manifest.json
       - uses: actions/setup-node@v7
         with:
           node-version: '24'
@@ -491,7 +481,29 @@ jobs:
             }
             console.log('packaged manifest matches built assets: ' + built.runtime.archive.sha256.slice(0, 12) + '… / ' + built.runtime.server.sha256.slice(0, 12) + '…');
           " "$RUNNER_TEMP/packed/manifest.json"
-      # Irreversible step 2/3: npm publish. Same guard: rehearsal dispatch only.
+      # npm IS the release: prove that the exact runtime archive built by
+      # this run rides inside the tarball a stranger will install, before
+      # any bytes reach the registry.
+      - name: assert runtime bundle rides in the npm tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="$(node -p "require('./npm-pkg/engine-manifest.json').runtime.archive.name")"
+          zip="./npm-pkg/bin/$name"
+          test -f "$zip" || { echo "::error::npm tarball has no bundled runtime at $zip"; exit 1; }
+          node -e "
+            const fs = require('fs'), crypto = require('crypto');
+            const m = require('./npm-pkg/engine-manifest.json');
+            const p = './npm-pkg/bin/' + m.runtime.archive.name;
+            const b = fs.readFileSync(p);
+            const sha = crypto.createHash('sha256').update(b).digest('hex');
+            if (b.length !== m.runtime.archive.size || sha !== m.runtime.archive.sha256.toLowerCase()) {
+              console.error('::error::bundled runtime ' + p + ' size ' + b.length + '/' + m.runtime.archive.size + ' sha ' + sha + '/' + m.runtime.archive.sha256);
+              process.exit(1);
+            }
+            console.log('runtime bundle OK: ' + p + ' ' + b.length + ' bytes sha256 ' + sha.slice(0, 12) + '…');
+          "
+      # Irreversible step 2/2: npm publish. Same guard: rehearsal dispatch only.
       - name: publish to npm (OIDC trusted publishing)
         id: publish_npm
         if: steps.release_mode.outputs.current == 'true' && (github.event_name != 'workflow_dispatch' || inputs.dry_run == false)
@@ -509,7 +521,8 @@ jobs:
             echo "::error::manifest serverVersion $man_ver != derived version $version"
             exit 1
           fi
-          node -e "const m=require('./npm-pkg/engine-manifest.json'); const tag=process.env.RELEASE_TAG; const product=process.env.PRODUCT_TAG; const src=(m.runtime&&m.runtime.source)||''; const arc=(m.runtime&&m.runtime.archive&&m.runtime.archive.name)||''; if(!src.endsWith('/download/'+product)||!arc.includes(tag)){ console.error('::error::manifest runtime.source must name the product page '+product+' and the archive must name '+tag+': '+src+' / '+arc); process.exit(1); } console.log('manifest OK: serverVersion '+m.serverVersion+', runtime '+src+' / '+arc)"
+          node -e "const m=require('./npm-pkg/engine-manifest.json'); const tag=process.env.RELEASE_TAG; const arc=(m.runtime&&m.runtime.archive&&m.runtime.archive.name)||''; if(!arc.includes(tag)){ console.error('::error::manifest archive must name '+tag+': '+arc); process.exit(1); } console.log('manifest OK: serverVersion '+m.serverVersion+', archive '+arc+' (bundled in the tarball, no release page)')"
+
           if npm view "$pkg@$version" version >/dev/null 2>&1; then
             published="$(npm view "$pkg@$version" version)"
             tarball="$(npm view "$pkg@$version" dist.tarball)"
