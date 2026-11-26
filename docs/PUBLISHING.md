@@ -1,9 +1,11 @@
 # Publishing puppet-mcp (owner only)
 
 `npx puppet-mcp@latest` installs the launcher in `npm/` plus the pinned
-server manifest. The server binary is fetched on first RUN from the tagged
-GitHub Release — never at install. Do NOT publish, tag, or release from any
-automated session: every step below is a human act, in order.
+server manifest. The server runtime zip rides inside this tarball; the launcher
+provisions and verifies it on first RUN — never at install. Older versions whose
+tarball carried no bundle fall back to the Release URL their manifest pins.
+Do NOT publish, tag, or release from any automated session: every step below
+is a human act, in order.
 
 Prerequisites: an npm account (first publish is manual, with 2FA or a
 granular token), and locally npm >= 11.5.1 with Node >= 22.14.0
@@ -28,10 +30,11 @@ granular token), and locally npm >= 11.5.1 with Node >= 22.14.0
    `rust-toolchain.toml`), runs the suite, closes `## [Unreleased]` into
    `## [X.Y.Z]` and uses that section as the release body, assembles the
    server runtime bundle, and fills `engine-manifest.json` with hashes
-   computed from the REAL artifacts. The tag is created by the publish job,
-   immediately before the release is attached — so nothing exists until the
-   whole gate is green. Its `npm publish` step FAILS on the very first
-   release (no trusted publisher yet) — expected, not a problem. Nothing
+   computed from the REAL artifacts. The tag is created by the publish job
+   immediately before `npm publish`; no GitHub Release page is created or
+   amended — so nothing exists until the whole gate is green. Its `npm publish`
+   step FAILS on the very first release (no trusted publisher yet) — expected,
+   not a problem. Nothing
    reaches npm.
 
    A `v*` tag push still runs the workflow, and is now only for re-running an
@@ -70,10 +73,10 @@ granular token), and locally npm >= 11.5.1 with Node >= 22.14.0
    cannot be re-published by the workflow, which is why the first trusted
    publish rides the NEXT version.
 
-6. Ongoing. Every release dispatch (and every `v*` tag push) is one GitHub
-   Release plus one npm publish, always from the same derived version and
-   commit. Never `npm publish` by hand again, and never publish anything but
-   a workflow-built `npm-package` artifact.
+6. Ongoing. Every release dispatch (and every `v*` tag push) creates one tag
+   and one npm publish — no GitHub Release page — always from the same derived
+   version and commit. Never `npm publish` by hand again, and never publish
+   anything but a workflow-built `npm-package` artifact.
 
 ## Version checklist (one version everywhere)
 
@@ -127,7 +130,8 @@ Before landing a release commit, in this order (all three are read-only):
 2. `node scripts/check-release-workflow.mjs` — asserts the release lane's own
    shape: derive before every version assert, no step that writes a version,
    the changelog closed after the test, the tag created in the publish job
-   immediately before the release is attached, and no `version` input.
+   immediately before `npm publish`, no GitHub Release page, and no `version`
+   input.
 3. `node scripts/release-check.mjs` — packs `npm/` exactly as npm would,
    extracts `engine-manifest.json` from the tarball with Node's `zlib` plus a
    minimal tar reader (no new dependency), and asserts `serverVersion` equals
