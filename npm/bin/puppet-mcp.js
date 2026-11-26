@@ -15,8 +15,11 @@
 // run. Everything is therefore acquired on first RUN by the code below.
 //
 // Provisioning, one cache, verified:
-//   - The server (manifest runtime.archive) downloads from the tagged GitHub
-//     Release, verifies zip sha256+size BEFORE extraction, extracts
+//   - The server (manifest runtime.archive) ships INSIDE this npm tarball at
+//     bin/<archive.name>: npm is the release, no GitHub page exists. Versions
+//     published before the tarball carried a bundle fall back to the tagged
+//     Release URL their manifest pinned. Either way the launcher verifies zip
+//     sha256+size BEFORE extraction, extracts
 //     atomically (staging dir, then rename) into
 //     %LOCALAPPDATA%\puppet\engine\<serverVersion>-<bundleSha8>\, verifies
 //     the server binary against the manifest, writes a .ready marker, and is
@@ -133,6 +136,22 @@ function shortHash(sha) {
   return isPlaceholderSha(sha) ? 'unpublished' : sha.toLowerCase().slice(0, 8);
 }
 
+// The built runtime zip is staged into bin/ before npm pack, and npm's files
+// whitelist already includes bin/. A strict name check keeps this lookup from
+// ever escaping the package directory. null means "an older published version
+// that has no bundled zip", whose manifest URL is the fallback.
+function bundledArchivePath(manifest) {
+  const arc = manifest && manifest.runtime && manifest.runtime.archive;
+  const name = arc && arc.name;
+  if (typeof name !== 'string' || !/^[A-Za-z0-9._-]+$/.test(name)) return null;
+  const p = path.join(PKG_DIR, 'bin', name);
+  try {
+    return fs.statSync(p).isFile() ? p : null;
+  } catch {
+    return null;
+  }
+}
+
 function resolveRuntimeDir(manifest) {
   const notes = [];
   let root = process.env[RUNTIME_CACHE_OVERRIDE_ENV];
@@ -164,11 +183,12 @@ function printDoctor(manifest, pkgVersion) {
     runtimeCacheDir: runtime.dir,
     runtimeCacheOverridden: runtime.overridden,
     runtimeCacheNotes: runtime.notes,
+    runtimeBundle: bundledArchivePath(manifest),
     runtimeBundleOverride: {
       env: RUNTIME_BUNDLE_OVERRIDE_ENV,
       set: Boolean(process.env[RUNTIME_BUNDLE_OVERRIDE_ENV]),
       path: process.env[RUNTIME_BUNDLE_OVERRIDE_ENV] ?? null,
-      note: 'diagnostics only: the pre-publish cleanroom points this at the archive it just built; a normal run leaves it unset and downloads runtime.archive, whose size and sha256 are checked either way',
+      note: 'diagnostics only: a normal run leaves this unset and provisions from the zip bundled under bin/ (older published versions fall back to runtime.archive URL); size and sha256 are checked either way',
     },
     runtime: manifest.runtime,
     network: 'none: this diagnostic performs no fetch and exits before any download code',
@@ -188,8 +208,9 @@ function usage(exitCode, stream) {
     '  --help, -h           print this usage',
     '',
     'runtime cache: ' + path.join('%LOCALAPPDATA%', 'puppet', 'engine', '<serverVersion>-<bundleSha8>') + ` (override: ${RUNTIME_CACHE_OVERRIDE_ENV})`,
-    `local bundle: unset by default; ${RUNTIME_BUNDLE_OVERRIDE_ENV} names a zip file to verify and extract`,
-    '              instead of downloading (pre-publish diagnostics only; size and sha256 are still checked)',
+    'runtime ships in the tarball under bin/; first run provisions it locally (no release page needed)',
+    `local bundle: unset by default; ${RUNTIME_BUNDLE_OVERRIDE_ENV} overrides the bundled zip with a file`,
+    '              to verify and extract (pre-publish diagnostics only; size and sha256 are still checked)',
     `platform: windows-x86_64 only (override: ${PLATFORM_OVERRIDE_ENV}=1, diagnostics only)`,
   ].join('\n') + '\n';
   stream.write(text);
@@ -394,15 +415,16 @@ async function ensureRuntime(manifest, cacheDir) {
   // warm reuse touches nothing. Below, the cache path itself is the claim: a
   // peer never clears it, it only waits for the creator's ready marker.
 
-  // Local bundle override: the pre-publish cleanroom builds the archive in
-  // this same job, before any GitHub Release exists, so it hands the zip over
-  // instead of fetching a URL that cannot exist yet. The size and sha256
-  // checks below stay unconditional: a local zip that disagrees with the
-  // manifest is refused exactly like a corrupt download would be.
+  // Provisioning order: the explicit local-bundle override (diagnostics),
+  // then the zip bundled in this tarball (the normal, page-less path), then
+  // the manifest URL (only for versions published before the tarball carried
+  // a bundle). The size and sha256 checks below stay unconditional: any
+  // source that disagrees with the manifest is refused the same way.
   const localBundle = process.env[RUNTIME_BUNDLE_OVERRIDE_ENV];
-  const origin = localBundle ? 'local bundle' : 'download';
+  let origin = 'download';
   let data;
   if (localBundle) {
+    origin = 'local bundle';
     log(`provisioning runtime cache: ${cacheDir}`);
     log(`reading ${localBundle} (${RUNTIME_BUNDLE_OVERRIDE_ENV} set; pre-publish diagnostics only)`);
     try {
@@ -411,13 +433,25 @@ async function ensureRuntime(manifest, cacheDir) {
       fail(`cannot read local bundle ${localBundle}: ${err.message}`);
     }
   } else {
-    const url = `${rt.source}/${rt.archive.name}`;
-    log(`provisioning runtime cache: ${cacheDir}`);
-    log(`downloading ${url} (${rt.archive.size} bytes)`);
-    try {
-      data = await downloadToMemory(url);
-    } catch (err) {
-      fail(err.message);
+    const bundled = bundledArchivePath(manifest);
+    if (bundled) {
+      origin = 'npm tarball';
+      log(`provisioning runtime cache: ${cacheDir}`);
+      log(`reading bundled runtime ${bundled} (${rt.archive.size} bytes)`);
+      try {
+        data = fs.readFileSync(bundled);
+      } catch (err) {
+        fail(`cannot read bundled runtime ${bundled}: ${err.message}`);
+      }
+    } else {
+      const url = `${rt.source}/${rt.archive.name}`;
+      log(`provisioning runtime cache: ${cacheDir}`);
+      log(`downloading ${url} (${rt.archive.size} bytes)`);
+      try {
+        data = await downloadToMemory(url);
+      } catch (err) {
+        fail(err.message);
+      }
     }
   }
   if (data.length !== rt.archive.size) {
@@ -540,4 +574,5 @@ module.exports = {
   checkFile,
   shortHash,
   resolveRuntimeDir,
+  bundledArchivePath,
 };
