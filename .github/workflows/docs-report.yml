@@ -11,8 +11,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '26'
-      - name: docs gate (report-only, phase 1)
-        run: node docs-check.mjs --report
+      - name: docs gate (strict, phase 2)
+        run: node docs-check.mjs --strict
       - name: link check (offline, report-only)
         uses: lycheeverse/lychee-action@v2.2.0
         with:
