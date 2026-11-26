@@ -1,7 +1,21 @@
 {
   "versions": [],
   "generated": [],
-  "forbidden": [],
+  "forbidden": [
+    {
+      "files": [
+        "AGENTS.md",
+        "README.md"
+      ],
+      "patterns": [
+        "(?<!\\d\\.)\\bv?\\d+\\.\\d+\\.\\d+(?:[-+][0-9A-Za-z.-]+)?\\b(?!\\.\\d)",
+        "\\b[A-Za-z]:[\\\\/]",
+        "\\\\\\\\[^\\\\\\s]+",
+        "%LOCALAPPDATA%",
+        "\\b(?:npm|pnpm|yarn)\\s+(?:install|i|add)\\b"
+      ]
+    }
+  ],
   "checker": {
     "version": "0.2.0",
     "sha256": "92f3f8bea1ff89497fb911ca57a6bf218ab3824ff34f8de3717f6a6a6d7a4546"
