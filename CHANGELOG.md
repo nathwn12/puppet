@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [8.0.3] - 2026-11-26
+
+### Changed
+- npm: cosmetic-only polish of the `puppet-mcp` package page and discovery
+  metadata — one uniform install-first README (centred title and pitch, earned
+  badges, and `Status` / `Links` in house order), factual fixes to the run and
+  cache prose, and a factual description plus ten discovery keywords in
+  `package.json`. No launcher or engine behaviour changes.
+
 ### Fixed
 - Modern MCP `tools/list` and `server/discover` replies now carry the full
   completion envelope `resultType:"complete"`, `ttlMs:0` and
