@@ -1,53 +1,64 @@
-# nathwn12 house CI — static gate plus the one conformance binary: fmt,
-# clippy, gitleaks, compile check, and the payload-vs-schema gate
-# (envelope_truth). The full build + test matrix still lives in
-# release.yml (`cargo build --release --locked`, `cargo test
-# --release --locked`), so this gate never compiles twice for the same
-# answer — except the single conformance binary, which is the check that
-# stops a schema-violating payload ever reaching a release. Job name
-# `build` is the required check — do not rename.
-# Docs-only change (*.md, docs/, LICEN[CS]E) keeps the required check green in seconds and runs no build.
+# nathwn12 house CI - one shape, adapted to puppet.
+# Required context from main protection: `build`. Keep that job name.
+# Specialised steps kept: gitleaks and the payload-vs-schema conformance test.
+# Scope comes from the GitHub API (fetch-depth: 1); docs-only changes skip
+# steps, never the trigger, so the check still reports green.
 name: ci
+
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
-  workflow_dispatch:
+
 permissions:
   contents: read
+  pull-requests: read
+
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Never cancel a push run: it is the run that tests main.
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_TERM_COLOR: always
+
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0
-      - name: Detect a docs-only change
+          fetch-depth: 1
+      - name: Scope from the API
         id: scope
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
         run: |
+          set -euo pipefail
           docs='^(.*\.md|docs/.*|LICEN[CS]E(\.md)?)$'
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            git fetch --no-tags origin "${{ github.base_ref }}"
-            changed=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD")
-          elif [ "${{ github.event_name }}" = "push" ] && [ -n "${{ github.event.before }}" ]; then
-            changed=$(git diff --name-only "${{ github.event.before }}" HEAD || true)
-          else
-            changed=$(git ls-files)
+          files=""
+          code=true
+          if [ "$EVENT" = "pull_request" ]; then
+            files="$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename')"
+          elif [ "$EVENT" = "push" ] && [ -n "$BEFORE" ] && [ "${BEFORE//0/}" != "" ]; then
+            files="$(gh api "repos/$REPO/compare/$BEFORE...$SHA" --paginate --jq '.files[].filename')"
           fi
-          if [ -n "$changed" ] && ! printf '%s\n' "$changed" | grep -qvE "$docs"; then
-            echo "code=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "code=true" >> "$GITHUB_OUTPUT"
+          if [ -n "$files" ] && ! printf '%s\n' "$files" | grep -qvE "$docs"; then
+            code=false
           fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@1.87.0
         if: steps.scope.outputs.code == 'true'
         with:
-          toolchain: 1.87.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         if: steps.scope.outputs.code == 'true'
@@ -59,7 +70,11 @@ jobs:
       - name: clippy
         if: steps.scope.outputs.code == 'true'
         run: cargo clippy --all-targets --locked -- -D warnings
+      - name: docs-check
+        if: steps.scope.outputs.code == 'true'
+        run: node docs-check.mjs --strict
       - name: gitleaks
+        if: steps.scope.outputs.code == 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -77,7 +92,41 @@ jobs:
       - name: conformance (payload vs own outputSchema)
         if: steps.scope.outputs.code == 'true'
         run: cargo test --release --locked --test envelope_truth
+      - name: test (blocking; display-dependent tests filtered)
+        if: steps.scope.outputs.code == 'true'
+        run: cargo test --release --locked -- --skip shot::tests::live_
       - name: Scope
         if: always()
+        shell: bash
         run: |
-          echo "scope: ${{ steps.scope.outputs.code == 'true' && 'code changed - the full gate ran' || 'docs-only - build skipped, the check stays green' }}"
+          echo "scope: ${{ steps.scope.outputs.code == 'true' && 'code changed - full gate ran' || 'docs-only - build skipped, check stays green' }}"
+
+  advisory-env-dependent:
+    name: advisory env-dependent suites
+    if: github.event_name == 'pull_request'
+    runs-on: windows-2022
+    continue-on-error: true
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.87.0
+        with:
+          toolchain: 1.87.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-1.87.0
+      - name: env-dependent suites (advisory)
+        env:
+          PUPPET_LIVE_DESKTOP: '1'
+        run: cargo test --release --locked
+      - name: report
+        if: always()
+        shell: bash
+        run: |
+          echo "### Advisory env-dependent suites" >> "$GITHUB_STEP_SUMMARY"
+          echo "PUPPET_LIVE_DESKTOP=1 cargo test --release --locked" >> "$GITHUB_STEP_SUMMARY"
+          echo "Result: ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
