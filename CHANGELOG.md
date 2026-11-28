@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Server-side MCP Skills (SEP-2640): `skills/list`, `skills/get`, and `resources/read` for embedded skills; `initialize`/`server/discover` advertise `resources` and the `io.modelcontextprotocol/skills` extension. Seed skill `windows` carries the targeting/no-steal/screenshot/cleanup guidance.
+
 ### Fixed
 - release: publish to the single rolling `puppet` product page, amended in place,
   instead of creating a page per version. Version tags are still created and left

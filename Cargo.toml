@@ -9,6 +9,9 @@ keywords = ["mcp", "windows", "automation", "desktop", "screenshot"]
 categories = ["command-line-utilities"]
 rust-version = "1.87"
 
+[build-dependencies]
+sha2 = "0.10"
+
 [dependencies]
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",

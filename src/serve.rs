@@ -91,7 +91,7 @@ fn init_result(params: &Value) -> String {
         LATEST_VERSION
     };
     format!(
-        "{{\"protocolVersion\":{},\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}},\"serverInfo\":{{\"name\":\"puppet\",\"version\":{}}},\"instructions\":{}}}",
+        "{{\"protocolVersion\":{},\"capabilities\":{{\"tools\":{{\"listChanged\":false}},\"resources\":{{}},\"extensions\":{{\"io.modelcontextprotocol/skills\":{{}}}}}},\"serverInfo\":{{\"name\":\"puppet\",\"version\":{}}},\"instructions\":{}}}",
         serde_json::to_string(echo).unwrap(),
         serde_json::to_string(env!("CARGO_PKG_VERSION")).unwrap(),
         serde_json::to_string(&crate::claims::instructions()).unwrap()
@@ -105,7 +105,7 @@ fn tools_list_result() -> String {
 fn discover_result() -> String {
     let supported: Vec<Value> = ALL_VERSIONS.iter().map(|v| Value::from(*v)).collect();
     format!(
-        "{{\"supportedVersions\":{},\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}},\"serverInfo\":{{\"name\":\"puppet\",\"version\":{}}},\"instructions\":{}}}",
+        "{{\"supportedVersions\":{},\"capabilities\":{{\"tools\":{{\"listChanged\":false}},\"resources\":{{}},\"extensions\":{{\"io.modelcontextprotocol/skills\":{{}}}}}},\"serverInfo\":{{\"name\":\"puppet\",\"version\":{}}},\"instructions\":{}}}",
         serde_json::to_string(&Value::Array(supported)).unwrap(),
         serde_json::to_string(env!("CARGO_PKG_VERSION")).unwrap(),
         serde_json::to_string(&crate::claims::instructions()).unwrap()
@@ -971,6 +971,29 @@ fn handle_fast<W: Write>(
             false
         }
         "ping" => write_result(sink, &id, "{}").is_err(),
+        "skills/list" => write_result(sink, &id, &crate::skills::list_skills_result()).is_err(),
+        "skills/get" => {
+            let uri = v
+                .get("params")
+                .and_then(|p| p.get("uri"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            match crate::skills::get_skill_result(uri) {
+                Some(r) => write_result(sink, &id, &r).is_err(),
+                None => write_error(sink, &id, -32602, "Unknown skill uri").is_err(),
+            }
+        }
+        "resources/read" => {
+            let uri = v
+                .get("params")
+                .and_then(|p| p.get("uri"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            match crate::skills::read_resource(uri) {
+                Some(r) => write_result(sink, &id, &serde_json::to_string(&r).unwrap()).is_err(),
+                None => write_error(sink, &id, -32602, "Unknown resource uri").is_err(),
+            }
+        }
         _ if m.starts_with("notifications/") => false,
         _ => write_error(sink, &id, -32601, &format!("Method not found: {m}")).is_err(),
     }

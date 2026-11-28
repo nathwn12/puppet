@@ -95,11 +95,15 @@ fn init_params(version: &str) -> Value {
     })
 }
 
-fn assert_tools_only_caps(result: &Value, what: &str) {
+fn assert_caps(result: &Value, what: &str) {
     assert_eq!(
         result.get("capabilities"),
-        Some(&serde_json::json!({"tools": {"listChanged": false}})),
-        "{what} capabilities must be tools-only, got: {result}"
+        Some(&serde_json::json!({
+            "tools": {"listChanged": false},
+            "resources": {},
+            "extensions": {"io.modelcontextprotocol/skills": {}}
+        })),
+        "{what} capabilities mismatch, got: {result}"
     );
 }
 
@@ -156,7 +160,7 @@ fn initialize_version_matrix() {
             Some(echo),
             "initialize({req}) must negotiate {echo}, got: {result}"
         );
-        assert_tools_only_caps(result, &format!("initialize({req})"));
+        assert_caps(result, &format!("initialize({req})"));
         assert_server_version(result, &format!("initialize({req})"));
         assert!(
             result.get("resultType").is_none(),
@@ -202,7 +206,7 @@ fn discover_lists_modern_and_legacy_with_tools_only() {
             "supportedVersions must not advertise {v} (batching not implemented), got: {strs:?}"
         );
     }
-    assert_tools_only_caps(result, "server/discover");
+    assert_caps(result, "server/discover");
     assert_server_version(result, "server/discover");
     assert_instructions(result, "server/discover");
     assert_eq!(

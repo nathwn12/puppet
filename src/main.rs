@@ -1327,6 +1327,7 @@ pub mod hidden;
 pub mod screen;
 pub mod serve;
 pub mod shot;
+pub mod skills;
 pub mod target;
 pub mod uia;
 pub mod winop;
