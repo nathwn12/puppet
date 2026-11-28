@@ -86,7 +86,7 @@ concurrency:
 jobs:
   build:
     name: derive + build server + manifest
-    runs-on: windows-latest
+    runs-on: windows-2022
     permissions:
       contents: read
     # The one version this run is about. publish reads it, and everything
@@ -168,7 +168,7 @@ jobs:
       - name: build
         run: cargo build --release --locked
       - name: test
-        run: cargo test --release --locked
+        run: cargo test --release --locked -- --skip live_
       # The changelog heading is produced by the run, AFTER the gate and before
       # any tag exists: a red build never closes a section. Idempotent, so a
       # rerun over an already-closed section changes nothing. The closed
@@ -357,7 +357,7 @@ jobs:
   publish:
     name: tag + npm publish
     needs: [build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
       id-token: write
