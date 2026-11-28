@@ -14,7 +14,7 @@ jobs:
       - name: docs gate (strict, phase 2)
         run: node docs-check.mjs --strict
       - name: link check (offline, report-only)
-        uses: lycheeverse/lychee-action@v2.2.0
+        uses: lycheeverse/lychee-action@v2.9.0
         with:
           args: --no-progress --offline '**/*.md'
           fail: false
